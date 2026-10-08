@@ -151,6 +151,13 @@ src/api/           REST + SSE (axum)       src/web/        dashboard e player (s
 src/db/            SQLite (rusqlite)       docs/           architettura, protocolli, API
 ```
 
+## Limiti noti e roadmap
+
+- Il packager LL-HLS/LL-DASH impacchetta solo **H.264 + AAC**; HEVC/AV1 (Enhanced RTMP) passano solo via HTTP-FLV/WS-FLV.
+- Nessun transcoding/ABR: la qualità è quella inviata da OBS (consigliati 2–6 Mbit/s CBR, keyframe 2 s).
+- Safari nativo e HTTP/2 non sono stati verificati in questo ambiente (vedi `docs/ARCHITECTURE.md` §15).
+- Prossimi passi previsti: uscita WebRTC (WHEP) sotto il secondo, ingest SRT/WHIP, token per gli spettatori.
+
 ## Licenza
 
 MIT.

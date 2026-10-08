@@ -432,3 +432,27 @@ Deviations/additions made while implementing Phase 1 — these supersede the sec
 - Player (§9): source order is `flv` -> `hls` -> `dash`, and `hls` -> `dash` on iOS (desktop Safari has MSE, so it starts with mpegts.js; the `hls` engine is native on iOS/Safari, hls.js elsewhere). `src=` means "start here, then fall through" (`src=dash` tries DASH only). Extra query parameter `latency=1|0` (default on for `/player`, off for `/embed`).
 - Client-side mock: `localStorage.rmsMock = "1"` makes `mock.js` answer `GET` metrics, summary and recordings in the browser only (UI demos); it is not a server feature.
 - Waiting-video upload: `data/waiting/<name>/<uuid>.mp4`, global default in `data/waiting/_default/`, in-flight files in `data/waiting/tmp/`, poster `<stem>.jpg`. Body limit `server.max_upload_mb` MiB + 64 KiB (413 over it), 415 unsupported type (non-MP4 without ffmpeg), 422 ffmpeg cannot convert, 503 conversion timeout (15 min, two conversions at a time).
+
+## 15. Known limits and roadmap (after the phase 3 review)
+
+Fixed in the review merge: HLS/DASH viewer double counting (race in `ViewerTracker::touch`), out-of-order
+`viewer_sessions` writes (now a single ordered writer task), encoder timestamp jumps breaking the segmenter,
+oversized LL-HLS parts at 29.97 fps, SPS/AAC parser overflows on hostile input, partial-file cleanup on aborted
+uploads, audio-only FLV lag recovery, stream keys logged by `rtmp_rs` at INFO. Added afterwards: `rtmp.max_connections`
+cap (default 256) and in-flight uploads moved to `data/upload-tmp/` (outside the public `/waiting/*` tree).
+
+Open (low/medium-low severity, documented for future work):
+- Segmenter: an encoder sending frozen (identical) timestamps keeps the in-progress segment open indefinitely;
+  a frame gap of 0.5–10 s yields one part longer than `PART-TARGET`; `EXT-X-TARGETDURATION` may grow mid-stream
+  (spec says it must not change); segments split from long GOPs are not keyframe-aligned (DASH still says `startWithSAP=1`);
+  lag gaps are not signalled as discontinuities.
+- Viewer tracking: the in-memory request-session map is keyed by (IP, UA) and only bounded by the 30 s timeout;
+  a client stopping to read an HTTP-FLV/SSE response stays counted until TCP gives up (no send-side watchdog).
+- Hot paths: broadcast lookups on every FLV/public request hit SQLite through `spawn_blocking` (cache candidate);
+  complete HLS segments / DASH segments are re-concatenated per request under the store mutex (cache candidate).
+- Packager task has no panic guard; two concurrent waiting-video uploads to the same broadcast may orphan a file.
+- Not tested: Safari native LL-HLS (no macOS available), HTTP/2 (needs a reverse proxy), HEVC/AV1 only via FLV.
+
+Roadmap (phase 4+): WebRTC egress via WHEP (`webrtc` crate; H.264 pass-through + AAC→Opus via ffmpeg RTP),
+native SRT ingest (`srt-tokio`) or the ffmpeg bridge, WHIP ingest, ABR/transcoding ladder, viewer tokens,
+delta playlists (`CAN-SKIP-UNTIL`), MoQ when the IETF spec settles.
