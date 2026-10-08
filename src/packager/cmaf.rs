@@ -30,6 +30,10 @@ pub const AUDIO_TRACK_ID: u32 = 2;
 pub const VIDEO_TIMESCALE: u32 = 90_000;
 /// Samples per AAC frame (AAC-LC; HE-AAC core frames are treated the same way).
 pub const AAC_FRAME_SAMPLES: u32 = 1024;
+/// Highest AAC sample rate accepted from an AudioSpecificConfig. The explicit 24-bit
+/// frequency field allows up to 16.7 MHz, which would overflow the audio timestamp
+/// math (`epoch ms × sample rate`) and is not a real AAC configuration anyway.
+pub const MAX_AUDIO_SAMPLE_RATE: u32 = 96_000;
 
 /// `sample_flags` of a sync sample: sample_depends_on = 2 (independent), is_non_sync = 0.
 pub const SAMPLE_FLAGS_SYNC: u32 = 0x0200_0000;
@@ -184,7 +188,7 @@ fn audio_config(asc: &[u8]) -> Option<AudioConfig> {
     legacy.extend_from_slice(&[0xAF, 0x00]);
     legacy.extend_from_slice(asc);
     let info = parse_aac_sequence_header(&legacy)?;
-    if info.sample_rate == 0 {
+    if info.sample_rate == 0 || info.sample_rate > MAX_AUDIO_SAMPLE_RATE {
         return None;
     }
     Some(AudioConfig {
@@ -861,6 +865,23 @@ mod tests {
         );
         assert_eq!(
             parse_audio_tag(&Bytes::from_static(&[0xAF, 0x00, 0x11])),
+            AudioTag::Ignore
+        );
+        // Explicit 24-bit sampling frequency: 48 kHz is fine, 16.7 MHz is rejected.
+        assert!(matches!(
+            parse_audio_tag(&Bytes::from_static(&[
+                0xAF, 0x00, 0x17, 0x80, 0x5d, 0xc0, 0x10
+            ])),
+            AudioTag::Config(AudioConfig {
+                sample_rate: 48_000,
+                channels: 2,
+                ..
+            })
+        ));
+        assert_eq!(
+            parse_audio_tag(&Bytes::from_static(&[
+                0xAF, 0x00, 0x17, 0xff, 0xff, 0xff, 0x90
+            ])),
             AudioTag::Ignore
         );
     }

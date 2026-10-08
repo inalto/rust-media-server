@@ -60,6 +60,13 @@ impl Point {
     }
 }
 
+/// One `viewer_sessions` write, see [`apply_session_writes`].
+#[derive(Debug, Clone)]
+pub enum SessionWrite {
+    Open(ViewerSessionRecord),
+    Close { id: String, ended_at: DateTime<Utc> },
+}
+
 /// Insert a `viewer_sessions` row when a viewer session opens.
 ///
 /// Unknown broadcast names are ignored (the broadcast may have been deleted
@@ -68,64 +75,94 @@ impl Point {
 /// unique id (`<id>:<uuid>`) so the history is kept and `close_viewer_session(id)`
 /// keeps addressing the current session.
 pub async fn insert_viewer_session(db: &Db, record: ViewerSessionRecord) -> DbResult<()> {
-    db.call(move |c| {
-        let tx = c.transaction()?;
-        let bid: Option<String> = tx
-            .query_row(
-                "SELECT id FROM broadcasts WHERE name = ?1",
-                [&record.broadcast_name],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(bid) = bid else {
-            return Ok(());
-        };
-        let started = fmt_ts(&record.started_at);
-        let exists = tx
-            .query_row(
-                "SELECT 1 FROM viewer_sessions WHERE id = ?1",
-                [&record.id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if exists {
-            let archived = format!("{}:{}", record.id, uuid::Uuid::new_v4().simple());
-            tx.execute(
-                "UPDATE viewer_sessions SET id = ?2, ended_at = COALESCE(ended_at, ?3) WHERE id = ?1",
-                params![record.id, archived, started],
-            )?;
-        }
-        tx.execute(
-            "INSERT INTO viewer_sessions (id, broadcast_id, protocol, ip, user_agent, started_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                record.id,
-                bid,
-                record.protocol.as_str(),
-                record.ip,
-                record.user_agent,
-                started
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
-    })
-    .await
+    apply_session_writes(db, vec![SessionWrite::Open(record)]).await
 }
 
 /// Set `ended_at` of a `viewer_sessions` row when a viewer session closes
 /// (no-op for unknown or already closed rows).
 pub async fn close_viewer_session(db: &Db, id: &str, ended_at: DateTime<Utc>) -> DbResult<()> {
     let id = id.to_string();
+    apply_session_writes(db, vec![SessionWrite::Close { id, ended_at }]).await
+}
+
+/// Apply `writes` in order, in one transaction (one savepoint per write: a failing
+/// write is logged and skipped without affecting the others).
+///
+/// The tracker funnels every open/close through a single ordered queue into this
+/// function: applying them in issue order is what guarantees that the close of a
+/// short-lived session never runs before its insert (which would leave the row open
+/// forever and skew `sessions_total` / `avg_watch_secs`).
+pub async fn apply_session_writes(db: &Db, writes: Vec<SessionWrite>) -> DbResult<()> {
+    if writes.is_empty() {
+        return Ok(());
+    }
     db.call(move |c| {
-        c.execute(
-            "UPDATE viewer_sessions SET ended_at = ?2 WHERE id = ?1 AND ended_at IS NULL",
-            params![id, fmt_ts(&ended_at)],
-        )?;
+        let mut tx = c.transaction()?;
+        for w in &writes {
+            let sp = tx.savepoint()?;
+            let r = match w {
+                SessionWrite::Open(record) => open_session_row(&sp, record),
+                SessionWrite::Close { id, ended_at } => sp
+                    .execute(
+                        "UPDATE viewer_sessions SET ended_at = ?2 WHERE id = ?1 AND ended_at IS NULL",
+                        params![id, fmt_ts(ended_at)],
+                    )
+                    .map(|_| ()),
+            };
+            match r {
+                Ok(()) => sp.commit()?,
+                Err(e) => tracing::warn!(error = %e, write = ?w, "viewer session write failed"),
+            }
+        }
+        tx.commit()?;
         Ok(())
     })
     .await
+}
+
+fn open_session_row(
+    c: &rusqlite::Connection,
+    record: &ViewerSessionRecord,
+) -> rusqlite::Result<()> {
+    let bid: Option<String> = c
+        .query_row(
+            "SELECT id FROM broadcasts WHERE name = ?1",
+            [&record.broadcast_name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(bid) = bid else {
+        return Ok(());
+    };
+    let started = fmt_ts(&record.started_at);
+    let exists = c
+        .query_row(
+            "SELECT 1 FROM viewer_sessions WHERE id = ?1",
+            [&record.id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if exists {
+        let archived = format!("{}:{}", record.id, uuid::Uuid::new_v4().simple());
+        c.execute(
+            "UPDATE viewer_sessions SET id = ?2, ended_at = COALESCE(ended_at, ?3) WHERE id = ?1",
+            params![record.id, archived, started],
+        )?;
+    }
+    c.execute(
+        "INSERT INTO viewer_sessions (id, broadcast_id, protocol, ip, user_agent, started_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            record.id,
+            bid,
+            record.protocol.as_str(),
+            record.ip,
+            record.user_agent,
+            started
+        ],
+    )?;
+    Ok(())
 }
 
 /// Crash recovery: close `viewer_sessions` rows left open by a previous process

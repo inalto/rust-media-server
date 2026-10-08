@@ -75,18 +75,41 @@ pub enum SegmenterStatus {
     Unsupported(String),
 }
 
-/// FLV timestamps are 32-bit milliseconds; extend them to i64 using signed deltas.
+/// Jumps between consecutive packets (any track) larger than these are encoder
+/// timestamp discontinuities (reset to 0, bogus jump): they are absorbed, i.e. the
+/// extended clock continues from where it was. Same thresholds as the recorder's
+/// `TimestampRebaser`. Without this, a reset made every later video frame
+/// "non-increasing" (1-tick durations, a segment that never completes and grows
+/// without bound, audio dropped) and a forward jump produced one huge part/segment
+/// (EXT-X-TARGETDURATION stuck at the jump size for the rest of the stream).
+const MAX_BACKWARD_JUMP_MS: i64 = 1_000;
+const MAX_FORWARD_JUMP_MS: i64 = 10_000;
+
+/// FLV timestamps are 32-bit milliseconds; extend them to i64 using signed deltas
+/// (which also handles the 32-bit wrap-around after ~49.7 days).
 #[derive(Debug, Default)]
 struct TsUnwrap {
     last_raw: Option<u32>,
     last_ext: i64,
+    /// Number of absorbed discontinuities.
+    jumps: u64,
 }
 
 impl TsUnwrap {
+    fn delta(prev: u32, raw: u32) -> Option<i64> {
+        let d = raw.wrapping_sub(prev) as i32 as i64;
+        (-MAX_BACKWARD_JUMP_MS..=MAX_FORWARD_JUMP_MS)
+            .contains(&d)
+            .then_some(d)
+    }
+
     fn unwrap(&mut self, raw: u32) -> i64 {
         match self.last_raw {
             None => self.last_ext = raw as i64,
-            Some(prev) => self.last_ext += raw.wrapping_sub(prev) as i32 as i64,
+            Some(prev) => match Self::delta(prev, raw) {
+                Some(d) => self.last_ext += d,
+                None => self.jumps += 1,
+            },
         }
         self.last_raw = Some(raw);
         self.last_ext
@@ -96,7 +119,7 @@ impl TsUnwrap {
     fn peek(&self, raw: u32) -> i64 {
         match self.last_raw {
             None => raw as i64,
-            Some(prev) => self.last_ext + raw.wrapping_sub(prev) as i32 as i64,
+            Some(prev) => self.last_ext + Self::delta(prev, raw).unwrap_or(0),
         }
     }
 }
@@ -253,6 +276,17 @@ impl Segmenter {
         self.probe = Probe::default();
     }
 
+    /// Extend a raw FLV timestamp (see [`TsUnwrap`]); logs absorbed discontinuities.
+    fn extend_ts(&mut self, raw: u32) -> i64 {
+        let jumps = self.ts.jumps;
+        let ts = self.ts.unwrap(raw);
+        if self.ts.jumps != jumps {
+            tracing::warn!(broadcast = %self.name, raw, "timestamp discontinuity from the encoder; absorbed");
+        }
+        self.latest_ts = Some(self.latest_ts.map_or(ts, |l| l.max(ts)));
+        ts
+    }
+
     /// Feed one packet from the hub.
     pub fn push(&mut self, p: &MediaPacket) {
         if matches!(self.status, SegmenterStatus::Unsupported(_)) {
@@ -267,8 +301,7 @@ impl Segmenter {
                     cts_ms,
                     data,
                 } => {
-                    let ts = self.ts.unwrap(p.timestamp);
-                    self.latest_ts = Some(self.latest_ts.map_or(ts, |l| l.max(ts)));
+                    let ts = self.extend_ts(p.timestamp);
                     self.on_frame(
                         ts,
                         VideoOrAudio::Video {
@@ -286,8 +319,7 @@ impl Segmenter {
             PacketKind::Audio => match cmaf::parse_audio_tag(&p.data) {
                 AudioTag::Config(c) => self.on_audio_config(c),
                 AudioTag::Frame(data) => {
-                    let ts = self.ts.unwrap(p.timestamp);
-                    self.latest_ts = Some(self.latest_ts.map_or(ts, |l| l.max(ts)));
+                    let ts = self.extend_ts(p.timestamp);
                     self.on_frame(ts, VideoOrAudio::Audio(data));
                 }
                 AudioTag::Ignore => {}
@@ -498,6 +530,16 @@ impl Segmenter {
         }
 
         if keyframe {
+            // A keyframe always closes the pending part. If it arrives late (e.g. 29.97
+            // fps: last frame at +467 ms, keyframe at +501 ms) that part would exceed
+            // PART-TARGET: close it at the previous frame and let that frame form the
+            // (short) final part, as the non-keyframe path below does.
+            if dts - self.chunk_start > self.part_ticks() && self.pending_video.len() > 1 {
+                let last = self.pending_video.pop().expect("len > 1");
+                self.close_chunk(last.dts);
+                self.chunk_start = last.dts;
+                self.pending_video.push(last);
+            }
             if dts - self.seg_start >= self.cfg.min_segment_ms as u64 * TICKS_PER_MS {
                 self.close_chunk(dts);
                 self.store.open_segment(dts, true);
@@ -1089,11 +1131,95 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_closed_parts_never_exceed_target_2997fps() {
+        // 29.97 fps with millisecond FLV timestamps: a keyframe often lands 1 ms past
+        // the part boundary (+467 ms, then +501 ms).
+        for gop in [15u32, 48, 59, 60, 61, 120] {
+            let mut s = segmenter(SegmenterConfig::default(), 100);
+            s.push(&avc_header());
+            s.push(&aac_header());
+            for i in 0..3000u32 {
+                let ts = (i as f64 * 1001.0 / 30.0).round() as u32;
+                s.push(&vframe(ts, i % gop == 0, 0));
+            }
+            s.store().with(|st| {
+                assert!(
+                    st.max_part <= 45_000,
+                    "gop {gop}: part of {} ticks",
+                    st.max_part
+                );
+                for seg in st.complete_segments() {
+                    // Short parts only as the last part of a segment or at keyframes.
+                    let n = seg.chunks.len();
+                    for (i, c) in seg.chunks.iter().enumerate() {
+                        let next_independent = seg.chunks.get(i + 1).is_some_and(|c| c.independent);
+                        if i + 1 < n && !next_independent {
+                            assert!(c.duration >= 38_250, "gop {gop}: short inner part");
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
     fn timestamp_unwrap() {
         let mut u = TsUnwrap::default();
         assert_eq!(u.unwrap(u32::MAX - 10), u32::MAX as i64 - 10);
         assert_eq!(u.unwrap(5), u32::MAX as i64 + 6);
         assert_eq!(u.unwrap(2), u32::MAX as i64 + 3);
         assert_eq!(u.peek(20), u32::MAX as i64 + 21);
+        // Discontinuities are absorbed, the clock continues from the last value.
+        assert_eq!(u.unwrap(1_000_000), u32::MAX as i64 + 3);
+        assert_eq!(u.unwrap(1_000_040), u32::MAX as i64 + 43);
+        assert_eq!(u.peek(0), u32::MAX as i64 + 43);
+        assert_eq!(u.jumps, 1);
+    }
+
+    /// Feed `pkts` and return (complete segments, target duration, max part).
+    fn run(s: &mut Segmenter, pkts: Vec<MediaPacket>) -> (usize, u32, u64) {
+        for p in pkts {
+            s.push(&p);
+        }
+        s.store()
+            .with(|st| (st.complete_count(), st.target_duration, st.max_part))
+    }
+
+    #[test]
+    fn encoder_timestamp_reset_is_absorbed() {
+        let mut s = segmenter(SegmenterConfig::default(), 100);
+        s.push(&avc_header());
+        s.push(&aac_header());
+        let (before, _, _) = run(&mut s, av_packets(600_000, 30 * 6 + 1, 60));
+        assert_eq!(before, 3);
+        // The encoder restarts its clock at 0 within the same RTMP session.
+        let (after, target, max_part) = run(&mut s, av_packets(0, 30 * 6 + 1, 60));
+        assert_eq!(after, 6, "packaging continues normally after the reset");
+        assert_eq!(target, 2);
+        assert!(max_part <= 45_000);
+        s.store().with(|st| {
+            let segs: Vec<_> = st.complete_segments().collect();
+            for w in segs.windows(2) {
+                assert!(w[1].start >= w[0].start + w[0].duration);
+                assert!(w[1].start - (w[0].start + w[0].duration) <= 3_000, "no gap");
+                assert!(w[0].audio_duration > 0 && w[1].audio_duration > 0);
+            }
+        });
+    }
+
+    #[test]
+    fn encoder_timestamp_jump_does_not_inflate_target_duration() {
+        let mut s = segmenter(SegmenterConfig::default(), 100);
+        s.push(&avc_header());
+        s.push(&aac_header());
+        run(&mut s, av_packets(0, 30 * 4 + 1, 60));
+        // Bogus forward jump of one hour.
+        let (n, target, max_part) = run(&mut s, av_packets(3_600_000, 30 * 4 + 1, 60));
+        assert!(n >= 4);
+        assert_eq!(
+            target, 2,
+            "EXT-X-TARGETDURATION must not jump to the gap size"
+        );
+        assert!(max_part <= 45_000);
     }
 }
