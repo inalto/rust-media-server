@@ -85,7 +85,12 @@ expect "metrics overview" 200 "${AUTH[@]}" "$BASE/api/v1/metrics/overview"
 expect "metrics time series -> 501 (phase 2)" 501 "${AUTH[@]}" "$BASE/api/v1/broadcasts/$NAME/metrics"
 expect "recordings -> 501 (phase 2)" 501 "${AUTH[@]}" "$BASE/api/v1/recordings"
 expect "record/start -> 501 (phase 2)" 501 "${AUTH[@]}" -X POST "$BASE/api/v1/broadcasts/$NAME/record/start"
-expect "settings -> 501 (phase 2)" 501 "${AUTH[@]}" "$BASE/api/v1/settings"
+expect "GET /settings" 200 "${AUTH[@]}" "$BASE/api/v1/settings"
+contains "settings has default waiting text" '"default_waiting_text"'
+contains "settings has upload limit" '"max_upload_mb"'
+expect "waiting video upload without file -> 400" 400 "${AUTH[@]}" -F "note=x" "$BASE/api/v1/broadcasts/$NAME/waiting-video"
+expect "waiting video upload of a non-video -> 415" 415 "${AUTH[@]}" -F "file=@$0;type=text/x-shellscript" "$BASE/api/v1/broadcasts/$NAME/waiting-video"
+expect "DELETE waiting video (none set)" 200 "${AUTH[@]}" -X DELETE "$BASE/api/v1/broadcasts/$NAME/waiting-video"
 expect "HTTP-FLV offline -> 404" 404 "$BASE/live/$NAME.flv"
 contains "offline error message" 'stream offline'
 expect "HTTP-FLV unknown -> 404" 404 "$BASE/live/does-not-exist-$RANDOM.flv"
