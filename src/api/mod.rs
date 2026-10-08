@@ -33,8 +33,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(broadcasts::routes())
         .merge(metrics::routes())
         .merge(recordings::routes())
-        .merge(waiting::routes())
-        .merge(settings::routes())
+        .merge(waiting::routes(state))
+        .merge(settings::routes(state))
         .merge(system::routes())
         .merge(events::routes())
         .route_layer(middleware::from_fn_with_state(

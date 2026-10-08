@@ -249,7 +249,7 @@ async fn delete_one(
 }
 
 /// Delete a file under `data/waiting/` (relative path; `..` components rejected).
-async fn remove_waiting_file(state: &AppState, rel: &str) {
+pub(crate) async fn remove_waiting_file(state: &AppState, rel: &str) {
     let rel_path = std::path::Path::new(rel);
     if rel_path
         .components()
