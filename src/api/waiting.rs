@@ -339,14 +339,20 @@ pub(crate) async fn receive_waiting_video(
                     .acquire()
                     .await
                     .map_err(|e| UploadError::Api(ApiError::internal(e.to_string())))?;
-                if let Err(e) = normalize(ffmpeg, &tmp.path, &dest).await {
-                    let _ = tokio::fs::remove_file(&dest).await;
-                    return Err(e);
-                }
+                // The outputs are removed unless everything succeeds: on errors and
+                // also when the client disconnects mid-way (this future is dropped,
+                // ffmpeg is killed and a partial MP4 would otherwise stay orphaned
+                // under data/waiting/).
+                let mut dest_guard = TempFile::new(dest.clone());
                 let poster = waiting_dir.join(poster_path_for(&rel));
-                if !make_poster(ffmpeg, &dest, &poster).await {
+                let mut poster_guard = TempFile::new(poster.clone());
+                normalize(ffmpeg, &tmp.path, &dest).await?;
+                if make_poster(ffmpeg, &dest, &poster).await {
+                    poster_guard.disarm();
+                } else {
                     tracing::warn!(video = %rel, "could not extract a poster frame");
                 }
+                dest_guard.disarm();
             }
             None => {
                 check_mp4_signature(&tmp.path).await?;
