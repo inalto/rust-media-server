@@ -228,6 +228,8 @@ pub struct LiveInfo {
     pub fps: Option<f64>,
     pub bytes_in: u64,
     pub recording: Option<Recording>,
+    /// LL-HLS/LL-DASH packaging status (codec support, readiness, measured GOP).
+    pub packager: Option<crate::packager::PackagerStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -297,6 +299,7 @@ impl ViewContext {
                 fps: info.fps,
                 bytes_in: s.bytes_in(),
                 recording: state.recorder.current(&broadcast.name),
+                packager: state.packager.status(&broadcast.name),
             }
         });
         BroadcastView {
