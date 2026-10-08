@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rms · Pannello dirette</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- PHASE 1 placeholder dashboard: the feat/dashboard branch replaces this file. -->
+  <header class="topbar">
+    <h1>rms <span class="muted">· Pannello dirette</span></h1>
+    <button id="logout" class="ghost" hidden>Esci</button>
+  </header>
+
+  <main>
+    <section id="login-view" class="card narrow" hidden>
+      <h2>Accesso</h2>
+      <p class="muted">Inserisci il token di amministrazione (lo trovi nel file <code>data/admin_token</code> o nel log al primo avvio).</p>
+      <form id="login-form">
+        <label>Token <input id="token" type="password" autocomplete="current-password" required></label>
+        <button type="submit">Accedi</button>
+        <p id="login-error" class="error" hidden></p>
+      </form>
+    </section>
+
+    <section id="app-view" hidden>
+      <div class="card">
+        <h2>Nuova diretta</h2>
+        <form id="create-form" class="grid">
+          <label>Titolo <input name="title" required maxlength="200" placeholder="Es. Messa della domenica"></label>
+          <label>Nome (URL, opzionale) <input name="name" pattern="[a-z0-9_\-]{1,64}" placeholder="generato dal titolo"></label>
+          <label class="wide">Descrizione <input name="description" maxlength="5000"></label>
+          <button type="submit">Crea diretta</button>
+          <p id="create-error" class="error wide" hidden></p>
+        </form>
+      </div>
+
+      <div class="toolbar">
+        <h2>Dirette</h2>
+        <span id="system-info" class="muted"></span>
+      </div>
+      <div id="broadcasts"></div>
+      <p id="empty" class="muted" hidden>Nessuna diretta: creane una qui sopra.</p>
+    </section>
+  </main>
+
+  <template id="broadcast-tpl">
+    <article class="card broadcast">
+      <div class="row">
+        <div>
+          <h3 class="b-title"></h3>
+          <div class="muted b-name"></div>
+        </div>
+        <span class="badge b-status"></span>
+      </div>
+      <div class="b-live muted"></div>
+      <div class="b-viewers"></div>
+      <dl class="kv">
+        <dt>Server OBS</dt><dd><code class="b-obs-server"></code> <button class="ghost small copy" data-copy="obs-server">Copia</button></dd>
+        <dt>Chiave stream</dt><dd><code class="b-obs-key secret"></code> <button class="ghost small toggle-key">Mostra</button> <button class="ghost small copy" data-copy="obs-key">Copia</button></dd>
+        <dt>HTTP-FLV</dt><dd><code class="b-url-flv"></code></dd>
+        <dt>WS-FLV</dt><dd><code class="b-url-wsflv"></code></dd>
+        <dt>LL-HLS</dt><dd><code class="b-url-hls"></code></dd>
+        <dt>LL-DASH</dt><dd><code class="b-url-dash"></code></dd>
+        <dt>Player</dt><dd><a class="b-url-player" target="_blank" rel="noopener"></a></dd>
+      </dl>
+      <details class="b-embed">
+        <summary>Codice di incorporamento</summary>
+        <textarea readonly rows="3" class="b-iframe"></textarea>
+      </details>
+      <div class="actions">
+        <button class="act-pause"></button>
+        <button class="ghost act-disconnect">Disconnetti encoder</button>
+        <button class="ghost act-regen">Rigenera chiave</button>
+        <button class="danger act-delete">Elimina</button>
+      </div>
+    </article>
+  </template>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
