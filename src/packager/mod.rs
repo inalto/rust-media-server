@@ -5,6 +5,12 @@
 //! `dash_mpd.rs`, `egress/hls.rs` and `egress/dash.rs`, and mounts the
 //! `/hls/...` and `/dash/...` routes in [`router`].
 
+pub mod cmaf;
+pub mod dash_mpd;
+pub mod hls_playlist;
+pub mod segmenter;
+pub mod store;
+
 use std::sync::Arc;
 
 use axum::Router;
