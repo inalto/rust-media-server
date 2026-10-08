@@ -82,9 +82,9 @@ contains "embed has iframe" '<iframe'
 contains "embed has mpegts snippet" 'mpegts'
 expect "sessions (empty)" 200 "${AUTH[@]}" "$BASE/api/v1/broadcasts/$NAME/sessions"
 expect "metrics overview" 200 "${AUTH[@]}" "$BASE/api/v1/metrics/overview"
-expect "metrics time series -> 501 (phase 2)" 501 "${AUTH[@]}" "$BASE/api/v1/broadcasts/$NAME/metrics"
-expect "recordings -> 501 (phase 2)" 501 "${AUTH[@]}" "$BASE/api/v1/recordings"
-expect "record/start -> 501 (phase 2)" 501 "${AUTH[@]}" -X POST "$BASE/api/v1/broadcasts/$NAME/record/start"
+expect "metrics time series" 200 "${AUTH[@]}" "$BASE/api/v1/broadcasts/$NAME/metrics"
+expect "recordings list" 200 "${AUTH[@]}" "$BASE/api/v1/recordings"
+expect "record/start when offline -> 409" 409 "${AUTH[@]}" -X POST "$BASE/api/v1/broadcasts/$NAME/record/start"
 expect "GET /settings" 200 "${AUTH[@]}" "$BASE/api/v1/settings"
 contains "settings has default waiting text" '"default_waiting_text"'
 contains "settings has upload limit" '"max_upload_mb"'
