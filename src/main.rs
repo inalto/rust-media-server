@@ -220,6 +220,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     {
         tracing::warn!("RTMP ingest did not stop in time");
     }
+    state.recorder.shutdown().await;
     tracing::info!("bye");
     Ok(())
 }
