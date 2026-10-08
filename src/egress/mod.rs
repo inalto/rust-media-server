@@ -73,6 +73,7 @@ pub struct FlvSubscriber {
     need_keyframe: bool,
     /// Recovering from lag: drop audio and video until a keyframe.
     skipping: bool,
+    /// The stream is known to carry video (lag recovery waits for a keyframe only then).
     has_video: bool,
 }
 
@@ -82,16 +83,15 @@ impl FlvSubscriber {
         let info = stream.info();
         let snap_video = snapshot.iter().any(|p| p.is_video());
         let snap_audio = snapshot.iter().any(|p| p.is_audio());
-        let mut has_video = info.has_video || snap_video;
-        let mut has_audio = info.has_audio || snap_audio;
-        if !has_video && !has_audio {
-            // Nothing known yet (stream just started): announce both.
-            has_video = true;
-            has_audio = true;
-        }
+        let has_video = info.has_video || snap_video;
+        let has_audio = info.has_audio || snap_audio;
+        // Nothing known yet (stream just started): announce both in the FLV header,
+        // but do not assume video for lag recovery (an audio-only stream would then
+        // wait forever for a keyframe after a lag).
+        let unknown = !has_video && !has_audio;
         let mut buf =
             BytesMut::with_capacity(13 + snapshot.iter().map(|p| p.flv_size()).sum::<usize>());
-        buf.extend_from_slice(&flv_file_header(has_video, has_audio));
+        buf.extend_from_slice(&flv_file_header(has_video || unknown, has_audio || unknown));
         let mut need_keyframe = true;
         for p in &snapshot {
             if p.is_video() && p.is_keyframe && !p.is_sequence_header {
@@ -116,6 +116,7 @@ impl FlvSubscriber {
             return true;
         }
         if p.is_video() {
+            self.has_video = true;
             if p.is_keyframe {
                 self.need_keyframe = false;
                 self.skipping = false;
@@ -208,5 +209,26 @@ mod tests {
 
         hub.publish_end("x");
         assert!(sub.next_chunk().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn audio_only_viewer_recovers_from_lag() {
+        let hub = Hub::new();
+        let s = hub.publish_start("a", PublishInfo::new("id")).unwrap();
+        // Subscribed before anything is known about the stream.
+        let mut sub = FlvSubscriber::new(&s, CancellationToken::new());
+        let first = sub.next_chunk().await.unwrap();
+        assert_eq!(first[4], 5, "header announces audio and video");
+        for i in 0..(crate::hub::stream::STREAM_CHANNEL_CAPACITY as u32 + 10) {
+            s.push(MediaPacket::audio(
+                i * 21,
+                Bytes::from_static(&[0xAF, 0x01, 0x21]),
+            ));
+        }
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), sub.next_chunk())
+            .await
+            .expect("audio must keep flowing after the lag")
+            .unwrap();
+        assert_eq!(next[0], 8);
     }
 }
