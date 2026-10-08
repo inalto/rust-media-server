@@ -447,6 +447,8 @@ async fn run_ffmpeg(
 }
 
 /// Normalize any accepted video to H.264/AAC MP4 with `+faststart` (≤ 1920 px wide).
+/// The width is rounded down to an even value (yuv420p/libx264 reject odd sizes) and
+/// the height follows the aspect ratio (`-2`, also even).
 async fn normalize(ffmpeg: &FsPath, input: &FsPath, output: &FsPath) -> Result<(), UploadError> {
     let (input, output) = (input.to_string_lossy(), output.to_string_lossy());
     let args = [
@@ -466,7 +468,7 @@ async fn normalize(ffmpeg: &FsPath, input: &FsPath, output: &FsPath) -> Result<(
         "-crf",
         "23",
         "-vf",
-        "scale='min(1920,iw)':-2",
+        "scale='trunc(min(1920,iw)/2)*2':-2",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -745,7 +747,8 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    /// Tiny real MP4 (1 s, 160x90, with audio) generated with ffmpeg, if available.
+    /// Tiny real video (1.5 s, odd 161x91 size, 4:4:4, with audio) generated with
+    /// ffmpeg, if available: normalization must cope with odd dimensions.
     pub fn tiny_mp4(dir: &FsPath) -> Option<Vec<u8>> {
         let ffmpeg = crate::config::find_in_path("ffmpeg")?;
         let out = dir.join("tiny-src.mov");
@@ -758,7 +761,7 @@ pub(crate) mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "testsrc2=size=160x90:rate=15",
+                "testsrc2=size=161x91:rate=15",
                 "-f",
                 "lavfi",
                 "-i",
@@ -768,7 +771,7 @@ pub(crate) mod tests {
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
-                "yuv420p",
+                "yuv444p",
                 "-c:a",
                 "aac",
             ])
