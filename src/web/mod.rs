@@ -1,7 +1,7 @@
 //! Pages and static assets (ARCHITECTURE.md §8.3).
 //!
-//! - `/` dashboard SPA (`static/index.html`, `app.js`, `style.css`) — PHASE 1 is a
-//!   minimal placeholder; the `feat/dashboard` branch replaces these files.
+//! - `/` dashboard SPA (`static/index.html` + ES modules `app.js`, `core.js`,
+//!   `detail.js`, `metrics.js`, `mock.js`, and `style.css`), Italian UI.
 //! - `/embed/{name}` player page for iframes, `/player/{name}` full-page player
 //!   (same `embed.html`, `data-mode` differs).
 //! - `/static/*` assets embedded in the binary with `include_str!`.
@@ -32,9 +32,34 @@ const ASSETS: &[(&str, &str, &str)] = &[
         include_str!("static/app.js"),
     ),
     (
+        "core.js",
+        "text/javascript; charset=utf-8",
+        include_str!("static/core.js"),
+    ),
+    (
+        "detail.js",
+        "text/javascript; charset=utf-8",
+        include_str!("static/detail.js"),
+    ),
+    (
+        "metrics.js",
+        "text/javascript; charset=utf-8",
+        include_str!("static/metrics.js"),
+    ),
+    (
+        "mock.js",
+        "text/javascript; charset=utf-8",
+        include_str!("static/mock.js"),
+    ),
+    (
         "style.css",
         "text/css; charset=utf-8",
         include_str!("static/style.css"),
+    ),
+    (
+        "favicon.svg",
+        "image/svg+xml",
+        include_str!("static/favicon.svg"),
     ),
     (
         "embed.html",
