@@ -384,10 +384,10 @@ impl<'a> BitReader<'a> {
         Some(((1u64 << zeros) - 1 + rest as u64).min(u32::MAX as u64) as u32)
     }
 
-    /// Signed Exp-Golomb.
-    fn se(&mut self) -> Option<i32> {
+    /// Signed Exp-Golomb (widened: `ue` values up to 2^32 - 2 map to ±2^31).
+    fn se(&mut self) -> Option<i64> {
         let k = self.ue()? as i64;
-        Some(if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) } as i32)
+        Some(if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) })
     }
 }
 
@@ -435,9 +435,10 @@ pub fn parse_h264_sps_dimensions(sps_nal: &[u8]) -> Option<(u32, u32)> {
             for i in 0..count {
                 if r.bit()? == 1 {
                     let size = if i < 6 { 16 } else { 64 };
-                    let (mut last, mut next) = (8i32, 8i32);
+                    let (mut last, mut next) = (8i64, 8i64);
                     for _ in 0..size {
                         if next != 0 {
+                            // i64: a hostile delta_scale near ±2^31 must not overflow.
                             let delta = r.se()?;
                             next = (last + delta + 256).rem_euclid(256);
                         }
@@ -486,15 +487,21 @@ pub fn parse_h264_sps_dimensions(sps_nal: &[u8]) -> Option<(u32, u32)> {
     } else {
         chroma_format_idc
     };
-    let (crop_x, crop_y) = if chroma_array_type == 0 {
+    let (crop_x, crop_y): (u32, u32) = if chroma_array_type == 0 {
         (1, 2 - frame_mbs_only)
     } else {
         let sub_w = if chroma_array_type == 3 { 1 } else { 2 };
         let sub_h = if chroma_array_type == 1 { 2 } else { 1 };
         (sub_w, sub_h * (2 - frame_mbs_only))
     };
-    let width = (width_mbs * 16).checked_sub(crop_x * (cl + cr))?;
-    let height = ((2 - frame_mbs_only) * height_map_units * 16).checked_sub(crop_y * (ct + cb))?;
+    // Checked arithmetic: every field comes from the publisher (ue values reach 2^32 - 2).
+    let width = width_mbs
+        .checked_mul(16)?
+        .checked_sub(crop_x.checked_mul(cl.checked_add(cr)?)?)?;
+    let height = (2 - frame_mbs_only)
+        .checked_mul(height_map_units)?
+        .checked_mul(16)?
+        .checked_sub(crop_y.checked_mul(ct.checked_add(cb)?)?)?;
     (width > 0 && height > 0 && width <= 16384 && height <= 16384).then_some((width, height))
 }
 
@@ -607,6 +614,61 @@ mod tests {
         for n in 0..SPS_1080P.len() {
             let _ = parse_h264_sps_dimensions(&SPS_1080P[..n]);
         }
+    }
+
+    /// MSB-first bit string ("0101...") to bytes, padded with a stop bit and zeros.
+    fn bits(s: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        let (mut cur, mut n) = (0u8, 0);
+        for c in s.chars() {
+            cur = (cur << 1) | u8::from(c == '1');
+            n += 1;
+            if n == 8 {
+                out.push(cur);
+                (cur, n) = (0, 0);
+            }
+        }
+        if n > 0 {
+            out.push((cur << (8 - n)) | (1 << (7 - n)));
+        }
+        out
+    }
+
+    #[test]
+    fn sps_hostile_values_never_overflow() {
+        // Baseline SPS whose pic_width_in_mbs_minus1 is the largest ue value (2^32 - 2):
+        // `width_mbs * 16` used to overflow.
+        let mut b = String::from("111110"); // sps_id, frame_num, poc 0, poc lsb, refs, gaps
+        b += &"0".repeat(31);
+        b += "1";
+        b += &"1".repeat(31);
+        b += "1110"; // height 0, frame_mbs_only, direct_8x8, no crop
+        let mut sps = vec![0x67, 66, 0, 0x1f];
+        sps.extend(bits(&b));
+        assert_eq!(parse_h264_sps_dimensions(&sps), None);
+
+        // High profile with a scaling list whose delta_scale is close to 2^31:
+        // `last + delta + 256` used to overflow i32.
+        let mut b = String::from("1010110"); // sps_id, chroma 1, depths, qpprime
+        b += "11"; // seq_scaling_matrix_present, list 0 present
+        b += &"0".repeat(31);
+        b += "1";
+        b += &format!("{:031b}", (1u64 << 31) - 2);
+        b += &"1".repeat(64);
+        let mut sps = vec![0x67, 100, 0, 0x1f];
+        sps.extend(bits(&b));
+        let _ = parse_h264_sps_dimensions(&sps);
+
+        // Huge cropping offsets.
+        let mut b = String::from("111110");
+        b += "0001010"; // width_mbs_minus1 = 9
+        b += "1"; // height_map_units_minus1 = 0
+        b += "111"; // frame_mbs_only, direct_8x8, cropping
+        let huge = format!("{}1{}", "0".repeat(31), "1".repeat(31));
+        b += &huge.repeat(4);
+        let mut sps = vec![0x67, 66, 0, 0x1f];
+        sps.extend(bits(&b));
+        assert_eq!(parse_h264_sps_dimensions(&sps), None);
     }
 
     #[test]
