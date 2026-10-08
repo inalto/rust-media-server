@@ -1,8 +1,11 @@
-//! Playback endpoints. Phase 1: HTTP-FLV (`/live/{name}.flv`) and WebSocket-FLV
-//! (`/ws/live/{name}.flv`). LL-HLS / LL-DASH (`hls.rs`, `dash.rs`) come with the
-//! packager branch and are mounted by `packager::router()`.
+//! Playback endpoints: HTTP-FLV (`/live/{name}.flv`) and WebSocket-FLV
+//! (`/ws/live/{name}.flv`) are mounted by [`router`]; LL-HLS / LL-DASH (`hls.rs`,
+//! `dash.rs`) are mounted by `packager::router()`.
 
+pub mod dash;
+pub mod hls;
 pub mod httpflv;
+mod lowlat;
 pub mod wsflv;
 
 use std::sync::Arc;
