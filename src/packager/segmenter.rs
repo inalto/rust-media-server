@@ -530,6 +530,16 @@ impl Segmenter {
         }
 
         if keyframe {
+            // A keyframe always closes the pending part. If it arrives late (e.g. 29.97
+            // fps: last frame at +467 ms, keyframe at +501 ms) that part would exceed
+            // PART-TARGET: close it at the previous frame and let that frame form the
+            // (short) final part, as the non-keyframe path below does.
+            if dts - self.chunk_start > self.part_ticks() && self.pending_video.len() > 1 {
+                let last = self.pending_video.pop().expect("len > 1");
+                self.close_chunk(last.dts);
+                self.chunk_start = last.dts;
+                self.pending_video.push(last);
+            }
             if dts - self.seg_start >= self.cfg.min_segment_ms as u64 * TICKS_PER_MS {
                 self.close_chunk(dts);
                 self.store.open_segment(dts, true);
@@ -1118,6 +1128,38 @@ mod tests {
             assert_eq!(gens.first(), Some(&0));
             assert_eq!(gens.last(), Some(&1));
         });
+    }
+
+    #[test]
+    fn keyframe_closed_parts_never_exceed_target_2997fps() {
+        // 29.97 fps with millisecond FLV timestamps: a keyframe often lands 1 ms past
+        // the part boundary (+467 ms, then +501 ms).
+        for gop in [15u32, 48, 59, 60, 61, 120] {
+            let mut s = segmenter(SegmenterConfig::default(), 100);
+            s.push(&avc_header());
+            s.push(&aac_header());
+            for i in 0..3000u32 {
+                let ts = (i as f64 * 1001.0 / 30.0).round() as u32;
+                s.push(&vframe(ts, i % gop == 0, 0));
+            }
+            s.store().with(|st| {
+                assert!(
+                    st.max_part <= 45_000,
+                    "gop {gop}: part of {} ticks",
+                    st.max_part
+                );
+                for seg in st.complete_segments() {
+                    // Short parts only as the last part of a segment or at keyframes.
+                    let n = seg.chunks.len();
+                    for (i, c) in seg.chunks.iter().enumerate() {
+                        let next_independent = seg.chunks.get(i + 1).is_some_and(|c| c.independent);
+                        if i + 1 < n && !next_independent {
+                            assert!(c.duration >= 38_250, "gop {gop}: short inner part");
+                        }
+                    }
+                }
+            });
+        }
     }
 
     #[test]
