@@ -247,13 +247,6 @@ impl ViewerTracker {
     /// Register activity of a request-oriented session (HLS, DASH).
     pub fn touch(&self, name: &str, protocol: Protocol, ip: IpAddr, user_agent: &str) {
         let id = Self::request_session_id(name, protocol, ip, user_agent);
-        {
-            let mut inner = self.lock();
-            if let Some(e) = inner.sessions.get_mut(&id) {
-                e.last_seen = Instant::now();
-                return;
-            }
-        }
         self.insert(id, name, protocol, ip, user_agent);
     }
 
@@ -275,17 +268,24 @@ impl ViewerTracker {
         hex::encode(h.finalize())
     }
 
+    /// Register session `id`, or only refresh its `last_seen` if it already exists.
+    /// Lookup and insertion happen under one lock: concurrent first requests of the
+    /// same HLS/DASH viewer must not count it twice (the reaper removes the entry
+    /// once, so a double count would never go away).
     fn insert(&self, id: String, name: &str, protocol: Protocol, ip: IpAddr, user_agent: &str) {
-        let ua: String = user_agent.chars().take(MAX_UA_LEN).collect();
-        let info = SessionInfo {
-            id: id.clone(),
-            protocol,
-            ip: ip.to_string(),
-            user_agent: ua,
-            started_at: Utc::now(),
-        };
-        let counts = {
+        let (info, counts) = {
             let mut inner = self.lock();
+            if let Some(e) = inner.sessions.get_mut(&id) {
+                e.last_seen = Instant::now();
+                return;
+            }
+            let info = SessionInfo {
+                id: id.clone(),
+                protocol,
+                ip: ip.to_string(),
+                user_agent: user_agent.chars().take(MAX_UA_LEN).collect(),
+                started_at: Utc::now(),
+            };
             inner.sessions.insert(
                 id,
                 SessionEntry {
@@ -299,7 +299,7 @@ impl ViewerTracker {
             let counts = *c;
             let peak = inner.peaks.entry(name.to_string()).or_default();
             *peak = (*peak).max(counts.total());
-            counts
+            (info, counts)
         };
         tracing::debug!(broadcast = %name, %protocol, ip = %info.ip, "viewer session opened");
         self.on_session_open(name, &info);
@@ -554,6 +554,35 @@ mod tests {
         assert_eq!(t.counts("b").total(), 3);
         t.reap(Instant::now() + Duration::from_secs(5));
         assert_eq!(t.counts("b").total(), 0);
+    }
+
+    #[test]
+    fn concurrent_first_touches_count_once() {
+        // Players fire several requests at once (playlist + part + preload hint): the
+        // first touches of the same session must not register it twice.
+        let (t, _rx) = tracker(1);
+        let threads = 16;
+        let rounds = 200u32;
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let (t, barrier) = (Arc::clone(&t), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    for r in 0..rounds {
+                        let ip = IpAddr::from([10, 1, (r >> 8) as u8, r as u8]);
+                        barrier.wait();
+                        t.touch("c", Protocol::Hls, ip, "hls.js");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(t.counts("c").hls, rounds);
+        assert_eq!(t.sessions("c").len(), rounds as usize);
+        t.reap(Instant::now() + Duration::from_secs(5));
+        assert_eq!(t.counts("c").total(), 0, "no session leaked in the counts");
     }
 
     #[test]
