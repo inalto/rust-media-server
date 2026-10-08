@@ -18,6 +18,7 @@ max_upload_mb = 1024
 [rtmp]
 bind = "0.0.0.0:1935"
 app = "live"               # advertised in the OBS settings; any app name is accepted
+max_connections = 256      # simultaneous RTMP connections (handshake + publish)
 
 [hls]
 enabled = true

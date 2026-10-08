@@ -2,7 +2,8 @@
 //! upload pipeline shared with the global default (`api/settings.rs`).
 //!
 //! Pipeline: the multipart `file` field is streamed to a temp file under
-//! `data/waiting/tmp/` (never buffered in memory, bounded by `server.max_upload_mb`),
+//! `data/upload-tmp/` (outside the publicly served `data/waiting/` tree; never buffered
+//! in memory, bounded by `server.max_upload_mb`),
 //! then:
 //! - with ffmpeg: normalized to H.264/AAC MP4 (`+faststart`, max 1920 px wide) and a
 //!   poster frame is extracted (`<video stem>.jpg`, see [`super::poster_path_for`]);
@@ -61,8 +62,9 @@ const MIME_EXTENSIONS: &[(&str, &str)] = &[
 
 /// Sub-directory of `data/waiting/` holding the global default waiting video.
 pub const DEFAULT_SUBDIR: &str = "_default";
-/// Sub-directory of `data/waiting/` for in-flight uploads (`.upload-*` files).
-pub const TMP_SUBDIR: &str = "tmp";
+/// Sub-directory of the data dir for in-flight uploads (`.upload-*` files). Kept outside
+/// `data/waiting/`, which is served publicly under `/waiting/*`.
+pub const TMP_SUBDIR: &str = "upload-tmp";
 const TMP_PREFIX: &str = ".upload-";
 /// Leftover temp files older than this are removed on the next upload.
 const TMP_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
@@ -280,7 +282,7 @@ pub(crate) async fn receive_waiting_video(
 ) -> Result<String, UploadError> {
     let limit = state.config.server.max_upload_mb.saturating_mul(MIB);
     let waiting_dir = state.config.waiting_dir();
-    let tmp_dir = waiting_dir.join(TMP_SUBDIR);
+    let tmp_dir = state.config.server.data_dir.join(TMP_SUBDIR);
     tokio::fs::create_dir_all(&tmp_dir)
         .await
         .map_err(|e| io_error("creating upload directory", e))?;
@@ -866,9 +868,7 @@ pub(crate) mod tests {
         assert!(body["waiting_video_url"].is_null());
         assert!(!dir.join("waiting").join(&rel2).exists());
         // No temp leftovers.
-        let leftovers = std::fs::read_dir(dir.join("waiting").join(TMP_SUBDIR))
-            .unwrap()
-            .count();
+        let leftovers = std::fs::read_dir(dir.join(TMP_SUBDIR)).unwrap().count();
         assert_eq!(leftovers, 0);
         std::fs::remove_dir_all(dir).unwrap();
     }

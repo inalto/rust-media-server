@@ -57,6 +57,7 @@ Chiavi principali:
 | `server.public_url` | vuoto | URL pubblico (es. `https://stream.example.com`) usato nei link e negli embed; se vuoto deriva dall'header `Host` |
 | `server.trust_proxy` | `false` | usa `X-Forwarded-For` per l'IP degli spettatori dietro reverse proxy |
 | `rtmp.bind` | `0.0.0.0:1935` | porta RTMP per OBS |
+| `rtmp.max_connections` | `256` | connessioni RTMP simultanee ammesse |
 | `hls.part_duration` | `0.5` | durata delle part LL-HLS (s) |
 | `hls.window_segments` | `6` | segmenti mantenuti nella playlist |
 | `dash.segment_duration` | `2.0` | durata nominale dei segmenti DASH (s) |

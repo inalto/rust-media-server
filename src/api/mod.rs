@@ -367,7 +367,8 @@ pub fn escape_html_js(s: &str) -> String {
 pub mod cdn {
     pub const HLS_JS: &str = "https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js";
     pub const MPEGTS_JS: &str = "https://cdn.jsdelivr.net/npm/mpegts.js@1.8.2/dist/mpegts.js";
-    pub const DASH_JS: &str = "https://cdn.jsdelivr.net/npm/dashjs@5.2.1/dist/modern/umd/dash.all.min.js";
+    pub const DASH_JS: &str =
+        "https://cdn.jsdelivr.net/npm/dashjs@5.2.1/dist/modern/umd/dash.all.min.js";
 }
 
 #[derive(Debug, Clone, Serialize)]

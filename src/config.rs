@@ -56,6 +56,9 @@ pub struct RtmpConfig {
     pub bind: String,
     /// Advertised application name (OBS "Server" URL suffix). Any app is accepted on ingest.
     pub app: String,
+    /// Maximum simultaneous RTMP connections (handshaking + publishing). Extra connections
+    /// are closed immediately; protects against unauthenticated memory exhaustion.
+    pub max_connections: usize,
 }
 
 impl Default for RtmpConfig {
@@ -63,6 +66,7 @@ impl Default for RtmpConfig {
         Self {
             bind: "0.0.0.0:1935".into(),
             app: "live".into(),
+            max_connections: 256,
         }
     }
 }

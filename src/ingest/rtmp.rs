@@ -40,6 +40,7 @@ use rtmp_rs::server::handler::{AuthResult, MediaDeliveryMode, RtmpHandler};
 use rtmp_rs::session::{SessionContext, StreamContext};
 use rtmp_rs::{ServerConfig, StreamKey, StreamRegistry};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -397,11 +398,20 @@ impl RtmpServer {
         tracing::info!(task = "rtmp-ingest", addr = ?addr, "RTMP ingest listening");
         let cleanup = self.handler.registry.spawn_cleanup_task();
         let tasks = TaskTracker::new();
+        let limiter = Arc::new(Semaphore::new(
+            self.handler.config.rtmp.max_connections.max(1),
+        ));
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 accepted = self.listener.accept() => match accepted {
-                    Ok((socket, peer)) => self.spawn_connection(&tasks, socket, peer, &shutdown),
+                    Ok((socket, peer)) => match Arc::clone(&limiter).try_acquire_owned() {
+                        Ok(permit) => self.spawn_connection(&tasks, socket, peer, &shutdown, permit),
+                        Err(_) => {
+                            tracing::warn!(task = "rtmp-ingest", %peer, limit = self.handler.config.rtmp.max_connections, "RTMP connection limit reached; closing connection");
+                            drop(socket);
+                        }
+                    },
                     Err(e) => {
                         // e.g. EMFILE: back off instead of spinning.
                         tracing::warn!(task = "rtmp-ingest", error = %e, "accept failed");
@@ -430,6 +440,7 @@ impl RtmpServer {
         socket: TcpStream,
         peer: SocketAddr,
         shutdown: &CancellationToken,
+        permit: OwnedSemaphorePermit,
     ) {
         if let Err(e) = socket.set_nodelay(true) {
             tracing::debug!(error = %e, "set_nodelay failed");
@@ -445,6 +456,8 @@ impl RtmpServer {
         let config = self.server_config.clone();
         tracing::debug!(session_id, %peer, "RTMP connection accepted");
         tasks.spawn(async move {
+            // Released when this task ends (connection closed).
+            let _permit = permit;
             let registry = Arc::clone(&handler.registry);
             let mut conn = Connection::new(session_id, socket, peer, config, Arc::clone(&handler), registry);
             let cancelled = tokio::select! {
