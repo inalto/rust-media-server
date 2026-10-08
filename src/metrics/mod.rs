@@ -19,6 +19,7 @@ pub use sampler::spawn_sampler;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,9 +27,10 @@ use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::config::Config;
+use crate::db::metrics::SessionWrite;
 use crate::db::{self, Db};
 use crate::hub::HubEvent;
 
@@ -168,6 +170,11 @@ pub struct ViewerTracker {
     inner: Mutex<Inner>,
     events: broadcast::Sender<HubEvent>,
     db: Option<Db>,
+    /// Ordered queue of `viewer_sessions` writes, drained by one writer task (created
+    /// lazily on the first write made inside a tokio runtime).
+    db_queue: Mutex<Option<mpsc::Sender<SessionWrite>>>,
+    /// Writes dropped because the queue was full (database far behind).
+    db_dropped: AtomicU64,
     session_timeout: Duration,
 }
 
@@ -198,6 +205,10 @@ impl std::fmt::Debug for ViewerSession {
 }
 
 const MAX_UA_LEN: usize = 512;
+/// Capacity of the `viewer_sessions` write queue.
+const DB_QUEUE_CAPACITY: usize = 8192;
+/// Writes applied per database transaction by the writer task.
+const DB_BATCH: usize = 256;
 
 impl ViewerTracker {
     pub fn new(config: &Config, db: Option<Db>, events: broadcast::Sender<HubEvent>) -> Arc<Self> {
@@ -205,6 +216,8 @@ impl ViewerTracker {
             inner: Mutex::new(Inner::default()),
             events,
             db,
+            db_queue: Mutex::new(None),
+            db_dropped: AtomicU64::new(0),
             session_timeout: Duration::from_secs(config.metrics.session_timeout_secs.max(1)),
         })
     }
@@ -299,10 +312,12 @@ impl ViewerTracker {
             let counts = *c;
             let peak = inner.peaks.entry(name.to_string()).or_default();
             *peak = (*peak).max(counts.total());
+            // Queued under the tracker lock: the queue order is the order in which
+            // sessions were opened/closed (see `queue_db_write`).
+            self.on_session_open(name, &info);
             (info, counts)
         };
         tracing::debug!(broadcast = %name, %protocol, ip = %info.ip, "viewer session opened");
-        self.on_session_open(name, &info);
         self.emit(name, counts);
     }
 
@@ -311,12 +326,12 @@ impl ViewerTracker {
             let mut inner = self.lock();
             inner.sessions.remove(id).map(|e| {
                 let counts = Self::decrement(&mut inner, &e.name, e.info.protocol);
+                self.on_session_close(&e.info.id, Utc::now());
                 (e, counts)
             })
         };
         if let Some((entry, counts)) = removed {
             tracing::debug!(broadcast = %entry.name, protocol = %entry.info.protocol, "viewer session closed");
-            self.on_session_close(&entry.info.id, Utc::now());
             self.emit(&entry.name, counts);
         }
     }
@@ -334,7 +349,8 @@ impl ViewerTracker {
 
     /// Expire request-based sessions idle for longer than the session timeout.
     fn reap(&self, now: Instant) {
-        let expired: Vec<(String, String, ViewerCounts, Instant)> = {
+        let wall_now = Utc::now();
+        let expired: Vec<(String, ViewerCounts)> = {
             let mut inner = self.lock();
             let ids: Vec<String> = inner
                 .sessions
@@ -349,19 +365,19 @@ impl ViewerTracker {
             for id in ids {
                 if let Some(e) = inner.sessions.remove(&id) {
                     let c = Self::decrement(&mut inner, &e.name, e.info.protocol);
-                    out.push((id, e.name, c, e.last_seen));
+                    // The viewer was last seen at `last_seen`, not when the reaper noticed.
+                    let idle =
+                        chrono::Duration::from_std(now.saturating_duration_since(e.last_seen))
+                            .unwrap_or_default();
+                    self.on_session_close(&id, wall_now - idle);
+                    out.push((e.name, c));
                 }
             }
             out
         };
         // Emit only the final count per broadcast.
         let mut last: HashMap<String, ViewerCounts> = HashMap::new();
-        let wall_now = Utc::now();
-        for (id, name, counts, last_seen) in expired {
-            // The viewer was last seen at `last_seen`, not when the reaper noticed.
-            let idle = chrono::Duration::from_std(now.saturating_duration_since(last_seen))
-                .unwrap_or_default();
-            self.on_session_close(&id, wall_now - idle);
+        for (name, counts) in expired {
             last.insert(name, counts);
         }
         for (name, counts) in last {
@@ -378,37 +394,54 @@ impl ViewerTracker {
 
     /// Hook: persist a `viewer_sessions` row.
     fn on_session_open(&self, name: &str, info: &SessionInfo) {
-        let Some(db) = self.db.clone() else { return };
-        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        if self.db.is_none() {
             return;
-        };
-        let record = db::metrics::ViewerSessionRecord {
+        }
+        self.queue_db_write(SessionWrite::Open(db::metrics::ViewerSessionRecord {
             id: info.id.clone(),
             broadcast_name: name.to_string(),
             protocol: info.protocol,
             ip: Some(info.ip.clone()),
             user_agent: Some(info.user_agent.clone()),
             started_at: info.started_at,
-        };
-        rt.spawn(async move {
-            if let Err(e) = db::metrics::insert_viewer_session(&db, record).await {
-                tracing::warn!(error = %e, "failed to record viewer session");
-            }
-        });
+        }));
     }
 
     /// Hook: close the `viewer_sessions` row.
     fn on_session_close(&self, id: &str, ended_at: DateTime<Utc>) {
-        let Some(db) = self.db.clone() else { return };
-        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        if self.db.is_none() {
             return;
-        };
-        let id = id.to_string();
-        rt.spawn(async move {
-            if let Err(e) = db::metrics::close_viewer_session(&db, &id, ended_at).await {
-                tracing::warn!(error = %e, "failed to close viewer session");
-            }
+        }
+        self.queue_db_write(SessionWrite::Close {
+            id: id.to_string(),
+            ended_at,
         });
+    }
+
+    /// Queue a `viewer_sessions` write for the single writer task, which applies the
+    /// writes in queue order. (Spawning one task per write let a quick close overtake
+    /// its own insert, leaving the row open forever.) Non-blocking: when the database
+    /// falls far behind, writes are dropped and counted rather than buffered without
+    /// bound. Callers hold the tracker lock, so the queue order matches the order of
+    /// the in-memory session changes.
+    fn queue_db_write(&self, write: SessionWrite) {
+        let Some(db) = &self.db else { return };
+        let mut queue = self.db_queue.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.as_ref().is_none_or(mpsc::Sender::is_closed) {
+            let Ok(rt) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            let (tx, rx) = mpsc::channel(DB_QUEUE_CAPACITY);
+            rt.spawn(session_writer(db.clone(), rx));
+            *queue = Some(tx);
+        }
+        let Some(tx) = queue.as_ref() else { return };
+        if let Err(mpsc::error::TrySendError::Full(w)) = tx.try_send(write) {
+            let n = self.db_dropped.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(1000) {
+                tracing::warn!(dropped = n + 1, write = ?w, "viewer session write queue full; dropping writes");
+            }
+        }
     }
 
     pub fn counts(&self, name: &str) -> ViewerCounts {
@@ -452,6 +485,19 @@ impl ViewerTracker {
         let peak = inner.peaks.insert(name.to_string(), current).unwrap_or(0);
         peak.max(current)
     }
+}
+
+/// Writer task of the `viewer_sessions` queue: applies writes in order, in batches.
+async fn session_writer(db: Db, mut rx: mpsc::Receiver<SessionWrite>) {
+    tracing::debug!(task = "viewer-session-writer", "started");
+    let mut batch = Vec::with_capacity(DB_BATCH);
+    while rx.recv_many(&mut batch, DB_BATCH).await > 0 {
+        let writes = std::mem::take(&mut batch);
+        if let Err(e) = db::metrics::apply_session_writes(&db, writes).await {
+            tracing::warn!(task = "viewer-session-writer", error = %e, "failed to persist viewer sessions");
+        }
+    }
+    tracing::debug!(task = "viewer-session-writer", "stopped");
 }
 
 /// Peer IP of a request: first `X-Forwarded-For` element or `X-Real-IP` when
@@ -583,6 +629,82 @@ mod tests {
         assert_eq!(t.sessions("c").len(), rounds as usize);
         t.reap(Instant::now() + Duration::from_secs(5));
         assert_eq!(t.counts("c").total(), 0, "no session leaked in the counts");
+    }
+
+    async fn rows(db: &Db, sql: &'static str) -> i64 {
+        db.call(move |c| Ok(c.query_row(sql, [], |r| r.get(0))?))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_rows_are_written_in_order() {
+        let db = Db::open_in_memory().unwrap();
+        db::broadcasts::create(&db, db::broadcasts::NewBroadcast::new("show", "Show"))
+            .await
+            .unwrap();
+        let (tx, _rx) = broadcast::channel(16);
+        let t = ViewerTracker::new(&Config::default(), Some(db.clone()), tx);
+        let ip: IpAddr = "10.0.0.9".parse().unwrap();
+        // Very short FLV sessions: the close must never overtake the insert.
+        let n = 500;
+        let tasks: Vec<_> = (0..n)
+            .map(|_| {
+                let t = Arc::clone(&t);
+                tokio::spawn(async move { drop(t.open("show", Protocol::Flv, ip, "probe")) })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        // An HLS viewer that expires and comes back reuses its session id.
+        t.touch("show", Protocol::Hls, ip, "hls.js");
+        t.reap(Instant::now() + Duration::from_secs(60));
+        t.touch("show", Protocol::Hls, ip, "hls.js");
+        t.reap(Instant::now() + Duration::from_secs(60));
+        for _ in 0..500 {
+            if rows(
+                &db,
+                "SELECT COUNT(*) FROM viewer_sessions WHERE ended_at IS NOT NULL",
+            )
+            .await
+                == n + 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            rows(&db, "SELECT COUNT(*) FROM viewer_sessions").await,
+            n + 2
+        );
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT COUNT(*) FROM viewer_sessions WHERE ended_at IS NULL"
+            )
+            .await,
+            0,
+            "a session row was left open"
+        );
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT COUNT(*) FROM viewer_sessions WHERE protocol = 'flv' AND ended_at < started_at"
+            )
+            .await,
+            0
+        );
+        // The returning HLS viewer: the first row was archived, the second one is
+        // the current id; both closed.
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT COUNT(*) FROM viewer_sessions WHERE protocol = 'hls'"
+            )
+            .await,
+            2
+        );
     }
 
     #[test]
