@@ -12,7 +12,7 @@ pronti da incollare e un video d'attesa quando la diretta non c'è.
 - Registrazione: automatica (flag) o manuale; FLV nativo → MP4 via ffmpeg
 - Metriche: spettatori simultanei per protocollo campionati su SQLite, grafici Chart.js, picco/sessioni/durata media
 - Video d'attesa per diretta o globale, mostrato dal player quando la diretta è offline o **in pausa**
-- Zero dipendenze esterne a runtime: SQLite incorporato; `ffmpeg` opzionale (remux MP4, normalizzazione video d'attesa)
+- Zero dipendenze esterne a runtime sul server: SQLite incorporato; `ffmpeg` opzionale (remux MP4, normalizzazione video d'attesa). I browser caricano hls.js, mpegts.js, dash.js (jsDelivr) e Chart.js (cdnjs) da CDN
 
 Architettura e contratto API: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (inglese).
 Standard di streaming a bassa latenza e raccomandazioni: [docs/PROTOCOLS.md](docs/PROTOCOLS.md).
@@ -20,7 +20,7 @@ Riferimento API: [docs/API.md](docs/API.md).
 
 ## Requisiti
 
-- Linux x86_64 (testato su AlmaLinux 9), Rust stable ≥ 1.85 (edition 2024) per compilare
+- Linux x86_64 (testato su AlmaLinux 9), Rust stable recente per compilare (edition 2024; sviluppato con 1.99, la dipendenza `uuid` richiede almeno 1.89)
 - `ffmpeg`/`ffprobe` nel PATH (opzionali ma consigliati): build statiche vanno benissimo
 - Porte: `8080/tcp` (HTTP: dashboard, API, player) e `1935/tcp` (RTMP) — modificabili
 
@@ -68,14 +68,14 @@ Chiavi principali:
 ## Flusso di lavoro
 
 1. Nella dashboard crea una **diretta** (titolo → nome URL automatico). Ogni diretta ha una stream key segreta.
-2. In OBS: *Impostazioni → Dirette → Servizio: Personalizzato*, Server `rtmp://<host>:1935/live`, Chiave `<stream key>`.
+2. In OBS: *Impostazioni → Stream → Servizio: Personalizzato*, Server `rtmp://<host>:1935/live`, Chiave `<stream key>`.
    Impostazioni consigliate (vedi `docs/PROTOCOLS.md` §5): **intervallo keyframe 2 s** (1 s per latenza minima),
    x264 `tune=zerolatency` o NVENC *Low latency*, CBR, nessun B-frame, audio AAC 48 kHz.
 3. Avvia la diretta in OBS: la dashboard mostra lo stato *In diretta*, codec, risoluzione, spettatori.
 4. Copia il codice `<iframe>` dalla sezione *Link e embed* e incollalo nel sito. Il player sceglie da solo
-   la sorgente migliore (HTTP-FLV su desktop/Android, LL-HLS nativo su iOS/Safari) e mostra il
+   la sorgente migliore (HTTP-FLV su desktop/Android, LL-HLS nativo su iOS) e mostra il
    **video d'attesa** finché la diretta non arriva, se cade o se la metti **in pausa**.
-5. Attiva la registrazione (flag *Registra* sulla diretta, oppure *Registra ora* durante la diretta).
+5. Attiva la registrazione (flag *Registra automaticamente* sulla diretta, oppure *Registra ora* durante la diretta).
    I file finiscono in `data/recordings/<nome>/` e sono scaricabili dalla dashboard.
 
 ### URL di riproduzione
@@ -89,7 +89,7 @@ Chiavi principali:
 | Player embed | `http://<host>:8080/embed/<nome>` | iframe |
 | Player pagina intera | `http://<host>:8080/player/<nome>` | browser |
 
-Parametri del player embed: `?autoplay=1|0&muted=1|0&controls=1|0&src=auto|flv|hls|dash`.
+Parametri del player embed (tutti opzionali): `?autoplay=1|0&muted=1|0&controls=1|0&src=auto|flv|hls|dash&latency=1|0` (default: `1`, `1`, `1`, `auto`; `latency` è `0` in `/embed` e `1` in `/player`). Dettagli in [docs/API.md](docs/API.md) §7.
 
 Esempio di embed:
 
@@ -110,7 +110,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
      -d '{"title":"Prova"}' http://127.0.0.1:8080/api/v1/broadcasts
 scripts/test-publish.sh <stream_key> 127.0.0.1:1935
 # terminale 3: verifica
-scripts/smoke.sh http://127.0.0.1:8080
+DATA_DIR=/tmp/rms-data scripts/smoke.sh http://127.0.0.1:8080   # oppure: scripts/smoke.sh http://127.0.0.1:8080 "$TOKEN"
 ffprobe http://127.0.0.1:8080/live/prova.flv
 ```
 
