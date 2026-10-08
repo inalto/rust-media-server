@@ -1,0 +1,14 @@
+# Caddy reverse proxy for rms (automatic TLS, HTTP/2, WebSocket, no buffering).
+stream.example.com {
+    request_body {
+        max_size 1100MB
+    }
+    reverse_proxy 127.0.0.1:8080 {
+        flush_interval -1
+        header_up X-Forwarded-Proto {scheme}
+        transport http {
+            read_timeout 1h
+            write_timeout 1h
+        }
+    }
+}

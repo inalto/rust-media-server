@@ -1,0 +1,28 @@
+# systemd unit for rust-media-server. Install:
+#   sudo cp target/release/rms /usr/local/bin/rms
+#   sudo useradd -r -s /sbin/nologin -d /var/lib/rms rms && sudo mkdir -p /var/lib/rms /etc/rms
+#   sudo cp config.example.toml /etc/rms/config.toml && sudo chown -R rms:rms /var/lib/rms
+#   sudo cp deploy/rms.service /etc/systemd/system/ && sudo systemctl enable --now rms
+# Without root: copy to ~/.config/systemd/user/, drop User/Group, use `systemctl --user`.
+[Unit]
+Description=rust-media-server (rms) live media server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=rms
+Group=rms
+WorkingDirectory=/var/lib/rms
+ExecStart=/usr/local/bin/rms --config /etc/rms/config.toml --data-dir /var/lib/rms/data
+Environment=RUST_LOG=info
+# Environment=RMS_ADMIN_TOKEN=change-me
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

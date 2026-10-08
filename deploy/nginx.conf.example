@@ -1,0 +1,34 @@
+# nginx reverse proxy for rms: TLS termination, WebSocket, no buffering for media.
+# Set server.public_url = "https://stream.example.com" and server.trust_proxy = true in rms.
+# RTMP (1935/tcp) is NOT proxied here; expose it directly or via the nginx `stream` module.
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+server {
+    listen 443 ssl http2;
+    server_name stream.example.com;
+    ssl_certificate     /etc/letsencrypt/live/stream.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/stream.example.com/privkey.pem;
+    client_max_body_size 1100m;        # waiting-video uploads (server.max_upload_mb)
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;          # WS-FLV
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;                             # FLV / LL-HLS parts / LL-DASH chunks / SSE
+        proxy_request_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        gzip off;
+    }
+}
+
+server {
+    listen 80;
+    server_name stream.example.com;
+    return 301 https://$host$request_uri;
+}
