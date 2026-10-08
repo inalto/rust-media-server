@@ -388,3 +388,20 @@ level = "info"             # RUST_LOG overrides
 - Media paths never buffer unbounded data: broadcast channels, bounded GOP caches, bounded segment windows.
 - Every long-running task is spawned with a name in logs and survives errors (loop with backoff where appropriate).
 - Keep handlers small; business logic lives in modules, not in axum handlers.
+
+## 13. Phase 1 as-built notes (binding for later phases)
+
+Deviations/additions made while implementing Phase 1 — these supersede the sections above where they differ:
+
+- `src/lib.rs` exists (library target: `rust_media_server::{api, config, db, egress, hub, ingest, metrics, packager, recorder, state, web, error}`); `main.rs` uses it.
+- Router builders: `api::router(&state)` and `web::router(&state)` take the state; `egress::router()` and `packager::router()` take none. `main.rs` merges them at `/` — never change the wiring, only fill the modules.
+- `Hub::publish_start(..) -> Result<Arc<LiveStream>, HubError::AlreadyLive>`; extra API: `publish_end_stream(&stream)`, `kick(name)`, `emit(event)`, `events()`, `live_count()`. `LiveStream::ended_token() -> CancellationToken` fires when the publisher goes away — **every consumer task (packager, recorder) must `select!` on it**, because holding an `Arc<LiveStream>` keeps the channel open. `LiveStream::info() -> StreamInfo` carries `video_codec`/`audio_codec` names (`h264`, `hevc`, `av1`, `aac`...), RFC 6381 `video_codec_string`/`audio_codec_string` (e.g. `avc1.64001f`, `mp4a.40.2`), width/height/fps, bitrates, sample rate/channels. `hub::packet` has `parse_avc_sequence_header`, `parse_aac_sequence_header`, `flv_file_header`, `flv_tag_bytes`, `on_metadata_body`.
+- Publisher kick is real: `ingest/rtmp.rs` runs its own accept loop around rtmp-rs `Connection` with a `CancellationToken` per connection; a publisher idle > 5 s is replaced when the same key publishes again.
+- `ViewerTracker::new(&config, Option<Db>, events)`; `open(name, protocol, ip, ua) -> ViewerSession` guard, `touch(..)`, `counts`, `all_counts`, `sessions`, `peak`/`take_peak`; `metrics::client_ip(headers, peer, trust_proxy)` and `metrics::user_agent(headers)` helpers. `ViewerCounts` serializes an extra `total` field. The tracker already calls `db::metrics::insert_viewer_session/close_viewer_session` (stubs to be implemented).
+- `db/stream_sessions.rs` holds the per-live-period rows; `db::Recording` type is final (see `db/recordings.rs`); `db::Db::call(|conn| ..)` runs on a blocking thread (single connection behind a mutex).
+- `api/settings.rs` is a separate route file (`GET/PATCH /settings`, `POST/DELETE /settings/waiting-video`); `api/waiting.rs` holds the per-broadcast upload. Poster convention: `api::poster_path_for(video)` = same file name with `.jpg`.
+- `api/metrics.rs` already implements `/broadcasts/{name}/sessions` and `/metrics/overview`; the series/summary endpoints return 501 until the metrics branch lands.
+- Admin SSE (`/api/v1/events`) emits `broadcast`, `broadcast_deleted {name}`, `viewers {name, counts}`, `stream {name, status}`, `heartbeat {ts}` — cookie auth only (EventSource cannot set headers). Public `sources.*` are `null` for disabled protocols.
+- `AppState` (Deref to `Inner`): `config`, `db`, `hub`, `tracker`, `packager`, `recorder`, `events`, `admin_token`, `ffmpeg: Option<PathBuf>`, `shutdown: CancellationToken`, `ffmpeg_version().await`.
+- Behaviour: disconnect on a non-live broadcast → 409; regenerate-key does not kick; static assets served `no-cache` + ETag; default log filter appends `rtmp_rs=warn`.
+- Known limits: HEVC/AV1 (Enhanced RTMP) only flow through FLV paths; the CMAF packager is H.264 + AAC. OBS defaults to keyframe interval "auto" (up to 250 frames): the packager must measure the GOP and expose it (`gop_secs`) so the dashboard can warn the operator to set 1–2 s.
