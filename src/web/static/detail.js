@@ -528,6 +528,7 @@ export function mountDetail(root, name, { navigate }) {
     el.tools.append(refreshBtn);
     let playing = null;
     let lastRecordingId;
+    let followTimer = null;
 
     function stateBox(iconName, title, text) {
       setChildren(body, h('div', { class: 'state-box' }, icon(iconName, 28), h('p', { class: 'state-title' }, title), text ? h('p', { class: 'hint' }, text) : null));
@@ -587,9 +588,18 @@ export function mountDetail(root, name, { navigate }) {
     }
 
     async function load() {
+      clearTimeout(followTimer);
+      followTimer = null;
       try {
         const list = await api(`/broadcasts/${enc(name)}/recordings`);
-        if (!destroyed) render(Array.isArray(list) ? list : []);
+        if (destroyed) return;
+        const rows = Array.isArray(list) ? list : [];
+        // Keep the inline player if one is open; otherwise refresh the table.
+        if (!playing) render(rows);
+        // No event announces the end of the remux: follow in-progress recordings.
+        if (rows.some((r) => r.status === 'recording' || r.status === 'processing')) {
+          followTimer = setTimeout(() => { if (!destroyed) load(); }, 5000);
+        }
       } catch (e) {
         if (destroyed || (e instanceof ApiError && e.status === 401)) return;
         if (e instanceof ApiError && e.status === 501) stateBox('info', 'Registrazioni non ancora disponibili', 'Questa versione del server non gestisce ancora l\'archivio delle registrazioni.');
