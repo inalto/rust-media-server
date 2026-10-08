@@ -20,7 +20,6 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 hex = "0.4.3"
 mime_guess = "2.0.5"
-mp4-atom = "0.16"
 rand = "0.10.3"
 rtmp-rs = "0.6"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
