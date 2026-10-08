@@ -20,7 +20,7 @@ use rust_media_server::db::{self, Db};
 use rust_media_server::error::ApiError;
 use rust_media_server::hub::Hub;
 use rust_media_server::ingest::rtmp::RtmpServer;
-use rust_media_server::metrics::ViewerTracker;
+use rust_media_server::metrics::{self, ViewerTracker};
 use rust_media_server::packager::{self, PackagerManager};
 use rust_media_server::recorder::RecorderManager;
 use rust_media_server::state::{AppState, AppStateParts};
@@ -155,6 +155,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let hub = Hub::new();
     let tracker = ViewerTracker::new(&config, Some(db.clone()), hub.events());
     tracker.spawn();
+    metrics::spawn_sampler(&config, db.clone(), hub.clone(), tracker.clone());
     let packager = PackagerManager::new(config.clone(), hub.clone(), tracker.clone());
     packager.spawn();
     let recorder = RecorderManager::new(config.clone(), db.clone(), hub.clone());

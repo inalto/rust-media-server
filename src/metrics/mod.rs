@@ -8,7 +8,14 @@
 //!   and expire after `metrics.session_timeout_secs` without touches (reaper task).
 //!
 //! Every change emits `HubEvent::ViewerCountChanged`. Opening/closing a session calls
-//! the `db::metrics` hooks (stubs in phase 1). The DB sampler task is phase 2.
+//! the `db::metrics` hooks (persisted `viewer_sessions` rows). The DB sampler task
+//! lives in [`sampler`] ([`spawn_sampler`]); the read side of the time series in
+//! [`query`].
+
+pub mod query;
+pub mod sampler;
+
+pub use sampler::spawn_sampler;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -309,7 +316,7 @@ impl ViewerTracker {
         };
         if let Some((entry, counts)) = removed {
             tracing::debug!(broadcast = %entry.name, protocol = %entry.info.protocol, "viewer session closed");
-            self.on_session_close(&entry.info.id);
+            self.on_session_close(&entry.info.id, Utc::now());
             self.emit(&entry.name, counts);
         }
     }
@@ -327,7 +334,7 @@ impl ViewerTracker {
 
     /// Expire request-based sessions idle for longer than the session timeout.
     fn reap(&self, now: Instant) {
-        let expired: Vec<(String, String, ViewerCounts)> = {
+        let expired: Vec<(String, String, ViewerCounts, Instant)> = {
             let mut inner = self.lock();
             let ids: Vec<String> = inner
                 .sessions
@@ -342,15 +349,19 @@ impl ViewerTracker {
             for id in ids {
                 if let Some(e) = inner.sessions.remove(&id) {
                     let c = Self::decrement(&mut inner, &e.name, e.info.protocol);
-                    out.push((id, e.name, c));
+                    out.push((id, e.name, c, e.last_seen));
                 }
             }
             out
         };
         // Emit only the final count per broadcast.
         let mut last: HashMap<String, ViewerCounts> = HashMap::new();
-        for (id, name, counts) in expired {
-            self.on_session_close(&id);
+        let wall_now = Utc::now();
+        for (id, name, counts, last_seen) in expired {
+            // The viewer was last seen at `last_seen`, not when the reaper noticed.
+            let idle = chrono::Duration::from_std(now.saturating_duration_since(last_seen))
+                .unwrap_or_default();
+            self.on_session_close(&id, wall_now - idle);
             last.insert(name, counts);
         }
         for (name, counts) in last {
@@ -365,7 +376,7 @@ impl ViewerTracker {
         });
     }
 
-    /// Hook: persist a `viewer_sessions` row (db::metrics stub in phase 1).
+    /// Hook: persist a `viewer_sessions` row.
     fn on_session_open(&self, name: &str, info: &SessionInfo) {
         let Some(db) = self.db.clone() else { return };
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
@@ -386,15 +397,15 @@ impl ViewerTracker {
         });
     }
 
-    /// Hook: close the `viewer_sessions` row (db::metrics stub in phase 1).
-    fn on_session_close(&self, id: &str) {
+    /// Hook: close the `viewer_sessions` row.
+    fn on_session_close(&self, id: &str, ended_at: DateTime<Utc>) {
         let Some(db) = self.db.clone() else { return };
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let id = id.to_string();
         rt.spawn(async move {
-            if let Err(e) = db::metrics::close_viewer_session(&db, &id, Utc::now()).await {
+            if let Err(e) = db::metrics::close_viewer_session(&db, &id, ended_at).await {
                 tracing::warn!(error = %e, "failed to close viewer session");
             }
         });
