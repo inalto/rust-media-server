@@ -81,24 +81,41 @@ fn main() -> ExitCode {
     }
 }
 
-/// `RUST_LOG` wins. Otherwise `log.level`; a plain level (e.g. "info") gets
-/// `rtmp_rs=warn` appended because rtmp-rs logs full stream keys (secrets) at INFO.
+/// `RUST_LOG` wins, otherwise `log.level`. Either way rtmp-rs is capped at WARN (its
+/// registry at ERROR) unless the directives mention `rtmp_rs` explicitly: rtmp-rs logs
+/// full stream keys (secrets) at INFO ("Publisher registered", "Publishing started")
+/// and in one registry WARN. The shipped systemd unit sets `RUST_LOG=info`, which
+/// previously bypassed the cap and wrote every stream key to the journal.
 fn init_tracing(level: &str) {
-    let level = level.trim();
-    let directives = if level.contains(['=', ',']) {
-        level.to_string()
-    } else {
-        format!("{level},rtmp_rs=warn")
-    };
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(&directives))
-        .unwrap_or_else(|_| EnvFilter::new("info,rtmp_rs=warn"));
+    let env = std::env::var("RUST_LOG")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .and_then(|v| {
+            let d = with_rtmp_rs_cap(&v);
+            EnvFilter::try_new(&d).ok()
+        });
+    let filter = env
+        .or_else(|| EnvFilter::try_new(with_rtmp_rs_cap(level)).ok())
+        .unwrap_or_else(|| EnvFilter::new(with_rtmp_rs_cap("info")));
     let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
         .with_ansi(ansi)
         .init();
+}
+
+/// Append the rtmp-rs cap (see [`init_tracing`]) unless `rtmp_rs` is configured.
+fn with_rtmp_rs_cap(directives: &str) -> String {
+    const CAP: &str = "rtmp_rs=warn,rtmp_rs::registry=error";
+    let d = directives.trim().trim_end_matches(',');
+    if d.contains("rtmp_rs") {
+        d.to_string()
+    } else if d.is_empty() {
+        format!("info,{CAP}")
+    } else {
+        format!("{d},{CAP}")
+    }
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
@@ -249,5 +266,26 @@ async fn wait_for_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_rtmp_rs_cap;
+
+    #[test]
+    fn rtmp_rs_is_capped_unless_configured() {
+        let cap = "rtmp_rs=warn,rtmp_rs::registry=error";
+        assert_eq!(with_rtmp_rs_cap("info"), format!("info,{cap}"));
+        assert_eq!(with_rtmp_rs_cap(" debug "), format!("debug,{cap}"));
+        assert_eq!(
+            with_rtmp_rs_cap("info,rust_media_server=debug"),
+            format!("info,rust_media_server=debug,{cap}")
+        );
+        assert_eq!(with_rtmp_rs_cap(""), format!("info,{cap}"));
+        assert_eq!(with_rtmp_rs_cap("info,rtmp_rs=debug"), "info,rtmp_rs=debug");
+        for d in ["info", "trace,hyper=info", ""] {
+            assert!(tracing_subscriber::EnvFilter::try_new(with_rtmp_rs_cap(d)).is_ok());
+        }
     }
 }
