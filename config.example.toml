@@ -1,0 +1,46 @@
+# rust-media-server (rms) configuration.
+#
+# Copy to config.toml (read automatically from the working directory) or pass
+# --config <file>. Every key is optional; the values below are the defaults.
+#
+# Precedence: defaults < this file < env vars RMS_<SECTION>_<KEY> (e.g.
+# RMS_SERVER_HTTP_BIND=127.0.0.1:8080, RMS_ADMIN_TOKEN=...) < CLI flags
+# (--data-dir, --http-bind, --rtmp-bind).
+
+[server]
+http_bind = "0.0.0.0:8080"
+public_url = ""            # e.g. "https://stream.example.com"; empty = derive from Host header
+admin_token = ""           # empty = generate at first start (stored in data/admin_token)
+data_dir = "./data"
+trust_proxy = false        # honour X-Forwarded-For / X-Real-IP for viewer IPs
+max_upload_mb = 1024
+
+[rtmp]
+bind = "0.0.0.0:1935"
+app = "live"               # advertised in the OBS settings; any app name is accepted
+
+[hls]
+enabled = true
+part_duration = 0.5
+max_segment_duration = 6.0
+window_segments = 6
+linger_secs = 30
+
+[dash]
+enabled = true
+segment_duration = 2.0
+
+[recording]
+remux_to_mp4 = true        # needs ffmpeg
+keep_flv = false
+
+[metrics]
+sample_interval_secs = 5
+session_timeout_secs = 30
+retention_days = 90
+
+[ffmpeg]
+path = ""                  # empty = search PATH
+
+[log]
+level = "info"             # RUST_LOG overrides

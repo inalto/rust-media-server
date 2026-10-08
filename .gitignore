@@ -1,0 +1,6 @@
+/target
+/data
+*.flv
+*.mp4
+!web/static/**
+.worktrees/

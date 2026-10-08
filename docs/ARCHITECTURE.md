@@ -1,0 +1,390 @@
+# rust-media-server (rms) — Architecture & Implementation Contract
+
+This document is the binding contract for everyone (humans and agents) implementing
+the project. Module boundaries, data shapes, URL layout and the API contract below
+must be respected so that independently developed parts integrate without surprises.
+When something is underspecified, prefer the simplest robust choice and document it
+in code comments.
+
+Language conventions: code, comments, commit messages, API field names and this
+document are in **English**. The management dashboard UI, the embed player texts and
+`README.md` are in **Italian** (the operator is Italian).
+
+## 1. Goals
+
+A single-binary live media server written in Rust, inspired by Ant Media Server and
+by `xiu` (pure Rust live server):
+
+1. **Ingest from OBS Studio** (and ffmpeg / any RTMP encoder) via RTMP with
+   per-broadcast secret stream keys. SRT ingest is optional (ffmpeg bridge).
+2. **Low-latency delivery** to browsers with open standards:
+   - HTTP-FLV and WebSocket-FLV (≈1–2 s, played with mpegts.js)
+   - LL-HLS (Apple Low-Latency HLS, CMAF/fMP4, EXT-X-PART, blocking playlist reload — ≈2–3 s, hls.js / Safari native)
+   - LL-DASH (CMAF chunked transfer, `availabilityTimeOffset` — ≈2–3 s, dash.js)
+   - WebRTC egress via WHEP (sub-second) is a **stretch goal** (phase 4) and must not block the rest.
+3. **Management dashboard** (axum, server-side static SPA + JSON API): create broadcasts,
+   show OBS settings, generate embed codes, pause/resume, record on demand,
+   upload waiting video, view metrics charts.
+4. **Metrics**: concurrent viewers per broadcast per protocol, sampled to SQLite,
+   charted over time (Chart.js), peak/total/avg watch time.
+5. **Recording**: automatic (per-broadcast flag) or manual start/stop while live;
+   pure-Rust FLV writer, remuxed to MP4 with ffmpeg when available.
+6. **Waiting video**: per-broadcast (or global default) video looped by the embed
+   player when the broadcast is Offline or Paused (admin forced pause), switching
+   automatically to the live stream when it arrives.
+
+Non-goals (for now): transcoding/ABR ladders, clustering, HEVC/AV1 packaging
+(they pass through FLV paths only), authentication for viewers (tokens), TLS
+termination (put nginx/caddy in front).
+
+## 2. Toolchain & dependencies
+
+- Rust stable 1.99 (edition 2024), `cargo` in `~/.cargo/bin`.
+- `ffmpeg`/`ffprobe` static builds in `~/.local/bin` (optional at runtime; detect with `which`
+  or config path; every feature must degrade gracefully when missing).
+- Crates (versions verified on crates.io 2026-10-08):
+  - `tokio` 1 (full), `axum` 0.8 (features: ws, multipart, macros), `tower-http` 0.7
+    (fs, cors, trace, compression? no — never compress media), `tower` 0.5
+  - `rtmp-rs` 0.6 — RTMP server with `RtmpHandler` callbacks (`on_publish` auth,
+    `on_media_tag` raw FLV tags, `on_metadata`, `on_unpublish`). Source is downloaded by cargo
+    to `~/.cargo/registry/src/*/rtmp-rs-0.6.0/` — read it when in doubt (also a copy in the
+    session scratchpad). Use `MediaDeliveryMode::RawFlv`.
+  - `rusqlite` 0.40 (features: bundled) — SQLite, accessed via a dedicated blocking thread/`spawn_blocking`
+    behind an async wrapper (`db::Db`).
+  - `serde`, `serde_json`, `toml`, `uuid` (v4), `chrono`, `bytes`, `anyhow`, `thiserror`,
+    `tracing`, `tracing-subscriber` (env-filter), `rand`, `sha2`/`hex` (fingerprints), `mime_guess`,
+    `tokio-util` (io), `futures`, `async-stream`, `clap` 4 (derive) for CLI flags,
+    `mp4-atom` 0.16 (ISOBMFF box encoding for the CMAF packager) — optional; hand-rolled
+    box writer is acceptable if simpler.
+  - Frontend libs via CDN (cdnjs / jsdelivr), pinned versions: hls.js ≥1.5, mpegts.js ≥1.7, dash.js ≥4.7, Chart.js ≥4.4.
+    They must be loaded from the CDN with fixed versions; no build step for the frontend.
+
+## 3. Repository layout
+
+```
+rust-media-server/
+  Cargo.toml                 crate "rust-media-server", binary "rms"
+  README.md                  Italian user guide (install, OBS setup, URLs, API, embed)
+  config.example.toml
+  docs/ARCHITECTURE.md       this file
+  docs/PROTOCOLS.md          Italian: proposed low-latency standards and why (phase 3)
+  docs/API.md                REST/SSE API reference (phase 3; keep in sync with §8)
+  scripts/test-publish.sh    ffmpeg test-pattern publisher to rtmp://localhost:1935/live/<key>
+  scripts/smoke.sh           curl-based smoke test of the HTTP surface
+  src/
+    main.rs                  CLI (clap): --config, --data-dir, --http-bind, --rtmp-bind; startup wiring
+    config.rs                Config (TOML + env overrides RMS_*), defaults
+    state.rs                 AppState (Arc) shared by axum handlers and tasks
+    error.rs                 ApiError -> axum response mapping ({"error": "..."})
+    db/mod.rs                Db wrapper + migrations (schema §7) + repositories
+    db/broadcasts.rs, db/metrics.rs, db/recordings.rs, db/settings.rs
+    hub/mod.rs               Hub: registry of live streams, events channel
+    hub/stream.rs            LiveStream: broadcast channel, GOP cache, stats
+    hub/packet.rs            MediaPacket + FLV tag helpers (serialize FLV header/tags)
+    ingest/rtmp.rs           rtmp-rs handler -> hub
+    ingest/srt.rs            optional ffmpeg SRT->RTMP bridge (phase 4)
+    egress/httpflv.rs        GET /live/{name}.flv
+    egress/wsflv.rs          GET /ws/live/{name}.flv (WebSocket binary FLV)
+    egress/hls.rs            LL-HLS routes (playlists, init, segments, parts, blocking reload)
+    egress/dash.rs           LL-DASH routes (MPD, init, chunked segments, utc time)
+    packager/mod.rs          PackagerManager: one Packager task per live stream
+    packager/cmaf.rs         fMP4/CMAF muxer (H.264 + AAC) -> init segment + chunks
+    packager/store.rs        SegmentStore: segments/parts in memory + notify for blocking reads
+    packager/hls_playlist.rs LL-HLS media/master playlist generation
+    packager/dash_mpd.rs     LL-DASH MPD generation
+    recorder/mod.rs          RecorderManager: FLV writer per stream, ffmpeg remux to MP4
+    metrics/mod.rs           ViewerTracker (live counts) + Sampler task -> db
+    api/mod.rs               /api/v1 router; auth middleware; JSON types
+    api/auth.rs, api/broadcasts.rs, api/metrics.rs, api/recordings.rs, api/waiting.rs,
+    api/system.rs, api/events.rs (SSE), api/public.rs (unauthenticated player API)
+    web/mod.rs               dashboard + embed routes (static assets via include_str!/include_bytes!)
+    web/static/index.html, app.js, style.css           dashboard SPA (Italian UI)
+    web/static/embed.html, player.js, player.css       embeddable player
+  data/ (runtime, gitignored)  rms.sqlite, recordings/, waiting/, admin_token
+```
+
+Each `src/<module>/mod.rs` exposes at most: a constructor/`spawn` function, an
+`axum::Router<AppState>` builder named `router()` when it serves HTTP, and the public
+types listed in this document. `main.rs` only wires modules together.
+
+## 4. Core domain
+
+### 4.1 Broadcast (persisted)
+
+```
+Broadcast {
+  id: String (uuid v4),
+  name: String       // URL-safe slug [a-z0-9-_]{1,64}, unique, public identifier used in all playback URLs
+  title: String,
+  description: String,
+  stream_key: String // secret, 32 hex chars, used by OBS; regenerable
+  record: bool       // auto-record when live
+  enable_flv, enable_hls, enable_dash: bool (default true)
+  paused: bool       // admin forced "waiting" state
+  waiting_video: Option<String>   // relative path under data/waiting/, normalized mp4
+  waiting_text: String            // text shown on the waiting screen (default "La diretta inizierà a breve")
+  created_at, updated_at: DateTime<Utc>
+}
+```
+
+### 4.2 Effective status
+
+`status = if paused { Paused } else if hub.is_live(name) { Live } else { Offline }`.
+Pause does **not** disconnect the publisher; the ingest keeps running (and recording keeps
+recording). Pause only affects what players are told (public status API/SSE) — players show
+the waiting video. Playback endpoints keep serving (so an admin preview still works), except
+that the public status reports `paused`.
+
+### 4.3 MediaPacket and Hub
+
+```rust
+pub enum PacketKind { Video, Audio, Script }
+pub struct MediaPacket {
+  pub kind: PacketKind,
+  pub timestamp: u32,          // FLV timestamp, milliseconds, as received (monotonic-ish)
+  pub data: Bytes,             // FLV tag *body* (no 11-byte tag header), shared across subscribers
+  pub is_keyframe: bool,       // video only (frame type 1)
+  pub is_sequence_header: bool // AVC/HEVC/AAC sequence header (config record)
+}
+```
+
+- `Hub` keeps `RwLock<HashMap<String /*broadcast name*/, Arc<LiveStream>>>` plus
+  `tokio::sync::broadcast::Sender<HubEvent>` with
+  `HubEvent::{StreamStarted{name}, StreamEnded{name}, Metadata{name}, ViewerCountChanged{name, counts}, BroadcastUpdated{name}}`.
+- `LiveStream` holds: `name`, `started_at`, `publisher_addr`, `tx: broadcast::Sender<Arc<MediaPacket>>`
+  (capacity 2048), `GopCache` (script tag + video seq header + audio seq header + all packets since the last keyframe,
+  bounded to e.g. 4 s / 4 MB), `StreamInfo` (video codec, audio codec, width, height, fps, bitrates,
+  from `onMetaData` and from sequence headers), counters (`bytes_in`, `packets`, last packet time).
+- `LiveStream::subscribe() -> (Vec<Arc<MediaPacket>> /*catch-up from GOP cache, headers first*/, broadcast::Receiver<Arc<MediaPacket>>)`
+  taken atomically under the GOP cache lock so no packet is lost/duplicated between the snapshot and the receiver.
+- Slow subscriber policy: on `RecvError::Lagged`, the consumer drops packets until the next video keyframe
+  (for FLV outputs) and logs a warning. Never block the publisher.
+- Only one publisher per broadcast; a second publish with the same key is rejected (`AuthResult::Reject`).
+- `Hub::publish_start(name, info) -> Arc<LiveStream>`, `Hub::publish_end(name)`, `Hub::push(name, MediaPacket)`,
+  `Hub::get(name) -> Option<Arc<LiveStream>>`, `Hub::list()`, `Hub::subscribe_events()`.
+
+### 4.4 Viewer tracking (metrics::ViewerTracker)
+
+```rust
+pub enum Protocol { Flv, WsFlv, Hls, Dash, WebRtc }
+pub struct ViewerCounts { pub flv: u32, pub ws_flv: u32, pub hls: u32, pub dash: u32, pub webrtc: u32 } // + total()
+```
+- Connection-oriented protocols (FLV, WS-FLV, WebRTC): `tracker.open(name, protocol, peer_ip, user_agent) -> ViewerSession`
+  (guard; `Drop` closes it; also records a `viewer_sessions` row with started_at/ended_at).
+- Request-oriented protocols (HLS, DASH): `tracker.touch(name, protocol, peer_ip, user_agent)` on every
+  media playlist/segment request; a session is `sha256(ip|ua|name|protocol)` and expires after
+  `metrics.session_timeout_secs` (default 30) without touches (reaper task every 5 s).
+- `tracker.counts(name) -> ViewerCounts`, `tracker.sessions(name) -> Vec<SessionInfo>`.
+- Sampler task (metrics module): every `metrics.sample_interval_secs` (default 5) for each live stream
+  insert a `viewer_samples` row and emit `HubEvent::ViewerCountChanged`. When a stream ends insert a final zero sample.
+- Peer IP: honour `X-Forwarded-For` (first element) / `X-Real-IP` when `server.trust_proxy = true`, else socket addr.
+
+## 5. Ingest
+
+- RTMP via `rtmp-rs`: bind `rtmp.bind` (default `0.0.0.0:1935`), app name configurable (default `live`,
+  but accept any app — OBS users often leave it empty or wrong). `on_fc_publish`/`on_publish`: look up the
+  broadcast by `stream_key` (the RTMP stream name); reject unknown keys and already-live broadcasts.
+  Map stream key → broadcast `name` in the handler (`DashMap`/`RwLock<HashMap<session_id, name>>`).
+- `on_metadata` → store `onMetaData` fields in `StreamInfo` and also keep the raw script tag (if available
+  through `on_media_tag` with `FlvTagType::ScriptData`) in the GOP cache so FLV outputs can replay it.
+  If the raw script tag is not exposed, re-serialize an `onMetaData` AMF0 script tag from the map
+  (there is an AMF0 encoder in `rtmp_rs::amf`).
+- `on_media_tag` → `Hub::push`. `on_unpublish`/`on_disconnect` → `Hub::publish_end`.
+- A `db.stream_sessions` row is created on start and closed on end (peak viewers, bytes).
+- Optional SRT ingest (phase 4): spawn `ffmpeg -i "srt://0.0.0.0:<port>?mode=listener&streamid=<key>" -c copy -f flv rtmp://127.0.0.1:1935/live/<key>`
+  per broadcast on demand — keep it isolated in `ingest/srt.rs`.
+
+## 6. Egress
+
+### 6.1 HTTP-FLV — `GET /live/{name}.flv`
+Headers: `Content-Type: video/x-flv`, `Cache-Control: no-cache`, `Access-Control-Allow-Origin: *`,
+chunked transfer (streaming body). Body: FLV header (9 bytes + PreviousTagSize0) then tags:
+script metadata (if any), video seq header, audio seq header, GOP cache, then live packets.
+Timestamps are passed through as-is. Register a `ViewerSession` (Protocol::Flv). 404 when not live
+(`{"error":"stream offline"}`), 404 when the broadcast does not exist, 403 when `enable_flv=false`.
+### 6.2 WebSocket-FLV — `GET /ws/live/{name}.flv`
+Same byte stream, as binary WebSocket messages (one message per tag; header + first tags in the first message).
+Supported by mpegts.js (`type: 'flv'`, `url: ws://...`).
+### 6.3 LL-HLS — `/hls/{name}/...`
+- `master.m3u8` (EXT-X-STREAM-INF with BANDWIDTH, RESOLUTION, CODECS e.g. `avc1.64001f,mp4a.40.2`,
+  FRAME-RATE) → `stream.m3u8`.
+- `stream.m3u8`: `#EXT-X-VERSION:9`, `#EXT-X-TARGETDURATION`, `#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=<3*part>,CAN-SKIP-UNTIL=<6*target>`,
+  `#EXT-X-PART-INF:PART-TARGET=<part_duration>`, `#EXT-X-MEDIA-SEQUENCE`, `#EXT-X-MAP:URI="init.mp4"`,
+  `#EXT-X-PROGRAM-DATE-TIME`, then for each segment its `#EXT-X-PART:DURATION=..,URI="part-<seg>-<n>.m4s"[,INDEPENDENT=YES]`
+  lines followed by `#EXTINF:<dur>,` + `seg-<seg>.m4s`; the in-progress segment lists its completed parts and ends with
+  `#EXT-X-PRELOAD-HINT:TYPE=PART,URI="part-<seg>-<next>.m4s"`. Support delta updates (`_HLS_skip=YES`) only if cheap; otherwise omit CAN-SKIP-UNTIL.
+- Blocking playlist reload: `stream.m3u8?_HLS_msn=N&_HLS_part=P` waits (tokio `Notify`/`watch`) until that part exists;
+  timeout after 3×target duration → `503`.
+- `init.mp4` (ftyp+moov), `seg-N.m4s` (complete segment = concatenation of its parts; while in progress, serve what exists
+  and keep streaming (chunked) until complete), `part-N-P.m4s` (one CMAF chunk: moof+mdat).
+- Headers: `Content-Type: application/vnd.apple.mpegurl` / `video/mp4` / `video/iso.segment`, `Cache-Control: no-cache` for playlists,
+  `max-age=3600` for finished segments/parts, CORS `*`. Every playlist/segment request calls `tracker.touch(.., Protocol::Hls, ..)`.
+- Segment = one GOP (new segment at every keyframe; if a GOP exceeds `hls.max_segment_duration` (default 6 s), split anyway
+  at the next part boundary). Target segment duration follows the encoder keyframe interval (OBS default 2 s). Part duration
+  `hls.part_duration` (default 0.5 s): a part is closed when the next video frame would exceed the duration or at a keyframe.
+  Audio samples are interleaved in the same track-separate fragments (one `moof` with two `traf`s per chunk is allowed
+  but **prefer one chunk containing both tracks' samples**, i.e. moof with traf(video)+traf(audio), mdat with both — hls.js and Safari accept it).
+- When the stream ends, keep serving the last window for `hls.linger_secs` (default 30) then drop; `#EXT-X-ENDLIST` is appended.
+### 6.4 LL-DASH — `/dash/{name}/...`
+- `manifest.mpd`: `type="dynamic"`, `profiles="urn:mpeg:dash:profile:isoff-live:2011"`, `availabilityStartTime` (stream start, UTC),
+  `publishTime`, `minimumUpdatePeriod="PT2S"`, `minBufferTime="PT1S"`, `timeShiftBufferDepth` (window), `maxSegmentDuration`,
+  `<ServiceDescription><Latency target="2000" min="1500" max="6000"/><PlaybackRate min="0.96" max="1.04"/></ServiceDescription>`,
+  `<UTCTiming schemeIdUri="urn:mpeg:dash:utc:http-xsdate:2014" value="/dash/time"/>`, one `Period` with one `AdaptationSet` per
+  track (video avc1, audio mp4a), `SegmentTemplate` with `initialization="init-$RepresentationID$.m4s"`, `media="chunk-$RepresentationID$-$Number$.m4s"`,
+  `timescale`, `duration` (nominal segment duration in timescale units), `startNumber`, `availabilityTimeOffset="<seg - chunk>"`, `availabilityTimeComplete="false"`.
+  Because DASH `$Number$` addressing assumes constant segment durations, the DASH packager uses **fixed-duration segments**
+  (`dash.segment_duration`, default 2 s) cut at the keyframe closest to the boundary; if GOPs are longer than the segment duration,
+  fall back to `SegmentTimeline` (`$Time$`) — implement SegmentTimeline from the start if simpler: it is fully supported by dash.js low-latency mode.
+- Segments are served with chunked transfer while being produced (same `SegmentStore` as HLS: a segment is a list of chunks + "complete" flag; readers stream existing chunks then await new ones).
+- `GET /dash/time` → current UTC in ISO-8601 (`2026-10-08T14:00:00.000Z`), `Content-Type: text/plain`.
+- Headers as HLS (`application/dash+xml` for the MPD). Every MPD/segment request → `tracker.touch(.., Protocol::Dash, ..)`.
+### 6.5 Shared SegmentStore (packager/store.rs)
+Single source for HLS parts and DASH chunks: a `Chunk { seq, part_index, duration_ms, bytes: Bytes, independent: bool }`;
+`Segment { seq, start_ts_ms, duration_ms, chunks: Vec<Chunk>, complete: bool, program_date_time }`; `init: Bytes`;
+`tokio::sync::watch<Version>` to wake blocking readers; window of N complete segments (default 6) + the in-progress one.
+
+## 7. Database schema (SQLite, `data/rms.sqlite`, WAL mode)
+
+```sql
+CREATE TABLE IF NOT EXISTS broadcasts (
+  id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+  stream_key TEXT UNIQUE NOT NULL, record INTEGER NOT NULL DEFAULT 0,
+  enable_flv INTEGER NOT NULL DEFAULT 1, enable_hls INTEGER NOT NULL DEFAULT 1, enable_dash INTEGER NOT NULL DEFAULT 1,
+  paused INTEGER NOT NULL DEFAULT 0, waiting_video TEXT, waiting_text TEXT NOT NULL DEFAULT 'La diretta inizierà a breve',
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS stream_sessions (   -- one row per live period
+  id TEXT PRIMARY KEY, broadcast_id TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT,
+  publisher_ip TEXT, video_codec TEXT, audio_codec TEXT, width INTEGER, height INTEGER, fps REAL,
+  bytes_in INTEGER NOT NULL DEFAULT 0, peak_viewers INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS viewer_samples (    -- time series, one row per sample per broadcast
+  broadcast_id TEXT NOT NULL, ts TEXT NOT NULL, total INTEGER NOT NULL, flv INTEGER NOT NULL, ws_flv INTEGER NOT NULL,
+  hls INTEGER NOT NULL, dash INTEGER NOT NULL, webrtc INTEGER NOT NULL, PRIMARY KEY (broadcast_id, ts));
+CREATE TABLE IF NOT EXISTS viewer_sessions (   -- one row per viewer session (all protocols)
+  id TEXT PRIMARY KEY, broadcast_id TEXT NOT NULL, protocol TEXT NOT NULL, ip TEXT, user_agent TEXT,
+  started_at TEXT NOT NULL, ended_at TEXT);
+CREATE TABLE IF NOT EXISTS recordings (
+  id TEXT PRIMARY KEY, broadcast_id TEXT NOT NULL, stream_session_id TEXT, path TEXT NOT NULL,
+  format TEXT NOT NULL, status TEXT NOT NULL,  -- recording|processing|ready|failed
+  started_at TEXT NOT NULL, ended_at TEXT, size_bytes INTEGER NOT NULL DEFAULT 0, duration_secs REAL, error TEXT);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- e.g. default_waiting_video, default_waiting_text
+CREATE INDEX IF NOT EXISTS idx_samples_ts ON viewer_samples(broadcast_id, ts);
+CREATE INDEX IF NOT EXISTS idx_vsessions ON viewer_sessions(broadcast_id, started_at);
+```
+Timestamps are RFC 3339 UTC strings. `db::Db` offers `call<F, T>(f) -> T` running `f(&mut Connection)` on a blocking thread.
+Retention: delete `viewer_samples` older than `metrics.retention_days` (default 90) daily.
+
+## 8. HTTP surface
+
+Authentication: admin token (`server.admin_token` or env `RMS_ADMIN_TOKEN`; if empty, generate a random
+one at first start, store it in `data/admin_token`, print it in the log). Admin endpoints require
+`Authorization: Bearer <token>` **or** cookie `rms_token=<token>` (set by `POST /api/v1/auth/login {token}` → `204` + cookie;
+`POST /api/v1/auth/logout`). `GET /api/v1/auth/check` → 204/401. Everything under `/api/v1/public/*`, all playback
+paths, `/embed/*`, `/waiting/*`, `/recordings/*/download`? (no: downloads are admin) and the dashboard static files are public.
+CORS: `*` on playback and public API. JSON errors: `{"error": "message"}` with proper status codes.
+
+### 8.1 Admin API (`/api/v1`)
+| Method & path | Body / query | Response |
+|---|---|---|
+| `GET /broadcasts` | | `[BroadcastView]` |
+| `POST /broadcasts` | `{name?, title, description?, record?, enable_flv?, enable_hls?, enable_dash?, waiting_text?}` (name auto-slugified from title if absent) | `201 BroadcastView` |
+| `GET /broadcasts/{name}` | | `BroadcastView` |
+| `PATCH /broadcasts/{name}` | any subset of the POST fields except name | `BroadcastView` |
+| `DELETE /broadcasts/{name}` | | `204` (disconnects publisher, deletes waiting video; recordings kept) |
+| `POST /broadcasts/{name}/regenerate-key` | | `BroadcastView` |
+| `POST /broadcasts/{name}/pause` / `/resume` | | `BroadcastView` |
+| `POST /broadcasts/{name}/disconnect` | | `204` (kick publisher) |
+| `POST /broadcasts/{name}/record/start` / `/stop` | | `Recording` / `204` |
+| `GET /broadcasts/{name}/recordings` | | `[Recording]` |
+| `GET /recordings` | `?broadcast=` | `[Recording]` |
+| `DELETE /recordings/{id}` | | `204` (deletes file) |
+| `GET /recordings/{id}/download` | | file (`Content-Disposition: attachment`) |
+| `GET /broadcasts/{name}/metrics` | `?from=<rfc3339>&to=<rfc3339>&step=<secs>` (defaults: last 1 h, step auto so ≤ 600 points; aggregate by max) | `{from,to,step,points:[{t,total,flv,ws_flv,hls,dash,webrtc}]}` |
+| `GET /broadcasts/{name}/metrics/summary` | `?from&to` | `{current: ViewerCounts, peak:{value,at}, sessions_total, avg_watch_secs, live_since?, bytes_in}` |
+| `GET /broadcasts/{name}/sessions` | | `[{id, protocol, ip, user_agent, started_at}]` (currently connected) |
+| `GET /metrics/overview` | | `{live_broadcasts, total_viewers: ViewerCounts, per_broadcast:[{name,title,status,viewers}]}` |
+| `POST /broadcasts/{name}/waiting-video` | multipart `file` (≤ `server.max_upload_mb`, default 1024) | `BroadcastView` (normalized with ffmpeg to H.264/AAC mp4 + poster when available; otherwise stored as-is if mp4) |
+| `DELETE /broadcasts/{name}/waiting-video` | | `BroadcastView` |
+| `POST /settings/waiting-video` / `DELETE` | multipart `file` | `Settings` (global default) |
+| `GET /settings` / `PATCH /settings` | `{default_waiting_text?}` | `Settings` |
+| `GET /broadcasts/{name}/embed` | | `EmbedInfo` (see below) |
+| `GET /system` | | `{version, uptime_secs, ffmpeg: {available, path, version?}, rtmp_bind, http_bind, public_url, hub:{live_streams}}` |
+| `GET /events` | SSE | events `broadcast` (BroadcastView on any change), `viewers` (`{name, counts}`), `stream` (`{name, status}`), heartbeat every 15 s |
+
+`BroadcastView = Broadcast (without stream_key? NO — admins need it) + {status: "offline"|"live"|"paused", viewers: ViewerCounts, live: Option<{started_at, publisher_ip, video_codec, audio_codec, width, height, fps, bytes_in, recording: Option<Recording>}>, urls: PlaybackUrls, obs: {server: "rtmp://<host>:1935/live", stream_key}, waiting_video_url: Option<String>}`.
+`PlaybackUrls = {flv, ws_flv, hls, dash, embed, player}` absolute, built from `server.public_url` (default `http://<Host header>`; ws scheme derived).
+`EmbedInfo = {iframe: "<iframe src=... allow=\"autoplay; fullscreen\" ...></iframe>", urls: PlaybackUrls, obs, snippets: {hlsjs, mpegtsjs, dashjs}}` (ready-to-paste examples).
+
+### 8.2 Public API (no auth)
+- `GET /api/v1/public/broadcasts/{name}` → `{name, title, status, waiting_video_url, waiting_text, poster_url, sources:{flv, ws_flv, hls, dash}, enable_*}` (no stream key!).
+- `GET /api/v1/public/broadcasts/{name}/events` → SSE `status` events `{status}` whenever it changes + heartbeat.
+
+### 8.3 Pages
+- `/` dashboard SPA (login view when 401), `/embed/{name}` player page for iframes (query: `autoplay=1|0`, `muted=1|0`, `src=auto|flv|hls|dash`, `controls=1|0`),
+  `/player/{name}` same as embed but full page with title, `/waiting/{...}` static waiting videos & posters (`data/waiting/`), `/static/*` assets.
+
+## 9. Embed player behaviour (web/static/player.js)
+
+1. Fetch public broadcast info; open SSE for status.
+2. `offline`/`paused` → show waiting screen: looped muted `<video>` with the waiting video (or a styled placeholder
+   with `waiting_text` and a pulsing "In attesa della diretta" badge when none).
+3. `live` → pick a source: `src` query param, otherwise: if `mpegts.js` supported (MSE + not iOS) → HTTP-FLV (`liveBufferLatencyChasing: true`),
+   else if Safari/iOS → native LL-HLS, else hls.js `lowLatencyMode: true`. Expose `window.rmsPlayer` with `setSource()` for debugging.
+   On fatal player errors fall back to the next source (flv → hls → dash); on `offline`/`paused` tear the player down and return to step 2.
+4. Show a small latency/health indicator (optional) and a "LIVE" badge.
+
+## 10. Configuration (`config.toml`, env override `RMS_<SECTION>_<KEY>`, CLI flags win)
+
+```toml
+[server]
+http_bind = "0.0.0.0:8080"
+public_url = ""            # e.g. "https://stream.example.com"; empty = derive from Host header
+admin_token = ""           # empty = generate at first start (stored in data/admin_token)
+data_dir = "./data"
+trust_proxy = false
+max_upload_mb = 1024
+[rtmp]
+bind = "0.0.0.0:1935"
+app = "live"
+[hls]
+enabled = true
+part_duration = 0.5
+max_segment_duration = 6.0
+window_segments = 6
+linger_secs = 30
+[dash]
+enabled = true
+segment_duration = 2.0
+[recording]
+remux_to_mp4 = true        # needs ffmpeg
+keep_flv = false
+[metrics]
+sample_interval_secs = 5
+session_timeout_secs = 30
+retention_days = 90
+[ffmpeg]
+path = ""                  # empty = search PATH
+[log]
+level = "info"             # RUST_LOG overrides
+```
+
+## 11. Phases & ownership
+
+- **Phase 1 (foundation, sequential)**: Cargo.toml with *all* deps above, config, error, state, db (full schema + broadcasts/settings repos),
+  hub (packets, GOP cache, subscribe), ingest/rtmp, egress/httpflv + wsflv, metrics::ViewerTracker (live counts only, no DB sampler),
+  api (auth, broadcasts CRUD, pause/resume/disconnect/regenerate-key, embed, system, events SSE, public), minimal web (placeholder dashboard
+  showing broadcasts JSON + embed page that plays HTTP-FLV with mpegts.js), stub modules `packager`, `recorder` (with the public API
+  signatures used by main.rs), `scripts/test-publish.sh`, e2e verified with ffmpeg → RTMP → `curl /live/x.flv | ffprobe`.
+- **Phase 2 (parallel, git worktrees, one branch each)**:
+  - `feat/packager`: packager (cmaf, store, hls_playlist, dash_mpd) + egress/hls + egress/dash, validated with ffprobe/ffmpeg and hls.js/dash.js in a headless browser.
+  - `feat/metrics-recording`: metrics sampler + db/metrics + api/metrics; recorder + db/recordings + api/recordings; retention.
+  - `feat/dashboard`: web/static dashboard SPA + embed player + api/waiting (upload/normalize) + api/settings; Italian UI; Chart.js charts (against the API contract in §8).
+- **Phase 3 (integration, sequential)**: merge, fix, e2e tests, README.md, docs/API.md, docs/PROTOCOLS.md, code review pass.
+- **Phase 4 (stretch)**: WHEP egress (webrtc-rs), SRT ingest bridge.
+
+## 12. Quality bar
+
+- `cargo build --release` warning-free (`#![deny(warnings)]` is NOT required but `cargo clippy` should be clean of errors), `cargo test` green.
+- No `unwrap()` on untrusted input in request handlers; never panic in tasks (log and continue).
+- Media paths never buffer unbounded data: broadcast channels, bounded GOP caches, bounded segment windows.
+- Every long-running task is spawned with a name in logs and survives errors (loop with backoff where appropriate).
+- Keep handlers small; business logic lives in modules, not in axum handlers.

@@ -1,0 +1,42 @@
+[package]
+name = "rust-media-server"
+version = "0.1.0"
+edition = "2024"
+description = "Single-binary live media server: RTMP ingest, HTTP-FLV/WS-FLV, LL-HLS, LL-DASH egress"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "rms"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+async-stream = "0.3.6"
+axum = { version = "0.8.9", features = ["ws", "multipart", "macros"] }
+bytes = "1.12.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+futures = "0.3.34"
+hex = "0.4.3"
+mime_guess = "2.0.5"
+mp4-atom = "0.16"
+rand = "0.10.3"
+rtmp-rs = "0.6"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["full"] }
+tokio-util = { version = "0.7.19", features = ["io", "rt"] }
+toml = "1.1.7"
+tower = "0.5.3"
+tower-http = { version = "0.7.1", features = ["fs", "cors", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.27.0", features = ["v4", "serde"] }
+
+[profile.release]
+opt-level = 3
+debug = 1
