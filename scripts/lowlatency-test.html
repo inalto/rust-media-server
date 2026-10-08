@@ -1,0 +1,114 @@
+<!doctype html>
+<!--
+  LL-HLS / LL-DASH playback test page for rms (developer tool, not served by rms).
+
+  Serve this directory with any static server and open:
+    lowlatency-test.html?src=hls&url=http://127.0.0.1:8080/hls/<name>/master.m3u8
+    lowlatency-test.html?src=dash&url=http://127.0.0.1:8080/dash/<name>/manifest.mpd
+  `window.stats` holds playback/latency figures for automated (headless) checks.
+  wallLatency = wall clock minus the playing media time: media time is server
+  wall-clock time (EXT-X-PROGRAM-DATE-TIME for HLS, availabilityStartTime = epoch for DASH).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>rms low-latency test</title>
+  <link rel="icon" href="data:,">
+  <style>
+    body { font: 13px/1.4 monospace; background: #111; color: #ddd; margin: 16px; }
+    video { width: 640px; max-width: 100%; background: #000; display: block; }
+    pre { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <video id="v" muted autoplay playsinline controls></video>
+  <pre id="out"></pre>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dashjs@5.2.1/dist/modern/umd/dash.all.min.js"></script>
+  <script>
+    const qs = new URLSearchParams(location.search);
+    const src = qs.get('src') || 'hls';
+    const url = qs.get('url');
+    const v = document.getElementById('v');
+    const stats = window.stats = {
+      src, url, errors: [], fatal: null, playing: false, firstFrameAt: null,
+      stalls: 0, stalledMs: 0, samples: [], requests404: 0,
+    };
+    const t0 = performance.now();
+    let waitingSince = null;
+    let latency = () => NaN, target = () => NaN, wallLatency = () => NaN;
+
+    v.addEventListener('playing', () => {
+      stats.playing = true;
+      if (stats.firstFrameAt === null) stats.firstFrameAt = (performance.now() - t0) / 1000;
+      if (waitingSince !== null) { stats.stalledMs += performance.now() - waitingSince; waitingSince = null; }
+    });
+    v.addEventListener('waiting', () => {
+      if (stats.firstFrameAt !== null) { stats.stalls++; waitingSince = performance.now(); }
+    });
+
+    if (src === 'hls') {
+      const hls = new Hls({ lowLatencyMode: true });
+      hls.on(Hls.Events.ERROR, (_, d) => {
+        stats.errors.push({ t: (performance.now() - t0) / 1000, type: d.type, details: d.details, fatal: d.fatal,
+                            code: d.response && d.response.code, url: d.frag && d.frag.url || d.url });
+        if (d.fatal) stats.fatal = d.details;
+      });
+      stats.events = [];
+      const ev = (e) => { stats.events.push(e); if (stats.events.length > 300) stats.events.shift(); };
+      hls.on(Hls.Events.FRAG_LOADED, (_, d) => {
+        const st = d.frag.stats || {};
+        ev({ t: +((performance.now() - t0) / 1000).toFixed(2), sn: d.frag.sn, part: d.part ? d.part.index : null,
+             ms: Math.round((st.loading && st.loading.end - st.loading.start) || 0), ct: +v.currentTime.toFixed(2) });
+      });
+      hls.on(Hls.Events.LEVEL_LOADED, (_, d) => {
+        ev({ t: +((performance.now() - t0) / 1000).toFixed(2), level: d.details.endSN, parts: d.details.partList && d.details.partList.length,
+             live: d.details.live, edge: +d.details.edge.toFixed(2) });
+      });
+      hls.loadSource(url);
+      hls.attachMedia(v);
+      window.player = hls;
+      latency = () => hls.latency;
+      target = () => hls.targetLatency;
+      wallLatency = () => hls.playingDate ? (Date.now() - hls.playingDate.getTime()) / 1000 : NaN;
+    } else {
+      const p = dashjs.MediaPlayer().create();
+      p.updateSettings({
+        debug: { logLevel: dashjs.Debug.LOG_LEVEL_WARNING },
+        streaming: { delay: { liveDelay: 2 }, liveCatchup: { enabled: true } },
+      });
+      p.on(dashjs.MediaPlayer.events.ERROR, (e) => {
+        const err = e.error || {};
+        stats.errors.push({ t: (performance.now() - t0) / 1000, code: err.code, message: err.message });
+        stats.fatal = err.message || String(err.code);
+      });
+      p.initialize(v, url, true);
+      window.player = p;
+      latency = () => p.getCurrentLiveLatency();
+      target = () => p.getTargetLiveDelay();
+      wallLatency = () => v.currentTime > 1e9 ? Date.now() / 1000 - v.currentTime : NaN;
+    }
+
+    setInterval(() => {
+      const b = v.buffered;
+      const ahead = b.length ? b.end(b.length - 1) - v.currentTime : 0;
+      const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {};
+      const s = {
+        t: +((performance.now() - t0) / 1000).toFixed(1),
+        currentTime: +v.currentTime.toFixed(3),
+        latency: +(+latency()).toFixed(3),
+        target: +(+target()).toFixed(3),
+        wallLatency: +(+wallLatency()).toFixed(3),
+        bufferAhead: +ahead.toFixed(3),
+        rate: v.playbackRate,
+        paused: v.paused,
+        frames: q.totalVideoFrames, dropped: q.droppedVideoFrames,
+      };
+      stats.samples.push(s);
+      if (stats.samples.length > 600) stats.samples.shift();
+      document.getElementById('out').textContent = JSON.stringify(
+        { ...stats, samples: stats.samples.slice(-5) }, null, 1);
+    }, 1000);
+  </script>
+</body>
+</html>
