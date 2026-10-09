@@ -25,7 +25,7 @@ use rust_media_server::packager::{self, PackagerManager};
 use rust_media_server::recorder::RecorderManager;
 use rust_media_server::state::{AppState, AppStateParts};
 use rust_media_server::webrtc::WebRtcManager;
-use rust_media_server::{api, egress, vod, web};
+use rust_media_server::{api, cluster, egress, vod, web};
 
 /// rust-media-server: RTMP ingest, HTTP-FLV / WS-FLV / LL-HLS / LL-DASH egress.
 #[derive(Debug, Parser)]
@@ -158,10 +158,29 @@ async fn run(config: Config) -> anyhow::Result<()> {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     }
 
-    // Database (+ crash recovery of open stream sessions).
-    let db_path = config.db_path();
-    let db =
-        Db::open(&db_path).with_context(|| format!("opening database {}", db_path.display()))?;
+    // Database: PostgreSQL in cluster mode, SQLite otherwise (+ crash recovery of the
+    // stream sessions this node left open).
+    let db = if config.cluster.enabled {
+        let url = &config.cluster.database_url;
+        Db::connect_postgres(url)
+            .await
+            .with_context(|| {
+                format!(
+                    "connecting to PostgreSQL {} (cluster.database_url)",
+                    rust_media_server::config::redact_url_password(url)
+                )
+            })?
+            .with_node_id(&config.cluster.node_id)
+    } else {
+        let db_path = config.db_path();
+        Db::open(&db_path).with_context(|| format!("opening database {}", db_path.display()))?
+    };
+    tracing::info!(
+        backend = db.backend().as_str(),
+        node_id = %config.cluster.node_id,
+        cluster = config.cluster.enabled,
+        "database ready"
+    );
     let dangling = db::stream_sessions::close_dangling(&db).await?;
     if dangling > 0 {
         tracing::warn!(
@@ -219,6 +238,27 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // Video on demand: re-queue interrupted jobs, job runner, inbox scanner.
     state.vod.spawn(shutdown.clone());
 
+    // Cluster: node registry (heartbeat + reaper) and the internal listener.
+    let registry = state.cluster.spawn_registry(
+        hub.clone(),
+        tracker.clone(),
+        state.webrtc.clone(),
+        shutdown.clone(),
+    );
+    let internal = if config.cluster.enabled {
+        Some(
+            cluster::http::serve_internal(
+                state.cluster.clone(),
+                &config.cluster.internal_bind,
+                config.cluster.internal_secret.clone(),
+                shutdown.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     // RTMP ingest.
     let rtmp = RtmpServer::bind(config.clone(), db.clone(), hub.clone(), tracker.clone()).await?;
     let rtmp_task = tokio::spawn(rtmp.run(shutdown.child_token()));
@@ -230,6 +270,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .merge(packager::router())
         .merge(WebRtcManager::router())
         .merge(vod::router())
+        .merge(cluster::http::health_router())
         .merge(web::router(&state))
         .fallback(|| async { ApiError::not_found("not found").into_response() })
         .layer(TraceLayer::new_for_http())
@@ -271,6 +312,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
     }
     state.recorder.shutdown().await;
     state.vod.shutdown(Duration::from_secs(5)).await;
+    for task in [registry, internal].into_iter().flatten() {
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+    state.cluster.deregister().await;
+    db.close().await;
     tracing::info!("bye");
     Ok(())
 }

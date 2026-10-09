@@ -5,6 +5,7 @@
 //! library target also lets integration tests in `tests/` use them.
 
 pub mod api;
+pub mod cluster;
 pub mod config;
 pub mod db;
 pub mod egress;

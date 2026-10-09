@@ -35,6 +35,8 @@ pub struct SystemInfo {
     pub webrtc: crate::webrtc::WebRtcStatus,
     /// Video on demand: `{enabled, available, inbox_dir, jobs_running, queued, ...}`.
     pub vod: crate::vod::VodStatus,
+    /// `{enabled, node_id, backend, nodes: [...]}` (docs/API.md §4.5).
+    pub cluster: crate::cluster::ClusterInfo,
 }
 
 async fn system(State(state): State<AppState>) -> Json<SystemInfo> {
@@ -55,5 +57,40 @@ async fn system(State(state): State<AppState>) -> Json<SystemInfo> {
         },
         webrtc: state.webrtc.status(),
         vod: state.vod.status().await,
+        cluster: state.cluster.info().await,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn system_reports_the_cluster_and_public_port() {
+        let (state, dir) = crate::api::waiting::tests::test_state(false).await;
+        let app = routes().with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/system")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["cluster"]["enabled"], false);
+        assert_eq!(v["cluster"]["backend"], "sqlite");
+        assert_eq!(v["cluster"]["node_id"], state.cluster.node_id());
+        assert!(v["cluster"]["nodes"].as_array().unwrap().is_empty());
+        assert_eq!(v["webrtc"]["public_port"], v["webrtc"]["udp_port"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

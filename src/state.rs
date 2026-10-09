@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{OnceCell, broadcast};
 use tokio_util::sync::CancellationToken;
 
+use crate::cluster::ClusterNode;
 use crate::config::Config;
 use crate::db::Db;
 use crate::hub::{Hub, HubEvent};
@@ -33,6 +34,9 @@ pub struct Inner {
     /// Video on demand (built here from the config, the DB and the resolved ffmpeg;
     /// `main.rs` spawns its tasks).
     pub vod: Arc<VodManager>,
+    /// Cluster identity, node registry and drain flag (`enabled = false` on a single
+    /// node; `main.rs` spawns the registry in cluster mode).
+    pub cluster: Arc<ClusterNode>,
     /// Monotonic process start (uptime).
     pub started_at: Instant,
     pub started_at_utc: DateTime<Utc>,
@@ -70,6 +74,7 @@ impl AppState {
             events.clone(),
             ffmpeg.clone(),
         );
+        let cluster = ClusterNode::new(p.config.clone(), p.db.clone());
         AppState(Arc::new(Inner {
             config: p.config,
             db: p.db,
@@ -79,6 +84,7 @@ impl AppState {
             recorder: p.recorder,
             webrtc: p.webrtc,
             vod,
+            cluster,
             started_at: Instant::now(),
             started_at_utc: Utc::now(),
             events,
