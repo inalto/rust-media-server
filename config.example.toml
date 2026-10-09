@@ -98,7 +98,7 @@ renditions = [
 [log]
 level = "info"             # RUST_LOG overrides
 
-[cluster]                  # multi-instance mode (preview, docs/CLUSTER.md): PostgreSQL instead of SQLite
+[cluster]                  # multi-instance mode (docs/CLUSTER.md): PostgreSQL instead of SQLite, relays between nodes
 enabled = false            # false = single node (SQLite, nothing below is used)
 node_id = ""               # unique and stable per node; empty = host name (RMS_CLUSTER_NODE_ID)
 database_url = ""          # postgres://rms:PASSWORD@db:5432/rms (RMS_CLUSTER_DATABASE_URL)
@@ -108,4 +108,6 @@ internal_secret = ""       # >= 32 random characters, identical on every node (R
 heartbeat_secs = 5         # node registry heartbeat
 node_ttl_secs = 15         # a node without heartbeat for this long is dead (>= 2 x heartbeat_secs)
 relay_idle_secs = 30       # stop an edge relay without local viewers after this long
+whep_url = ""              # public WHEP base of THIS node, e.g. "https://rms2.example.com/whep"; empty = <public_url>/whep
+whep_redirect = true       # without usable WebRTC, answer POST /whep with 307 to another node's whep_url (different from ours)
 # In cluster mode server.admin_token (RMS_ADMIN_TOKEN) is mandatory and identical on every node.

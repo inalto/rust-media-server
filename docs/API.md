@@ -25,7 +25,7 @@ Conventions used below:
 3. [Data types](#3-data-types)
 4. [Admin API](#4-admin-api): [Broadcasts](#41-broadcasts) - [Recording](#42-recording) - [Metrics](#43-metrics) -
    [Waiting video and settings](#44-waiting-video-and-settings) - [System](#45-system) - [Events (SSE)](#46-events-sse) -
-   [Video on demand](#47-video-on-demand)
+   [Video on demand](#47-video-on-demand) - [Cluster mode](#48-cluster-mode)
 5. [Public player API](#5-public-player-api)
 6. [Playback endpoints](#6-playback-endpoints)
 7. [Pages](#7-pages)
@@ -235,7 +235,9 @@ HLS/DASH viewers are request-based: a viewer is counted from its first playlist/
 
 ### LiveInfo
 
-Present in `BroadcastView.live` while a publisher is connected.
+Present in `BroadcastView.live` while a publisher is connected (in cluster mode: to any node; for a
+stream published on another node the fields come from that node's `/internal/status`, cached 3 s, or
+only `started_at` + `node_id` when it does not answer).
 
 | Field | Type | Notes |
 |---|---|---|
@@ -247,6 +249,7 @@ Present in `BroadcastView.live` while a publisher is connected.
 | `bytes_in` | integer | bytes received from the publisher so far |
 | `recording` | [Recording](#recording) \| null | the in-progress recording (`status = "recording"`), if any |
 | `packager` | [PackagerStatus](#packagerstatus) \| null | LL-HLS/LL-DASH packaging status; `null` when both packagers are disabled or nothing is packaged yet |
+| `node_id` | string | cluster mode only (absent on a single node): the node the publisher is connected to |
 
 ### PackagerStatus
 
@@ -763,7 +766,7 @@ Upload of the global default video (same pipeline and limits as above, stored un
   "rtmp_bind": "0.0.0.0:1935",
   "http_bind": "0.0.0.0:8080",
   "public_url": "",
-  "hub": {"live_streams": 1},
+  "hub": {"live_streams": 1, "relays": 0},
   "webrtc": {
     "enabled": true,
     "available": true,
@@ -797,10 +800,18 @@ Upload of the global default video (same pipeline and limits as above, stored un
       {"node_id": "rms2", "advertise_url": "http://rms2:8081", "whep_url": null,
        "version": "0.1.0", "started_at": "2026-10-09T18:00:03.950Z", "heartbeat": "2026-10-09T18:12:30.411Z",
        "live_streams": 0, "viewers": 3, "draining": false, "alive": true}
-    ]
+    ],
+    "live_streams": [
+      {"name": "evento-2026", "node_id": "rms1", "session_id": "5d0c…", "started_at": "2026-10-09T18:05:12.391Z",
+       "heartbeat": "2026-10-09T18:12:31.012Z"}
+    ],
+    "relays": []
   }
 }
 ```
+
+`hub.live_streams` counts the streams published on this node, `hub.relays` the streams of other nodes
+relayed here (cluster mode).
 
 `ffmpeg.path` / `ffmpeg.version` are `null` when ffmpeg is unavailable (`version` is the first line of
 `ffmpeg -version`). `public_url` is `server.public_url` as configured (empty = derived from `Host`).
@@ -823,7 +834,11 @@ WHEP sessions (connecting or connected); `publishers` the broadcasts with a runn
 node). Each node refreshes `heartbeat` (database clock), `live_streams`, `viewers` (live broadcasts,
 all protocols) and `draining` every `cluster.heartbeat_secs`; `alive` is false once the heartbeat is
 older than `cluster.node_ttl_secs`, and every node deletes such rows shortly after. `whep_url` is
-`<server.public_url>/whep` when WebRTC is available and `public_url` is set, else `null`.
+`cluster.whep_url` (else `<server.public_url>/whep`) when WebRTC is available, else `null`.
+`live_streams` are the stream owners (`live_streams` rows with a fresh heartbeat: `session_id` is the
+claim of the current publish); `relays` the relays running on this node: `{name, origin_node,
+started_at, state: "connecting"|"ready"|"failed"|"stopped", attempts, bytes_in, viewers}` (see
+[4.8](#48-cluster-mode)). Both are `[]` on a single node.
 
 #### `GET /healthz`
 
@@ -840,7 +855,8 @@ Public, no token, no CORS. Liveness probe for load balancers and container healt
 | `503` | draining or shutting down (`"draining": true`): stop sending new requests here |
 
 `db` is the result of a `SELECT 1` bounded to 2 s; `live_streams` counts the streams published on
-this node.
+this node (relays excluded). A node drains on `SIGTERM` and on `POST /internal/drain`
+([4.8](#48-cluster-mode)).
 
 ### 4.6 Events (SSE)
 
@@ -854,8 +870,8 @@ Admin Server-Sent Events stream (`Content-Type: text/event-stream`, `Cache-Contr
 |---|---|---|
 | `heartbeat` | `{"ts": "2026-10-08T14:00:00.000Z"}` | on connect and every 15 s |
 | `broadcast` | a full [BroadcastView](#broadcastview) | any change of a broadcast: create, patch, pause/resume, regenerate-key, waiting video, recording start/stop/finalize, stream start/end, stream metadata (codec info) update |
-| `stream` | `{"name": "evento-2026", "status": "live"}` | stream start/end; `status` is the new `offline`/`live`/`paused`; sent right before the matching `broadcast` event |
-| `viewers` | `{"name": "evento-2026", "counts": ViewerCounts}` | the viewer counts of a broadcast changed |
+| `stream` | `{"name": "evento-2026", "status": "live"}` | stream start/end; `status` is the new `offline`/`live`/`paused`; sent right before the matching `broadcast` event. Cluster mode: also when a stream of another node starts, ends or changes owner, and when a local relay starts/stops (`status` is the effective one: live anywhere in the cluster) |
+| `viewers` | `{"name": "evento-2026", "counts": ViewerCounts}` | the viewer counts of a broadcast changed (cluster mode: counts of every node, this node's live counts plus the other nodes' latest samples; a change on another node shows up within ~2 s plus one sampling interval) |
 | `broadcast_deleted` | `{"name": "evento-2026"}` | a broadcast was deleted |
 | `settings` | `{"ui_language": "en", "ui_theme": "system", "default_waiting_text": "The live stream will start shortly"}` | after a `PATCH /api/v1/settings` that set `ui_language`, `ui_theme` and/or `default_waiting_text` (effective values) |
 | `vod` | a full [VodView](#vodview) | a video on demand item was created (upload, inbox), changed status, progressed (≥ 1 %, at most every 0.5 s), got its poster, was edited or re-queued, or counted a play |
@@ -870,6 +886,8 @@ data: {"name":"evento-2026","status":"live"}
 ```
 
 Events are not replayed: after a reconnect, re-read `GET /api/v1/broadcasts` (and `GET /api/v1/vod`).
+In cluster mode every node's stream shows changes made on any node (broadcasts, settings, videos,
+streams): they travel between nodes as PostgreSQL notifications ([4.8](#48-cluster-mode)).
 The viewer counts of a video on demand also arrive as `viewers` events with `name` = `vod:<id>`.
 
 ### 4.7 Video on demand
@@ -966,6 +984,54 @@ The ladders of the configuration (read-only) and the VOD limits:
 #### `GET /api/v1/vod/{id}/source`
 
 - The original file (`Content-Disposition: attachment`, `Range` supported). `404` when it was removed.
+
+### 4.8 Cluster mode
+
+Several rms nodes share one PostgreSQL database ([CLUSTER.md](CLUSTER.md)); every public route works on
+every node. What changes for clients:
+
+- **`X-Rms-Node: <node_id>`** on every HTTP response of a node in cluster mode (absent on a single
+  node): which node answered behind the load balancer.
+- **Status and views** are cluster-wide: a broadcast is `live` when any node publishes it (the
+  `live_streams` table, refreshed every 2 s and by notifications); `BroadcastView.live` describes the
+  owner's stream ([LiveInfo](#liveinfo)); `viewers`, `/metrics/overview`, `metrics/summary.current`
+  add up the nodes (this node's live counts + the other nodes' latest samples); `GET
+  /broadcasts/{name}/sessions` lists this node's sessions only.
+- **Playback anywhere**: FLV, WS-FLV, HLS, DASH and WHEP requests for a stream published on another
+  node start a relay from the owner (one per stream and node; the first request waits up to 6 s for
+  a keyframe). HLS/DASH timelines are per node: keep one viewer on one node (hash of `X-Real-IP`, see
+  `deploy/haproxy.cfg`).
+- **Publishing**: any node accepts any key. When another node publishes the key, its publisher is
+  disconnected (internal kick) and the new one takes over within ~0.5 s; a draining node rejects
+  publishes. `POST /broadcasts/{name}/disconnect` reaches the owner node (`503` when it cannot be
+  reached). Recordings are made by the owner node only: `record/start` on another node answers `409
+  the stream is published on node <id>`.
+- **Downloads**: `GET /recordings/{id}/download` serves the file from the shared volume; when the file
+  is missing locally it is fetched (Range forwarded) from the node that wrote it.
+- **WHEP**: session ids are `<node_id>-<uuid>`; `DELETE /whep/{name}/{session}` of another node's
+  session is forwarded to it; a node without usable WebRTC answers `307` ([6.5](#65-webrtc-whep)).
+
+#### Internal routes
+
+Served only on the internal listener (`cluster.internal_bind`, default `0.0.0.0:8081`; never publish it
+through the proxy), every route requires `Authorization: Bearer <cluster.internal_secret>` (`401`
+otherwise; cookies are ignored). Used by the nodes themselves; listed here for operators.
+
+| Method & path | Response |
+|---|---|
+| `GET /internal/ping` | `{"node_id", "version", "draining"}` |
+| `GET /internal/relay/{name}.flv` | the FLV byte stream of a stream **published on this node** (header, metadata, sequence headers, GOP, then live tags; no viewer session); `404` otherwise (a relay is never relayed again) |
+| `POST /internal/kick/{name}` | `204` the local publisher is disconnected (another node takes the stream over); `404` none |
+| `GET /internal/status/{name}` | `200` `{name, node_id, started_at, publisher_ip, video_codec, audio_codec, width, height, fps, bytes_in, recording, packager}` of a stream published here; `404` otherwise |
+| `POST /internal/drain` | `{"node_id", "draining": true}`: `/healthz` answers `503` (the load balancer stops sending new requests), no new publishes or relays on this node; current publishers, viewers and relays keep running |
+| `DELETE /internal/drain` | `{"node_id", "draining": false}`: back in the pool |
+| `GET /internal/files/{kind}/{path}` | a file of `recordings`, `waiting` or `vod` (relative `path`, plain components only), `Range` supported; `404` unknown kind or file |
+| `POST /internal/whep/delete/{session}?name={name}` | `200` the WHEP session of this node is closed; `404` unknown |
+
+```bash
+curl -s -H "Authorization: Bearer $RMS_INTERNAL_SECRET" http://rms2:8081/internal/ping
+curl -s -X POST -H "Authorization: Bearer $RMS_INTERNAL_SECRET" http://rms2:8081/internal/drain   # before maintenance
+```
 
 ---
 
@@ -1299,8 +1365,8 @@ audio section (video-only). A new viewer starts at the next keyframe (at most on
 
 | Method & path | Request | Response |
 |---|---|---|
-| `POST /whep/{name}` | `Content-Type: application/sdp`, body = SDP offer (≤ 64 KiB) with a video section offering H.264 (`packetization-mode=1`); audio optional | `201 Created`, `Content-Type: application/sdp`, body = SDP answer, `Location: /whep/{name}/{session}`, `ETag: "<session>"`, `Link` (ICE servers, below) |
-| `DELETE /whep/{name}/{session}` | | `200` (session closed; also for a session the server closed in the last 2 minutes), `404 session not found` |
+| `POST /whep/{name}` | `Content-Type: application/sdp`, body = SDP offer (≤ 64 KiB) with a video section offering H.264 (`packetization-mode=1`); audio optional | `201 Created`, `Content-Type: application/sdp`, body = SDP answer, `Location: /whep/{name}/{session}`, `ETag: "<session>"`, `Link` (ICE servers, below). Cluster mode: `307 Temporary Redirect` (below) |
+| `DELETE /whep/{name}/{session}` | | `200` (session closed; also for a session the server closed in the last 2 minutes), `404 session not found`; cluster mode: a session of another node is closed there (`502` when that node cannot be reached) |
 | `PATCH /whep/{name}/{session}` | | `405` with `Allow: DELETE, OPTIONS` (trickle ICE / ICE restart not supported) |
 | `OPTIONS /whep/{name}` | | `204`, `Allow: POST, OPTIONS`, CORS preflight headers, `Link` |
 | `OPTIONS /whep/{name}/{session}` | | `204`, `Allow: DELETE, OPTIONS` |
@@ -1322,6 +1388,16 @@ audio section (video-only). A new viewer starts at the next keyframe (at most on
 Every response has `Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers: Location, Link,
 ETag`. When `webrtc.stun_server` is set, `POST` and `OPTIONS` responses carry
 `Link: <stun:host:port>; rel="ice-server"` (a bare `host:port` gets the `stun:` prefix).
+
+**Cluster mode.** Session ids are `<node_id>-<uuid>` (a plain 32-hex-digit UUID on a single node), so
+any node can route the `DELETE`. A node whose WebRTC is unusable (`webrtc.enabled = false` or UDP
+port not bound) answers `POST` with **`307 Temporary Redirect`**, `Location: <whep_url>/{name}` of the
+least loaded alive node whose `whep_url` differs from its own (`cluster.whep_url` per node, e.g.
+`https://rms2.example.com/whep`; nodes sharing one hostname never redirect to each other), when
+`cluster.whep_redirect = true` (default); the public player info then offers `sources.whep` too. The
+browser re-sends the `POST` with its body to the new URL (Fetch, `307`); cross-origin targets get a
+CORS preflight, which rms answers (verified with Chrome 150, page on one node, session on the other).
+Resolve the `Location` of the `201` against `res.url` (the final URL), not the first endpoint.
 
 Session lifetime: the server closes a session on `DELETE`, when the peer connection fails or closes,
 after 10 s in the `disconnected` state (consent freshness lost: tab closed without `DELETE`, network
