@@ -620,3 +620,7 @@ broadcast. A browser killed without `DELETE` is reaped after ≈ 15 s (5 s ICE d
 - **No backend change.** Everything uses the 8A endpoints.
 - **Validated** (2026-10-10, release build, headless Chrome 150): both roles end to end (users, keys shown once, buckets, uploads incl. a 314 MB streamed `PUT` with progress and cancel, live encoding chips, private + signed playback, rotation invalidating links, folder delete, storage-only key `/videos/` 201 vs `/other/` 403, refusal of its dashboard login), it/en × dark/light, 390 px without horizontal scroll, no console errors; smoke 212/212. Screenshots: `docs/screenshots/`.
 - **Known limits.** No folder upload (directory entries of a drop are ignored), no resumable/parallel uploads, listings not paginated (one directory = one table), SHA-256 of files ≤ 256 MB is read into memory; private posters are not shown in the admin library; the login page still logs the browser's `401` of the initial `auth/check` (as before); the network log also shows the expected `4xx` of rejected requests (e.g. a 409 when a bucket gained files after the page loaded).
+
+## 24. Phase 8C: documentation
+
+Phase 8C: English README, wiki pages and screenshot set — `README.md` is the English GitHub README (Italian guide in `README.it.md`, superseding the README language note above and in §3), user guide in `docs/wiki/`, English screenshots in `docs/screenshots/`, MIT `LICENSE`.
