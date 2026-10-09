@@ -1,13 +1,19 @@
-// rms dashboard — entry point: login, hash router, admin SSE (live updates with
-// reconnect/backoff and polling fallback), broadcast list, "Nuova diretta" dialog and
-// the settings page. The broadcast detail lives in detail.js.
+// rms dashboard — entry point: UI language, login, hash router, admin SSE (live
+// updates with reconnect/backoff and polling fallback), broadcast list, "new broadcast"
+// dialog and the settings page. The broadcast detail lives in detail.js.
+//
+// Language: <html lang> (set by the server) at startup, then GET /api/v1/public/ui
+// before the login view, then GET /settings after login; the admin SSE `settings`
+// event and the Settings page switch it at runtime: the static shell is re-translated
+// (data-i18n) and the current view is re-rendered without a reload.
 
 import {
-  api, ApiError, bus, store, describeError, onUnauthorized, h, icon, iconButton, setChildren, toast,
+  api, ApiError, bus, store, describeError, onUnauthorized, h, icon, iconButton, setChildren, toast, uid,
   modal, copyText, uploadWidget, flagFields, readFlags, textField, slugify, NAME_RE,
   fmtInt, fmtDuration, fmtSince, statusBadge, totalViewers, PROTOCOLS, confirmDialog,
 } from './core.js';
 import { mountDetail } from './detail.js';
+import { t, tn, setLanguage, getLanguage, onLanguageChange, translateDom } from './i18n.js';
 
 const POLL_MS = 10000;
 const SSE_MAX_BACKOFF = 30000;
@@ -28,14 +34,14 @@ function showLogin(message) {
   if (unmount) { unmount(); unmount = null; }
   store.clear();
   topbar.hidden = true;
-  document.title = 'Accesso · rms';
+  document.title = t('login.docTitle');
   const err = h('p', { class: 'error', role: 'alert', hidden: !message }, message || '');
   const token = textField({
-    label: 'Token di amministrazione', name: 'token', type: 'password',
-    hint: 'Lo trovi nel file data/admin_token del server (o nel log al primo avvio).',
+    label: t('login.tokenLabel'), name: 'token', type: 'password',
+    hint: t('login.tokenHint'),
     attrs: { required: true, autocomplete: 'current-password', spellcheck: 'false' },
   });
-  const submit = h('button', { type: 'submit', class: 'btn primary block' }, 'Accedi');
+  const submit = h('button', { type: 'submit', class: 'btn primary block' }, t('login.submit'));
   // Hidden username so password managers can store the token.
   const user = h('input', { type: 'text', name: 'username', autocomplete: 'username', value: 'admin', hidden: true, tabindex: '-1', 'aria-hidden': 'true' });
   const form = h('form', { class: 'stack', novalidate: true }, user, token, err, submit);
@@ -43,13 +49,13 @@ function showLogin(message) {
     e.preventDefault();
     const value = token.control.value.trim();
     err.hidden = true;
-    if (!value) { err.textContent = 'Inserisci il token.'; err.hidden = false; token.control.focus(); return; }
+    if (!value) { err.textContent = t('login.emptyToken'); err.hidden = false; token.control.focus(); return; }
     submit.disabled = true;
     try {
       await api('/auth/login', { method: 'POST', body: { token: value } });
       await start();
     } catch (ex) {
-      err.textContent = ex instanceof ApiError && ex.status === 401 ? 'Token non valido.' : describeError(ex);
+      err.textContent = ex instanceof ApiError && ex.status === 401 ? t('login.invalidToken') : describeError(ex);
       err.hidden = false;
       token.control.select();
     } finally { submit.disabled = false; }
@@ -57,13 +63,13 @@ function showLogin(message) {
   setChildren(app, h('section', { class: 'login' },
     h('div', { class: 'login-card' },
       h('div', { class: 'brand big' }, icon('radio', 28), h('span', null, 'rms')),
-      h('h1', null, 'Pannello delle dirette'),
-      h('p', { class: 'muted' }, 'Accedi per gestire le dirette, le impostazioni di OBS e il codice di embed.'),
+      h('h1', null, t('login.title')),
+      h('p', { class: 'muted' }, t('login.lead')),
       form)));
   token.control.focus();
 }
 
-onUnauthorized(() => { if (authed) showLogin('Sessione scaduta: accedi di nuovo.'); });
+onUnauthorized(() => { if (authed) showLogin(t('error.sessionExpired')); });
 
 document.getElementById('logout').addEventListener('click', async () => {
   try { await api('/auth/logout', { method: 'POST' }); } catch (_) { /* ignore */ }
@@ -71,7 +77,8 @@ document.getElementById('logout').addEventListener('click', async () => {
 });
 
 async function start() {
-  const list = await api('/broadcasts');
+  const [list, settings] = await Promise.all([api('/broadcasts'), api('/settings').catch(() => null)]);
+  if (settings && settings.ui_language) setLanguage(settings.ui_language);
   authed = true;
   store.replaceAll(list);
   topbar.hidden = false;
@@ -91,8 +98,8 @@ let everConnected = false;
 
 function setConn(state) {
   connEl.dataset.state = state;
-  connEl.querySelector('.conn-label').textContent = state === 'live' ? 'Tempo reale' : state === 'polling' ? 'Riconnessione…' : 'Connessione…';
-  connEl.title = state === 'live' ? 'Aggiornamenti in tempo reale attivi' : 'Aggiornamenti in tempo reale non disponibili: aggiorno ogni 10 secondi';
+  connEl.querySelector('.conn-label').textContent = state === 'live' ? t('conn.live') : state === 'polling' ? t('conn.polling') : t('conn.connecting');
+  connEl.title = state === 'live' ? t('conn.liveTitle') : t('conn.pollingTitle');
 }
 
 async function refreshList() {
@@ -128,9 +135,11 @@ function connectSSE() {
     if (!d || !d.name) return;
     const b = store.broadcasts.get(d.name);
     const title = b ? b.title : d.name;
-    if (d.status === 'live') toast(`«${title}» riceve il segnale ed è in diretta.`, 'success');
-    else if (d.status === 'offline') toast(`«${title}»: il segnale si è interrotto.`, 'info');
+    if (d.status === 'live') toast(t('toast.streamLive', { title }), 'success');
+    else if (d.status === 'offline') toast(t('toast.streamOffline', { title }), 'info');
   });
+  // UI language changed (here or in another dashboard): re-render in the new language.
+  es.addEventListener('settings', (ev) => { const d = parse(ev); if (d && d.ui_language) setLanguage(d.ui_language); });
   es.addEventListener('heartbeat', () => setConn('live'));
   es.addEventListener('error', async () => {
     if (!es) return;
@@ -139,7 +148,7 @@ function connectSSE() {
     setConn('polling');
     startPolling();
     // A 401 closes the stream for good: check the session before reconnecting.
-    try { await api('/auth/check'); } catch (e) { if (e instanceof ApiError && e.status === 401) { showLogin('Sessione scaduta: accedi di nuovo.'); return; } }
+    try { await api('/auth/check'); } catch (e) { if (e instanceof ApiError && e.status === 401) { showLogin(t('error.sessionExpired')); return; } }
     if (!authed) return;
     reconnectTimer = setTimeout(connectSSE, backoff);
     backoff = Math.min(backoff * 2, SSE_MAX_BACKOFF);
@@ -196,26 +205,26 @@ window.addEventListener('hashchange', route);
 // ---------------------------------------------------------------------------
 
 function mountList(root) {
-  document.title = 'Dirette · rms';
+  document.title = t('list.docTitle');
   const cards = new Map();
   const grid = h('div', { class: 'cards', role: 'list' });
   const summary = h('p', { class: 'muted', 'aria-live': 'polite' });
   const empty = h('div', { class: 'empty', hidden: true },
     icon('radio', 32),
-    h('h2', null, 'Nessuna diretta'),
-    h('p', { class: 'muted' }, 'Crea la prima diretta: otterrai le impostazioni da inserire in OBS e il codice da incorporare nel sito.'),
-    h('button', { type: 'button', class: 'btn primary', onclick: () => createDialog() }, icon('plus'), h('span', null, 'Nuova diretta')));
+    h('h2', null, t('list.emptyTitle')),
+    h('p', { class: 'muted' }, t('list.emptyText')),
+    h('button', { type: 'button', class: 'btn primary', onclick: () => createDialog() }, icon('plus'), h('span', null, t('list.new'))));
   setChildren(root, h('div', { class: 'page' },
     h('div', { class: 'page-head' },
-      h('div', null, h('h1', null, 'Dirette'), summary),
-      h('button', { type: 'button', class: 'btn primary', onclick: () => createDialog() }, icon('plus'), h('span', null, 'Nuova diretta'))),
+      h('div', null, h('h1', null, t('list.title')), summary),
+      h('button', { type: 'button', class: 'btn primary', onclick: () => createDialog() }, icon('plus'), h('span', null, t('list.new')))),
     grid, empty));
 
   function card(b) {
     const el = h('article', { class: 'bcard', role: 'listitem' });
     const refs = {
       badge: h('span'),
-      rec: h('span', { class: 'rec-chip', hidden: true, title: 'Registrazione in corso' }, h('span', { class: 'dot', 'aria-hidden': 'true' }), 'REC'),
+      rec: h('span', { class: 'rec-chip', hidden: true, title: t('card.recTitle') }, h('span', { class: 'dot', 'aria-hidden': 'true' }), t('common.rec')),
       viewers: h('strong'),
       viewersWrap: null,
       title: h('a'),
@@ -230,18 +239,18 @@ function mountList(root) {
       refs.pause.disabled = true;
       try {
         store.upsert(await api(`/broadcasts/${encodeURIComponent(b.name)}/${paused ? 'resume' : 'pause'}`, { method: 'POST' }));
-        toast(paused ? 'Diretta ripresa.' : 'Diretta in pausa: i player mostrano il video di attesa.', 'success');
+        toast(paused ? t('toast.resumed') : t('toast.paused'), 'success');
       } catch (e) { toast(describeError(e), 'error'); }
       refs.pause.disabled = false;
     });
-    const copyEmbed = iconButton('code', 'Embed', async () => {
+    const copyEmbed = iconButton('code', t('card.embed'), async () => {
       try {
         const info = await api(`/broadcasts/${encodeURIComponent(b.name)}/embed`);
         const ok = await copyText(info.iframe);
-        toast(ok ? 'Codice iframe copiato negli appunti.' : 'Copia non riuscita.', ok ? 'success' : 'error');
+        toast(ok ? t('toast.iframeCopied') : t('toast.copyFailedShort'), ok ? 'success' : 'error');
       } catch (e) { toast(describeError(e), 'error'); }
-    }, { cls: 'btn small', attrs: { title: 'Copia il codice iframe da incollare nel sito', 'aria-label': `Copia il codice embed di ${b.title}` } });
-    const open = h('a', { class: 'btn small primary', href: `#/b/${encodeURIComponent(b.name)}`, 'aria-label': `Apri ${b.title}` }, h('span', null, 'Apri'));
+    }, { cls: 'btn small', attrs: { title: t('card.embedTitle'), 'aria-label': t('card.embedLabel', { title: b.title }) } });
+    const open = h('a', { class: 'btn small primary', href: `#/b/${encodeURIComponent(b.name)}`, 'aria-label': t('card.openLabel', { title: b.title }) }, h('span', null, t('card.open')));
     el.append(
       h('div', { class: 'bcard-top' }, h('div', { class: 'badges' }, refs.badge, refs.rec), refs.viewersWrap),
       h('h2', { class: 'bcard-title' }, refs.title),
@@ -265,20 +274,20 @@ function mountList(root) {
       const parts = [];
       if (b.live.width && b.live.height) parts.push(`${b.live.width}×${b.live.height}`);
       if (b.live.fps) parts.push(`${Math.round(b.live.fps)} fps`);
-      parts.push(`segnale ${fmtSince(b.live.started_at)}`);
+      parts.push(t('card.signalFor', { duration: fmtDuration((Date.now() - new Date(b.live.started_at).getTime()) / 1000) }));
       r.meta.textContent = parts.join(' · ');
     } else {
-      r.meta.textContent = b.description ? b.description : 'In attesa del segnale da OBS';
+      r.meta.textContent = b.description ? b.description : t('card.waitingSignal');
     }
     const paused = b.status === 'paused';
-    setChildren(r.pause, icon(paused ? 'play' : 'pause', 16), h('span', null, paused ? 'Riprendi' : 'Pausa'));
-    r.pause.setAttribute('aria-label', `${paused ? 'Riprendi' : 'Metti in pausa'} ${b.title}`);
+    setChildren(r.pause, icon(paused ? 'play' : 'pause', 16), h('span', null, paused ? t('action.resume') : t('action.pause')));
+    r.pause.setAttribute('aria-label', paused ? t('card.resumeLabel', { title: b.title }) : t('card.pauseLabel', { title: b.title }));
   }
 
   function setViewers(el, counts) {
     const n = totalViewers(counts);
     el.refs.viewers.textContent = fmtInt(n);
-    el.refs.viewersWrap.setAttribute('aria-label', `${fmtInt(n)} spettatori`);
+    el.refs.viewersWrap.setAttribute('aria-label', tn('card.viewersLabel', n, { n: fmtInt(n) }));
     el.refs.viewersWrap.title = PROTOCOLS.map((p) => `${p.label}: ${fmtInt((counts && counts[p.key]) || 0)}`).join(' · ');
   }
 
@@ -287,7 +296,7 @@ function mountList(root) {
     const live = all.filter((b) => b.status === 'live').length;
     const viewers = all.reduce((acc, b) => acc + totalViewers(b.viewers), 0);
     summary.textContent = all.length
-      ? `${all.length} ${all.length === 1 ? 'diretta' : 'dirette'} · ${live} in onda · ${fmtInt(viewers)} ${viewers === 1 ? 'spettatore' : 'spettatori'}`
+      ? [tn('list.broadcasts', all.length), t('list.onAir', { n: live }), tn('list.viewers', viewers, { n: fmtInt(viewers) })].join(' · ')
       : '';
   }
 
@@ -314,33 +323,33 @@ function mountList(root) {
     bus.on('viewers', ({ name, counts }) => { const el = cards.get(name); if (el) setViewers(el, counts); renderSummary(); }),
   ];
   render();
-  // Refresh "segnale da N min" labels.
+  // Refresh "on air for N min" labels.
   const tick = setInterval(() => { if (!document.hidden) render(); }, 30000);
   return () => { offs.forEach((off) => off()); clearInterval(tick); };
 }
 
 function createDialog() {
-  const dlg = modal({ title: 'Nuova diretta' });
-  const title = textField({ label: 'Titolo', name: 'title', attrs: { required: true, maxlength: '200', placeholder: 'Es. Messa della domenica' } });
+  const dlg = modal({ title: t('create.title') });
+  const title = textField({ label: t('create.titleLabel'), name: 'title', attrs: { required: true, maxlength: '200', placeholder: t('create.titlePlaceholder') } });
   const nameField = textField({
-    label: 'Nome nell\'URL', name: 'name',
-    hint: 'Generato dal titolo; usato in tutti i link (lettere minuscole, cifre, «-» e «_»). Non si può cambiare dopo.',
+    label: t('create.nameLabel'), name: 'name',
+    hint: t('create.nameHint'),
     attrs: { maxlength: '64', pattern: '[a-z0-9_\\-]{1,64}', spellcheck: 'false', autocapitalize: 'off', class: 'mono' },
   });
-  const desc = textField({ label: 'Descrizione (facoltativa)', name: 'description', textarea: true, rows: 2, attrs: { maxlength: '5000' } });
+  const desc = textField({ label: t('create.descLabel'), name: 'description', textarea: true, rows: 2, attrs: { maxlength: '5000' } });
   const waiting = textField({
-    label: 'Testo di attesa (facoltativo)', name: 'waiting_text', attrs: { maxlength: '500', placeholder: 'Predefinito: La diretta inizierà a breve' },
-    hint: 'Mostrato dal player prima dell\'inizio e durante le pause. Se lo lasci vuoto si usa il testo predefinito globale (Impostazioni).',
+    label: t('create.waitingLabel'), name: 'waiting_text', attrs: { maxlength: '500', placeholder: t('create.defaultPlaceholder', { text: t('waiting.builtin') }) },
+    hint: t('create.waitingHint'),
   });
-  api('/settings').then((s) => { if (s && s.default_waiting_text) waiting.control.placeholder = `Predefinito: ${s.default_waiting_text}`; }).catch(() => {});
+  api('/settings').then((s) => { if (s && s.default_waiting_text) waiting.control.placeholder = t('create.defaultPlaceholder', { text: s.default_waiting_text }); }).catch(() => {});
   const err = h('p', { class: 'error', role: 'alert', hidden: true });
-  const submit = h('button', { type: 'submit', class: 'btn primary' }, 'Crea diretta');
+  const submit = h('button', { type: 'submit', class: 'btn primary' }, t('create.submit'));
   const form = h('form', { class: 'stack', novalidate: true }, title, nameField, desc, waiting, flagFields({}), err,
-    h('div', { class: 'modal-actions' }, h('button', { type: 'button', class: 'btn', onclick: () => dlg.close('cancel') }, 'Annulla'), submit));
+    h('div', { class: 'modal-actions' }, h('button', { type: 'button', class: 'btn', onclick: () => dlg.close('cancel') }, t('common.cancel')), submit));
 
   let manual = false;
   const preview = h('span', { class: 'url-preview mono' });
-  nameField.append(h('p', { class: 'hint' }, 'Link del player: ', preview));
+  nameField.append(h('p', { class: 'hint' }, t('create.playerLink'), preview));
   const updatePreview = () => { preview.textContent = `${location.origin}/player/${nameField.control.value || '…'}`; };
   title.control.addEventListener('input', () => {
     if (!manual) nameField.control.value = slugify(title.control.value);
@@ -356,22 +365,22 @@ function createDialog() {
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     err.hidden = true;
-    const t = title.control.value.trim();
+    const titleText = title.control.value.trim();
     const n = nameField.control.value.trim();
-    if (!t) { err.textContent = 'Il titolo è obbligatorio.'; err.hidden = false; title.control.focus(); return; }
+    if (!titleText) { err.textContent = t('error.titleRequired'); err.hidden = false; title.control.focus(); return; }
     if (n && !NAME_RE.test(n)) {
-      err.textContent = 'Nome non valido: usa solo lettere minuscole, cifre, «-» e «_» (max 64 caratteri).';
+      err.textContent = t('create.invalidName');
       err.hidden = false; nameField.control.focus(); return;
     }
     submit.disabled = true;
     try {
       const b = await api('/broadcasts', {
         method: 'POST',
-        body: { title: t, name: n || undefined, description: desc.control.value, waiting_text: waiting.control.value, ...readFlags(form) },
+        body: { title: titleText, name: n || undefined, description: desc.control.value, waiting_text: waiting.control.value, ...readFlags(form) },
       });
       store.upsert(b);
       dlg.close('ok');
-      toast(`Diretta «${b.title}» creata.`, 'success');
+      toast(t('toast.created', { title: b.title }), 'success');
       navigate(`#/b/${encodeURIComponent(b.name)}`);
     } catch (ex) {
       err.textContent = describeError(ex);
@@ -388,55 +397,81 @@ function createDialog() {
 // ---------------------------------------------------------------------------
 
 function mountSettings(root) {
-  document.title = 'Impostazioni · rms';
+  document.title = t('settings.docTitle');
   let destroyed = false;
   let settings = null;
   const timers = [];
+
+  // Interface language (dashboard + player texts).
+  const langId = uid('lang');
+  const langSelect = h('select', { id: langId, name: 'ui_language' },
+    h('option', { value: 'it' }, t('lang.name.it')),
+    h('option', { value: 'en' }, t('lang.name.en')));
+  langSelect.value = getLanguage();
+  const langNoteId = uid('hint');
+  langSelect.setAttribute('aria-describedby', langNoteId);
+  const langSave = h('button', { type: 'submit', class: 'btn primary' }, t('settings.languageSave'));
+  const langForm = h('form', { class: 'stack' },
+    h('div', { class: 'field' }, h('label', { for: langId }, t('settings.language')), langSelect,
+      h('p', { id: langNoteId, class: 'hint' }, t('settings.languageNote'))),
+    h('div', null, langSave));
+  langForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    langSave.disabled = true;
+    try {
+      const res = await api('/settings', { method: 'PATCH', body: { ui_language: langSelect.value } });
+      // Re-renders this page in the new language (see onLanguageChange below).
+      setLanguage(res.ui_language);
+      toast(t('settings.languageSaved'), 'success');
+    } catch (ex) {
+      toast(describeError(ex), 'error');
+    } finally { langSave.disabled = false; }
+  });
 
   const videoBox = h('div', { class: 'waiting-current' });
   const upload = uploadWidget({
     endpoint: '/settings/waiting-video',
     getLimits: () => ({ maxMb: settings ? settings.max_upload_mb : null, ffmpeg: settings ? settings.ffmpeg_available : true }),
     onDone: (s) => { settings = s; renderVideo(); },
-    label: 'Carica il video predefinito',
+    label: t('settings.uploadLabel'),
   });
   const text = textField({
-    label: 'Testo di attesa predefinito', name: 'default_waiting_text', textarea: true, rows: 2,
-    hint: 'Usato dalle dirette che non hanno un proprio testo di attesa. Lascia vuoto per ripristinare «La diretta inizierà a breve».',
+    label: t('settings.textLabel'), name: 'default_waiting_text', textarea: true, rows: 2,
+    hint: t('settings.textHint', { text: t('waiting.builtin') }),
     attrs: { maxlength: '500' },
   });
-  const textForm = h('form', { class: 'stack' }, text, h('div', null, h('button', { type: 'submit', class: 'btn primary' }, 'Salva testo')));
+  const textForm = h('form', { class: 'stack' }, text, h('div', null, h('button', { type: 'submit', class: 'btn primary' }, t('common.saveText'))));
   textForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     try {
       settings = await api('/settings', { method: 'PATCH', body: { default_waiting_text: text.control.value } });
       text.control.value = settings.default_waiting_text;
-      toast('Testo predefinito salvato.', 'success');
+      toast(t('settings.textSaved'), 'success');
     } catch (ex) { toast(describeError(ex), 'error'); }
   });
 
-  const systemBox = h('div', null, h('p', { class: 'muted' }, 'Caricamento…'));
-  const overviewBox = h('div', null, h('p', { class: 'muted' }, 'Caricamento…'));
+  const systemBox = h('div', null, h('p', { class: 'muted' }, t('common.loading')));
+  const overviewBox = h('div', null, h('p', { class: 'muted' }, t('common.loading')));
 
   function renderVideo() {
     if (!settings) return;
     const url = settings.default_waiting_video_url;
     if (!url) {
       setChildren(videoBox,
-        h('div', { class: 'waiting-placeholder' }, icon('film', 28), h('p', null, 'Nessun video predefinito')),
-        h('p', { class: 'hint' }, 'Le dirette senza un proprio video mostrano il titolo e il testo di attesa su sfondo animato.'));
+        h('div', { class: 'waiting-placeholder' }, icon('film', 28), h('p', null, t('settings.noVideo'))),
+        h('p', { class: 'hint' }, t('settings.noVideoHint')));
       return;
     }
     setChildren(videoBox,
       h('video', { class: 'waiting-preview', src: url, poster: settings.default_poster_url || null, controls: true, muted: true, loop: true, playsinline: true, preload: 'metadata' }),
       h('div', { class: 'row-between' },
-        h('p', { class: 'hint' }, 'Usato da tutte le dirette senza un video di attesa proprio.'),
-        iconButton('trash', 'Elimina video', async () => {
-          const ok = await confirmDialog({ title: 'Eliminare il video predefinito?', message: 'Le dirette senza un video proprio mostreranno il testo di attesa.', confirmLabel: 'Elimina', danger: true });
+        h('p', { class: 'hint' }, t('settings.videoHint')),
+        iconButton('trash', t('action.deleteVideo'), async () => {
+          const ok = await confirmDialog({ title: t('settings.deleteVideoTitle'), message: t('settings.deleteVideoText'), confirmLabel: t('action.delete'), danger: true });
           if (!ok) return;
           try {
             settings = await api('/settings/waiting-video', { method: 'DELETE' });
-            toast('Video predefinito eliminato.', 'success');
+            toast(t('settings.videoDeleted'), 'success');
             renderVideo();
           } catch (ex) { toast(describeError(ex), 'error'); }
         }, { cls: 'btn danger-ghost' })));
@@ -452,24 +487,23 @@ function mountSettings(root) {
       if (destroyed) return;
       const ff = s.ffmpeg || {};
       const rtc = s.webrtc || {};
-      const rtcLine = !rtc.enabled ? 'disattivato'
-        : !rtc.available ? `non disponibile${rtc.error ? ': ' + rtc.error : ''}`
-          : `porta UDP ${rtc.udp_port} · ${fmtInt(rtc.sessions)} sessioni${rtc.audio ? '' : ' · solo video (manca ffmpeg)'}`;
+      const rtcLine = !rtc.enabled ? t('system.rtcDisabled')
+        : !rtc.available ? (rtc.error ? t('system.rtcUnavailableReason', { error: rtc.error }) : t('system.unavailable'))
+          : [t('system.rtcStatus', { port: rtc.udp_port, sessions: fmtInt(rtc.sessions) }), rtc.audio ? null : t('system.rtcVideoOnly')].filter(Boolean).join(' · ');
       setChildren(systemBox,
         ff.available ? null : h('div', { class: 'banner warn', role: 'alert' }, icon('alert'),
-          h('div', null, h('strong', null, 'ffmpeg non è disponibile sul server. '),
-            'Il video di attesa deve essere un file MP4 (H.264/AAC) e viene usato così com\'è (senza immagine di anteprima); le registrazioni restano in formato FLV. Installa ffmpeg o indica il percorso in [ffmpeg] path.')),
+          h('div', null, h('strong', null, t('system.ffmpegMissingTitle')), t('system.ffmpegMissingText'))),
         kv([
-          ['Versione', `rms ${s.version}`],
-          ['In esecuzione da', fmtDuration(s.uptime_secs)],
-          ['ffmpeg', ff.available ? (ff.version || 'disponibile') : 'non disponibile'],
-          ['Percorso ffmpeg', ff.path || '—'],
-          ['RTMP in ascolto su', s.rtmp_bind],
-          ['HTTP in ascolto su', s.http_bind],
-          ['URL pubblico', s.public_url || 'dedotto dalla richiesta (Host)'],
-          ['Dirette in onda', fmtInt(s.hub && s.hub.live_streams)],
-          ['WebRTC (WHEP)', rtcLine],
-          ['Indirizzi ICE annunciati', (rtc.candidates && rtc.candidates.length) ? rtc.candidates.join(', ') : '—'],
+          [t('system.version'), `rms ${s.version}`],
+          [t('system.uptime'), fmtDuration(s.uptime_secs)],
+          [t('system.ffmpeg'), ff.available ? (ff.version || t('system.available')) : t('system.unavailable')],
+          [t('system.ffmpegPath'), ff.path || '—'],
+          [t('system.rtmpBind'), s.rtmp_bind],
+          [t('system.httpBind'), s.http_bind],
+          [t('system.publicUrl'), s.public_url || t('system.publicUrlDerived')],
+          [t('common.liveNow'), fmtInt(s.hub && s.hub.live_streams)],
+          [t('system.webrtc'), rtcLine],
+          [t('system.iceAddresses'), (rtc.candidates && rtc.candidates.length) ? rtc.candidates.join(', ') : '—'],
         ]));
     } catch (e) {
       if (!(e instanceof ApiError && e.status === 401)) setChildren(systemBox, h('p', { class: 'error' }, describeError(e)));
@@ -483,17 +517,17 @@ function mountSettings(root) {
       const tot = o.total_viewers || {};
       setChildren(overviewBox,
         h('div', { class: 'tiles' },
-          h('div', { class: 'tile' }, h('span', { class: 'tile-label' }, 'Dirette in onda'), h('span', { class: 'tile-value' }, fmtInt(o.live_broadcasts))),
-          h('div', { class: 'tile' }, h('span', { class: 'tile-label' }, 'Spettatori totali'), h('span', { class: 'tile-value' }, fmtInt(totalViewers(tot)))),
+          h('div', { class: 'tile' }, h('span', { class: 'tile-label' }, t('common.liveNow')), h('span', { class: 'tile-value' }, fmtInt(o.live_broadcasts))),
+          h('div', { class: 'tile' }, h('span', { class: 'tile-label' }, t('settings.totalViewers')), h('span', { class: 'tile-value' }, fmtInt(totalViewers(tot)))),
           ...PROTOCOLS.filter((p) => p.key !== 'webrtc').map((p) => h('div', { class: 'tile' }, h('span', { class: 'tile-label' }, p.label), h('span', { class: 'tile-value' }, fmtInt(tot[p.key] || 0))))),
         (o.per_broadcast || []).length
           ? h('div', { class: 'table-wrap' }, h('table', null,
-            h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Diretta'), h('th', { scope: 'col' }, 'Stato'), h('th', { scope: 'col', class: 'num' }, 'Spettatori'))),
+            h('thead', null, h('tr', null, h('th', { scope: 'col' }, t('common.broadcast')), h('th', { scope: 'col' }, t('common.status')), h('th', { scope: 'col', class: 'num' }, t('common.viewers')))),
             h('tbody', null, ...o.per_broadcast.map((r) => h('tr', null,
               h('td', null, h('a', { href: `#/b/${encodeURIComponent(r.name)}` }, r.title), h('span', { class: 'mono muted small block' }, r.name)),
               h('td', null, statusBadge(r.status)),
               h('td', { class: 'num' }, fmtInt(totalViewers(r.viewers))))))))
-          : h('p', { class: 'muted' }, 'Nessuna diretta.'));
+          : h('p', { class: 'muted' }, t('settings.noBroadcasts')));
     } catch (e) {
       if (!(e instanceof ApiError && e.status === 401)) setChildren(overviewBox, h('p', { class: 'error' }, describeError(e)));
     }
@@ -503,17 +537,19 @@ function mountSettings(root) {
     h('div', { class: 'panel-head' }, h('h2', { id }, icon(iconName), title)), ...children);
 
   setChildren(root, h('div', { class: 'page' },
-    h('div', { class: 'page-head' }, h('div', null, h('h1', null, 'Impostazioni'), h('p', { class: 'muted' }, 'Valori predefiniti per tutte le dirette e informazioni sul server.'))),
-    section('set-waiting', 'film', 'Video di attesa predefinito',
-      h('p', { class: 'hint lead' }, 'Mostrato in loop dai player delle dirette che non hanno un proprio video di attesa, quando sono offline o in pausa.'),
+    h('div', { class: 'page-head' }, h('div', null, h('h1', null, t('settings.title')), h('p', { class: 'muted' }, t('settings.lead')))),
+    section('set-language', 'text', t('settings.languageSection'), langForm),
+    section('set-waiting', 'film', t('settings.waitingSection'),
+      h('p', { class: 'hint lead' }, t('settings.waitingLead')),
       h('div', { class: 'grid-2' }, videoBox, h('div', { class: 'stack' }, upload, textForm))),
-    section('set-overview', 'users', 'Panoramica', overviewBox),
-    section('set-system', 'server', 'Sistema', systemBox)));
+    section('set-overview', 'users', t('settings.overview'), overviewBox),
+    section('set-system', 'server', t('settings.system'), systemBox)));
 
   (async () => {
     try {
       settings = await api('/settings');
       if (destroyed) return;
+      if (settings.ui_language) langSelect.value = settings.ui_language;
       text.control.value = settings.default_waiting_text || '';
       upload.refreshLimits();
       renderVideo();
@@ -532,16 +568,41 @@ function mountSettings(root) {
 // Boot
 // ---------------------------------------------------------------------------
 
-(async function boot() {
+/** Language for pages shown before login (no auth). */
+async function loadPublicLanguage() {
   try {
-    await api('/auth/check');
+    const res = await fetch('/api/v1/public/ui', { cache: 'no-store' });
+    if (res.ok) {
+      const ui = await res.json();
+      if (ui && ui.language) setLanguage(ui.language);
+    }
+  } catch (_) { /* keep <html lang> */ }
+}
+
+// A language change re-translates the static shell and re-renders the current view.
+onLanguageChange(() => {
+  translateDom(document);
+  if (!authed) return;
+  setConn(connEl.dataset.state);
+  const y = window.scrollY;
+  route();
+  window.scrollTo(0, y);
+});
+
+(async function boot() {
+  // <html lang> is set by the server from the same setting: no flash of the wrong language.
+  setLanguage(document.documentElement.lang);
+  translateDom(document);
+  try {
+    const [, check] = await Promise.allSettled([loadPublicLanguage(), api('/auth/check')]);
+    if (check.status === 'rejected') throw check.reason;
     await start();
   } catch (e) {
     if (e instanceof ApiError && e.status === 401) showLogin();
     else {
-      setChildren(app, h('div', { class: 'empty' }, icon('alert', 32), h('h1', null, 'Server non raggiungibile'),
+      setChildren(app, h('div', { class: 'empty' }, icon('alert', 32), h('h1', null, t('boot.unreachable')),
         h('p', { class: 'muted' }, describeError(e)),
-        h('button', { type: 'button', class: 'btn primary', onclick: () => location.reload() }, 'Riprova')));
+        h('button', { type: 'button', class: 'btn primary', onclick: () => location.reload() }, t('common.retry'))));
     }
   }
 })();

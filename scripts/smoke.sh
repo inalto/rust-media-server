@@ -92,6 +92,29 @@ expect "record/start when offline -> 409" 409 "${AUTH[@]}" -X POST "$BASE/api/v1
 expect "GET /settings" 200 "${AUTH[@]}" "$BASE/api/v1/settings"
 contains "settings has default waiting text" '"default_waiting_text"'
 contains "settings has upload limit" '"max_upload_mb"'
+contains "settings has ui_language" '"ui_language"'
+# UI language (it|en): public endpoint, validation, switch and restore.
+expect "GET /public/ui (no auth)" 200 "$BASE/api/v1/public/ui"
+contains "public ui has language" '"language":"'
+ORIG_LANG="$(grep -o '"language":"[a-z]*"' "$TMP" | cut -d'"' -f4)"
+ORIG_LANG="${ORIG_LANG:-it}"
+expect "PATCH ui_language=fr -> 400" 400 "${AUTH[@]}" -X PATCH -H 'Content-Type: application/json' -d '{"ui_language":"fr"}' "$BASE/api/v1/settings"
+contains "ui_language error message" 'ui_language'
+expect "PATCH ui_language=en" 200 "${AUTH[@]}" -X PATCH -H 'Content-Type: application/json' -d '{"ui_language":"en"}' "$BASE/api/v1/settings"
+contains "ui_language is en" '"ui_language":"en"'
+expect "public ui follows" 200 "$BASE/api/v1/public/ui"
+contains "public ui is en" '"language":"en"'
+expect "public info has ui_language" 200 "$BASE/api/v1/public/broadcasts/$NAME"
+contains "public info ui_language en" '"ui_language":"en"'
+expect "embed page in English" 200 "$BASE/embed/$NAME"
+contains "embed html lang en" '<html lang="en">'
+expect "embed page ?lang=it override" 200 "$BASE/embed/$NAME?lang=it"
+contains "embed html lang it" '<html lang="it">'
+expect "PATCH ui_language=it" 200 "${AUTH[@]}" -X PATCH -H 'Content-Type: application/json' -d '{"ui_language":"it"}' "$BASE/api/v1/settings"
+contains "ui_language is it" '"ui_language":"it"'
+if [[ "$ORIG_LANG" != "it" ]]; then
+  expect "restore ui_language=$ORIG_LANG" 200 "${AUTH[@]}" -X PATCH -H 'Content-Type: application/json' -d "{\"ui_language\":\"$ORIG_LANG\"}" "$BASE/api/v1/settings"
+fi
 expect "waiting video upload without file -> 400" 400 "${AUTH[@]}" -F "note=x" "$BASE/api/v1/broadcasts/$NAME/waiting-video"
 expect "waiting video upload of a non-video -> 415" 415 "${AUTH[@]}" -F "file=@$0;type=text/x-shellscript" "$BASE/api/v1/broadcasts/$NAME/waiting-video"
 expect "DELETE waiting video (none set)" 200 "${AUTH[@]}" -X DELETE "$BASE/api/v1/broadcasts/$NAME/waiting-video"
@@ -118,6 +141,8 @@ expect "embed page" 200 "$BASE/embed/$NAME"
 contains "embed page has name" "data-name=\"$NAME\""
 expect "player page" 200 "$BASE/player/$NAME"
 expect "static asset" 200 "$BASE/static/player.js"
+expect "static i18n.js" 200 "$BASE/static/i18n.js"
+contains "i18n.js exports t()" 'export function t('
 expect "public SSE first event" 200 --max-time 2 "$BASE/api/v1/public/broadcasts/$NAME/events" || true
 expect "DELETE broadcast -> 204" 204 "${AUTH[@]}" -X DELETE "$BASE/api/v1/broadcasts/$NAME"
 expect "GET deleted -> 404" 404 "${AUTH[@]}" "$BASE/api/v1/broadcasts/$NAME"

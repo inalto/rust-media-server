@@ -5,7 +5,7 @@ Events streams, the public player API, the playback endpoints (HTTP-FLV, WS-FLV,
 WebRTC via WHEP) and the HTML pages. It is derived from the code (`src/api/*.rs`, `src/egress/*.rs`,
 `src/packager/*.rs`, `src/webrtc/*.rs`, `src/web/mod.rs`, `src/main.rs`); where it and
 [ARCHITECTURE.md](ARCHITECTURE.md) §8 differ, this file describes the behaviour of the code (see also
-ARCHITECTURE.md §13, §14 and §16).
+ARCHITECTURE.md §13, §14, §16 and §17).
 
 Conventions used below:
 
@@ -152,7 +152,7 @@ flattened into the object, followed by the computed fields.
 | `enable_webrtc` | boolean | WebRTC playback via WHEP (default `true`) |
 | `paused` | boolean | admin-forced "waiting" state (does not disconnect the publisher) |
 | `waiting_video` | string \| null | the broadcast's *own* waiting video, relative to `data/waiting/` (`<name>/<uuid>.mp4`) |
-| `waiting_text` | string | the broadcast's own waiting text; `""` means "use the global default or the built-in text" |
+| `waiting_text` | string | the broadcast's own waiting text; `""` means "use the global default or the built-in text". A text equal to a built-in text (`La diretta inizierà a breve`, `The live stream will start shortly`) counts as `""` |
 | `created_at`, `updated_at` | timestamp | |
 | `status` | `"offline"` \| `"live"` \| `"paused"` | `paused` wins over `live` |
 | `viewers` | [ViewerCounts](#viewercounts) | current concurrent viewers |
@@ -311,9 +311,10 @@ One row of the `recordings` table.
 | `default_waiting_video` | string \| null | global default video, relative to `data/waiting/` (`_default/<uuid>.mp4`) |
 | `default_waiting_video_url` | string \| null | absolute `/waiting/...` URL of it |
 | `default_poster_url` | string \| null | URL of its poster (`.jpg`), only if the file exists |
-| `default_waiting_text` | string | effective global text: the custom one, else the built-in `La diretta inizierà a breve` |
+| `default_waiting_text` | string | effective global text: the custom one, else the built-in text of `ui_language` (`it`: `La diretta inizierà a breve`, `en`: `The live stream will start shortly`) |
 | `max_upload_mb` | integer | `server.max_upload_mb` |
 | `ffmpeg_available` | boolean | whether ffmpeg was found at startup |
+| `ui_language` | `"it"` \| `"en"` | language of the dashboard and of the player texts (setting key `ui_language`, default `"it"`) |
 
 ```json
 {
@@ -322,7 +323,8 @@ One row of the `recordings` table.
   "default_poster_url": "http://127.0.0.1:8080/waiting/_default/3c2d1e0f9a8b4c7d8e6f5a4b3c2d1e0f.jpg",
   "default_waiting_text": "La diretta inizierà a breve",
   "max_upload_mb": 1024,
-  "ffmpeg_available": true
+  "ffmpeg_available": true,
+  "ui_language": "it"
 }
 ```
 
@@ -352,7 +354,7 @@ Create a broadcast.
 | `description` | string | `""` | up to 5000 characters |
 | `record` | boolean | `false` | auto-record |
 | `enable_flv`, `enable_hls`, `enable_dash`, `enable_webrtc` | boolean | `true` | |
-| `waiting_text` | string | `La diretta inizierà a breve` | up to 500 characters; `""` = use the global default |
+| `waiting_text` | string | `La diretta inizierà a breve` | up to 500 characters; `""` = use the global default. The default (a built-in text) also counts as `""`, so the player shows the global default or the built-in text in the UI language |
 
 - Response `201`: `BroadcastView` (status `offline`, a fresh `stream_key`).
 - `400`: missing/empty title, title/description/waiting_text too long, invalid `name`
@@ -646,9 +648,13 @@ Removes the broadcast's own video (idempotent); the global default applies again
 
 | Body field | Type | Notes |
 |---|---|---|
-| `default_waiting_text` | string | trimmed; up to 500 characters; `""` restores the built-in text; omitted = unchanged |
+| `default_waiting_text` | string | trimmed; up to 500 characters; `""` (or a built-in text) restores the built-in text, which follows `ui_language`; omitted = unchanged |
+| `ui_language` | string | `"it"` or `"en"` (exact, lowercase); omitted = unchanged |
 
-- Response `200`: [Settings](#settings). `400` if the text is too long.
+- Response `200`: [Settings](#settings). `400` if the text is too long or `ui_language` is anything else
+  (`ui_language must be "it" or "en"`); nothing is written on a `400`.
+- A request that sets either field sends a `settings` event on the admin SSE stream
+  ([4.6](#46-events-sse)), so open dashboards switch language without a reload.
 
 #### `POST /api/v1/settings/waiting-video`
 
@@ -714,6 +720,7 @@ Admin Server-Sent Events stream (`Content-Type: text/event-stream`, `Cache-Contr
 | `stream` | `{"name": "evento-2026", "status": "live"}` | stream start/end; `status` is the new `offline`/`live`/`paused`; sent right before the matching `broadcast` event |
 | `viewers` | `{"name": "evento-2026", "counts": ViewerCounts}` | the viewer counts of a broadcast changed |
 | `broadcast_deleted` | `{"name": "evento-2026"}` | a broadcast was deleted |
+| `settings` | `{"ui_language": "en", "default_waiting_text": "The live stream will start shortly"}` | after a `PATCH /api/v1/settings` that set `ui_language` and/or `default_waiting_text` (effective values) |
 
 ```
 event: viewers
@@ -729,8 +736,14 @@ Events are not replayed: after a reconnect, re-read `GET /api/v1/broadcasts`.
 
 ## 5. Public player API
 
-No authentication, permissive CORS. These two endpoints never expose the stream key; they are what the
-embed player uses.
+No authentication, permissive CORS. These endpoints never expose the stream key; they are what the
+embed player and the dashboard login page use.
+
+#### `GET /api/v1/public/ui`
+
+UI settings needed before login (the dashboard reads the language here before showing the login view).
+
+- Response `200`: `{"language": "it"}` (`"it"` or `"en"`, the `ui_language` setting).
 
 #### `GET /api/v1/public/broadcasts/{name}`
 
@@ -754,7 +767,8 @@ embed player uses.
   "enable_flv": true,
   "enable_hls": true,
   "enable_dash": false,
-  "enable_webrtc": true
+  "enable_webrtc": true,
+  "ui_language": "it"
 }
 ```
 
@@ -763,10 +777,11 @@ embed player uses.
 | `name`, `title` | string | |
 | `status` | `"offline"` \| `"live"` \| `"paused"` | |
 | `waiting_video_url` | string \| null | effective waiting video (own, else global default) |
-| `waiting_text` | string | *effective* text: the broadcast's, else the global default, else the built-in `La diretta inizierà a breve` |
+| `waiting_text` | string | *effective* text: the broadcast's, else the global default, else the built-in text in `ui_language` (`La diretta inizierà a breve` / `The live stream will start shortly`) |
 | `poster_url` | string \| null | the video's `.jpg` poster, only if that file exists |
 | `sources` | object | `flv`, `ws_flv`, `hls`, `dash`, `whep`: URL, or `null` when the protocol is disabled. `flv` and `ws_flv` follow `enable_flv`; `hls` / `dash` are `null` when disabled for the broadcast *or* on the server (`hls.enabled` / `dash.enabled`); `whep` is `null` when `enable_webrtc` is false, WebRTC is disabled or unavailable on the server (`webrtc.enabled`, UDP port not bound), or the live video codec is known and is not H.264 |
 | `enable_flv`, `enable_hls`, `enable_dash`, `enable_webrtc` | boolean | `enable_hls` / `enable_dash` / `enable_webrtc` already include the server-wide conditions (`enable_webrtc` = `sources.whep` is non-null) |
+| `ui_language` | `"it"` \| `"en"` | the UI language setting: the player's texts follow it unless the page has `?lang=` |
 
 `404 broadcast not found` for an unknown name.
 
@@ -1061,7 +1076,7 @@ await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
 
 | Route | Description |
 |---|---|
-| `GET /` | the dashboard SPA (`text/html`, `Cache-Control: no-cache`, Italian UI; hash routes `#/`, `#/b/{name}`, `#/settings`). Shows the login view when the API answers 401 |
+| `GET /` | the dashboard SPA (`text/html`, `Cache-Control: no-cache`, Italian or English UI per `ui_language`, which also sets `<html lang>`; hash routes `#/`, `#/b/{name}`, `#/settings`). Shows the login view when the API answers 401 |
 | `GET /embed/{name}` | player page for iframes |
 | `GET /player/{name}` | the same player as a full page, with the title above it |
 | `GET /static/{file}` | assets embedded in the binary |
@@ -1072,7 +1087,8 @@ await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
 
 Both serve the same HTML (`embed.html`, with `data-mode="embed"` or `"player"`; HTML `no-cache`). The
 name is only validated as a slug (`[a-z0-9_-]{1,64}`, else a plain-text `404 broadcast not found`); an
-unknown but well-formed name still returns the page, which then displays "Diretta non trovata". The page
+unknown but well-formed name still returns the page, which then displays "Diretta non trovata" ("Live
+stream not found" in English). The page
 loads [`/api/v1/public/broadcasts/{name}`](#5-public-player-api) and its SSE stream (falling back to
 polling every 5 s), and plays the waiting video / waiting text while the status is `offline` or `paused`.
 
@@ -1085,9 +1101,13 @@ Query parameters (all optional):
 | `controls` | `1` / `0` | `1` | show the native video controls |
 | `src` | `auto`, `webrtc` (alias `whep`), `flv`, `hls`, `dash` | `auto` | source to try first (any other value is `auto`); see below |
 | `latency` | `1` / `0` | `0` on `/embed`, `1` on `/player` | show the estimated latency in the corner |
+| `lang` | `it` / `en` (case-insensitive) | the `ui_language` setting | language of the player texts (waiting/paused badge, built-in waiting text, buttons, "not found"); also sets `<html lang>`. Other values are ignored |
 
 A flag is false when present with the value `0`, `false`, `no` or `off` (case-insensitive) and true for
 any other value, including an empty one. The dashboard preview uses `?muted=1&autoplay=1&latency=1`.
+Without `lang` the player starts with the server's `<html lang>` and then follows `ui_language` from the
+public info (re-read every 60 s while waiting). A custom waiting text is shown as-is in either language;
+the built-in one is shown in the player's language.
 
 Source selection: `auto` tries `webrtc` -> `flv` -> `hls` -> `dash` (on iOS: `webrtc` -> `hls` ->
 `dash`). `webrtc` is a built-in WHEP client (no library; see [6.5](#65-webrtc-whep)); `flv` plays
@@ -1118,7 +1138,8 @@ Only the top-level files below exist (no sub-paths); unknown names return a plai
 carry `Cache-Control: no-cache` and a content-hash `ETag`; `If-None-Match` is honoured (`304`).
 
 `index.html`, `app.js`, `core.js`, `detail.js`, `metrics.js`, `mock.js`, `style.css` (dashboard);
-`embed.html`, `player.js`, `player.css` (player); `favicon.svg`.
+`embed.html`, `player.js` (ES module), `player.css` (player); `i18n.js` (Italian/English texts and
+formatting, shared by the dashboard and the player); `favicon.svg`.
 
 ---
 
@@ -1171,6 +1192,8 @@ curl -s -H "$H" -F file=@attesa.mp4 $B/api/v1/broadcasts/evento-2026/waiting-vid
 curl -s -H "$H" -X DELETE $B/api/v1/broadcasts/evento-2026/waiting-video | jq .waiting_video_url
 curl -s -H "$H" -F file=@attesa.mp4 $B/api/v1/settings/waiting-video | jq .default_waiting_video
 curl -s -H "$H" -H "$J" -X PATCH -d '{"default_waiting_text":"Siamo quasi pronti"}' $B/api/v1/settings
+curl -s -H "$H" -H "$J" -X PATCH -d '{"ui_language":"en"}' $B/api/v1/settings | jq .ui_language   # "en"
+curl -s $B/api/v1/public/ui                                     # {"language":"en"}, no token
 curl -s -H "$H" $B/api/v1/system | jq
 
 # --- events (SSE); -N disables curl's output buffering
@@ -1198,4 +1221,5 @@ ffplay "$B/dash/evento-2026/manifest.mpd"
 
 # --- pages
 curl -s -o /dev/null -w '%{http_code}\n' "$B/embed/evento-2026?autoplay=0&muted=1&controls=1&src=hls&latency=1"
+curl -s "$B/embed/evento-2026?lang=en" | grep -o '<html lang="[a-z]*">'   # <html lang="en">
 ```

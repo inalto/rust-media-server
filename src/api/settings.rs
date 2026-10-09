@@ -1,7 +1,10 @@
-//! Global settings: default waiting text and default waiting video (ARCHITECTURE.md §8.1).
+//! Global settings: default waiting text, default waiting video and UI language
+//! (ARCHITECTURE.md §8.1, §17).
 //!
 //! - `GET /settings` → [`Settings`]
-//! - `PATCH /settings` `{default_waiting_text?}` → [`Settings`] (empty text = built-in default)
+//! - `PATCH /settings` `{default_waiting_text?, ui_language?}` → [`Settings`] (empty text,
+//!   or a built-in text, = built-in default; `ui_language` must be `"it"` or `"en"`).
+//!   Emits `HubEvent::SettingsChanged` (admin SSE `settings` event) after a change.
 //! - `POST /settings/waiting-video` multipart `file` → [`Settings`] (same pipeline as the
 //!   per-broadcast upload, stored under `data/waiting/_default/`)
 //! - `DELETE /settings/waiting-video` → [`Settings`]
@@ -21,9 +24,10 @@ use super::waiting::{
     remove_video_files, upload_body_limit,
 };
 use super::{ApiJson, ViewContext, waiting_url};
-use crate::db::settings::{DEFAULT_WAITING_TEXT, DEFAULT_WAITING_VIDEO};
+use crate::db::settings::{DEFAULT_WAITING_TEXT, DEFAULT_WAITING_VIDEO, UI_LANGUAGE, UiLanguage};
 use crate::db::{self};
 use crate::error::{ApiError, ApiResult};
+use crate::hub::HubEvent;
 use crate::state::AppState;
 
 pub fn routes(state: &AppState) -> Router<AppState> {
@@ -47,15 +51,19 @@ pub struct Settings {
     pub default_waiting_video_url: Option<String>,
     /// Poster of the default video, when it exists.
     pub default_poster_url: Option<String>,
-    /// Effective default waiting text (the built-in one when not customized).
+    /// Effective default waiting text (the built-in one, in the UI language, when not
+    /// customized).
     pub default_waiting_text: String,
     pub max_upload_mb: u64,
     pub ffmpeg_available: bool,
+    /// Language of the dashboard and of the player texts.
+    pub ui_language: UiLanguage,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SettingsPatch {
     pub default_waiting_text: Option<String>,
+    pub ui_language: Option<String>,
 }
 
 async fn current(state: &AppState, headers: &HeaderMap) -> ApiResult<Settings> {
@@ -67,12 +75,10 @@ async fn current(state: &AppState, headers: &HeaderMap) -> ApiResult<Settings> {
             .as_deref()
             .and_then(|v| poster_url_if_exists(&state.config, &ctx.base, v)),
         default_waiting_video: video,
-        default_waiting_text: ctx
-            .default_waiting_text
-            .clone()
-            .unwrap_or_else(|| db::broadcasts::DEFAULT_WAITING_TEXT.to_string()),
+        default_waiting_text: ctx.effective_default_waiting_text(),
         max_upload_mb: state.config.server.max_upload_mb,
         ffmpeg_available: state.ffmpeg.is_some(),
+        ui_language: ctx.language,
     })
 }
 
@@ -88,19 +94,38 @@ async fn patch_settings(
     headers: HeaderMap,
     ApiJson(body): ApiJson<SettingsPatch>,
 ) -> ApiResult<Json<Settings>> {
-    if let Some(text) = body.default_waiting_text {
-        let text = text.trim();
-        if text.chars().count() > WAITING_TEXT_MAX {
-            return Err(ApiError::bad_request(format!(
-                "default_waiting_text is too long (max {WAITING_TEXT_MAX} characters)"
-            )));
-        }
-        if text.is_empty() {
+    // Validate everything before writing anything.
+    let text = body.default_waiting_text.as_deref().map(str::trim);
+    if let Some(text) = text
+        && text.chars().count() > WAITING_TEXT_MAX
+    {
+        return Err(ApiError::bad_request(format!(
+            "default_waiting_text is too long (max {WAITING_TEXT_MAX} characters)"
+        )));
+    }
+    let language = match body.ui_language.as_deref() {
+        Some(l) => Some(
+            UiLanguage::parse(l)
+                .ok_or_else(|| ApiError::bad_request("ui_language must be \"it\" or \"en\""))?,
+        ),
+        None => None,
+    };
+
+    if let Some(text) = text {
+        // A built-in text is stored as "no custom text" so it follows the UI language.
+        if text.is_empty() || UiLanguage::is_builtin_waiting_text(text) {
             db::settings::delete(&state.db, DEFAULT_WAITING_TEXT).await?;
         } else {
             db::settings::set(&state.db, DEFAULT_WAITING_TEXT, text).await?;
         }
         tracing::info!("default waiting text updated");
+    }
+    if let Some(language) = language {
+        db::settings::set(&state.db, UI_LANGUAGE, language.as_str()).await?;
+        tracing::info!(language = language.as_str(), "UI language updated");
+    }
+    if text.is_some() || language.is_some() {
+        state.hub.emit(HubEvent::SettingsChanged);
     }
     Ok(Json(current(&state, &headers).await?))
 }
@@ -252,6 +277,186 @@ mod tests {
             .unwrap();
         let (_, public) = send(&state, req).await;
         assert!(public["waiting_video_url"].is_null());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn public_get(uri: &str) -> Request<Body> {
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ui_language_setting() {
+        let (state, dir) = test_state(false).await;
+        // Default: Italian, also on the public endpoint (no auth).
+        let (st, s) = send(&state, json_request("GET", "/api/v1/settings", "")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(s["ui_language"], "it");
+        let (st, ui) = send(&state, public_get("/api/v1/public/ui")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(ui, serde_json::json!({ "language": "it" }));
+
+        // Validation: nothing is written on a 400, even with a valid text alongside.
+        for bad in [r#""fr""#, r#""EN""#, r#""""#, "1"] {
+            let body = format!(r#"{{"ui_language":{bad},"default_waiting_text":"Ciao"}}"#);
+            let (st, _) = send(&state, json_request("PATCH", "/api/v1/settings", &body)).await;
+            assert!(st.is_client_error(), "{bad}: {st}");
+        }
+        let (st, e) = send(
+            &state,
+            json_request("PATCH", "/api/v1/settings", r#"{"ui_language":"fr"}"#),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(e["error"].as_str().unwrap().contains("ui_language"));
+        assert_eq!(
+            db::settings::get(&state.db, db::settings::DEFAULT_WAITING_TEXT)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db::settings::get(&state.db, db::settings::UI_LANGUAGE)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Switch to English: persisted, announced on the hub, public endpoint follows.
+        let mut events = state.hub.subscribe_events();
+        let (st, s) = send(
+            &state,
+            json_request("PATCH", "/api/v1/settings", r#"{"ui_language":"en"}"#),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(s["ui_language"], "en");
+        assert_eq!(
+            s["default_waiting_text"],
+            "The live stream will start shortly"
+        );
+        assert_eq!(
+            events.try_recv().unwrap(),
+            crate::hub::HubEvent::SettingsChanged
+        );
+        assert_eq!(
+            db::settings::get(&state.db, db::settings::UI_LANGUAGE)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("en")
+        );
+        let (_, ui) = send(&state, public_get("/api/v1/public/ui")).await;
+        assert_eq!(ui["language"], "en");
+        let (_, s) = send(&state, json_request("GET", "/api/v1/settings", "")).await;
+        assert_eq!(s["ui_language"], "en");
+
+        // Back to Italian: stored explicitly.
+        let (st, s) = send(
+            &state,
+            json_request("PATCH", "/api/v1/settings", r#"{"ui_language":"it"}"#),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(s["ui_language"], "it");
+        assert_eq!(s["default_waiting_text"], "La diretta inizierà a breve");
+        assert_eq!(
+            db::settings::get(&state.db, db::settings::UI_LANGUAGE)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("it")
+        );
+        assert_eq!(
+            events.try_recv().unwrap(),
+            crate::hub::HubEvent::SettingsChanged
+        );
+        // An empty patch changes nothing and announces nothing.
+        let (st, _) = send(&state, json_request("PATCH", "/api/v1/settings", "{}")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(events.try_recv().is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn builtin_waiting_text_follows_language() {
+        let (state, dir) = test_state(false).await;
+        // "own": custom text; "dflt": empty (global default); "api": the Italian built-in
+        // text stored by POST /broadcasts when waiting_text is omitted (same as empty).
+        let mut own = NewBroadcast::new("own", "Own");
+        own.waiting_text = "Torniamo alle 21".into();
+        let mut dflt = NewBroadcast::new("dflt", "Dflt");
+        dflt.waiting_text = String::new();
+        for nb in [own, dflt, NewBroadcast::new("api", "Api")] {
+            db::broadcasts::create(&state.db, nb).await.unwrap();
+        }
+        let text_of = |name: &'static str| {
+            let state = state.clone();
+            async move {
+                let (st, p) = send(
+                    &state,
+                    public_get(&format!("/api/v1/public/broadcasts/{name}")),
+                )
+                .await;
+                assert_eq!(st, StatusCode::OK);
+                (
+                    p["waiting_text"].as_str().unwrap().to_string(),
+                    p["ui_language"].as_str().unwrap().to_string(),
+                )
+            }
+        };
+        let it = db::broadcasts::DEFAULT_WAITING_TEXT;
+        let en = "The live stream will start shortly";
+        assert_eq!(text_of("own").await.0, "Torniamo alle 21");
+        assert_eq!(text_of("dflt").await, (it.to_string(), "it".to_string()));
+        assert_eq!(text_of("api").await.0, it);
+
+        send(
+            &state,
+            json_request("PATCH", "/api/v1/settings", r#"{"ui_language":"en"}"#),
+        )
+        .await;
+        assert_eq!(text_of("own").await.0, "Torniamo alle 21");
+        assert_eq!(text_of("dflt").await, (en.to_string(), "en".to_string()));
+        assert_eq!(text_of("api").await.0, en);
+        // Stored texts are untouched.
+        let api = db::broadcasts::find_by_name(&state.db, "api")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(api.waiting_text, it);
+
+        // A custom global default applies to "dflt" and "api" (a stored built-in text
+        // counts as no own text), never to custom texts...
+        send(
+            &state,
+            json_request(
+                "PATCH",
+                "/api/v1/settings",
+                r#"{"default_waiting_text":"Back soon"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(text_of("dflt").await.0, "Back soon");
+        assert_eq!(text_of("api").await.0, "Back soon");
+        assert_eq!(text_of("own").await.0, "Torniamo alle 21");
+        // ...and saving a built-in text as the default resets it (follows the language).
+        let (_, s) = send(
+            &state,
+            json_request(
+                "PATCH",
+                "/api/v1/settings",
+                r#"{"default_waiting_text":"La diretta inizierà a breve"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s["default_waiting_text"], en);
+        assert_eq!(
+            db::settings::get(&state.db, db::settings::DEFAULT_WAITING_TEXT)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(text_of("dflt").await.0, en);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

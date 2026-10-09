@@ -13,8 +13,13 @@
 //   closes, the WHEP POST is refused, or no video frame arrives within 8 s; its
 //   teardown closes the peer connection and DELETEs the WHEP session.
 //   Player libraries are loaded from the CDN only when needed.
-// - Query: autoplay=1|0 (1), muted=1|0 (1), controls=1|0 (1), src, latency=1|0.
-// - Debug handle: window.rmsPlayer = { status, source, engine, latency, peerConnection, setSource(), reload() }.
+// - Query: autoplay=1|0 (1), muted=1|0 (1), controls=1|0 (1), src, latency=1|0,
+//   lang=it|en (texts; default: `ui_language` from the public broadcast info, before
+//   that the <html lang> set by the server).
+// - Debug handle: window.rmsPlayer = { status, source, engine, latency, peerConnection, language, setSource(), reload() }.
+// ES module (loaded with type="module") only to import the shared translations.
+import { t, setLanguage, getLanguage, normalizeLanguage, translateDom, formatNumber, isBuiltinWaitingText } from './i18n.js';
+
 (function () {
   'use strict';
 
@@ -56,6 +61,12 @@
     latency: flag('latency', mode === 'player'),
   };
 
+  // Language: ?lang= wins; otherwise the server setting (<html lang> now, then
+  // `ui_language` from every info refresh).
+  var langOverride = normalizeLanguage(params.get('lang'));
+  setLanguage(langOverride || document.documentElement.lang);
+  translateDom(document);
+
   var $ = function (id) { return document.getElementById(id); };
   var stage = $('stage');
   var video = $('video');
@@ -72,6 +83,14 @@
   var unmuteBtn = $('unmute');
   var playBtn = $('play');
   var srStatus = $('sr-status');
+  var titleEl = $('title');
+
+  function renderTitle() {
+    var title = info && info.title;
+    document.title = title ? t('player.docTitle', { title: title }) : t('player.defaultTitle');
+    titleEl.textContent = title || t('player.defaultTitle');
+  }
+  renderTitle();
 
   video.controls = opts.controls;
   video.muted = opts.muted;
@@ -156,13 +175,15 @@
     waitingTitle.textContent = title;
     if (status === 'notfound') {
       waitingBadge.hidden = true;
-      waitingTitle.textContent = 'Diretta non trovata';
-      waitingText.textContent = 'Controlla il link: questa diretta non esiste o è stata eliminata.';
+      waitingTitle.textContent = t('player.notFound');
+      waitingText.textContent = t('player.notFoundText');
     } else {
       waitingBadge.hidden = false;
       waitingBadge.classList.toggle('paused', paused);
-      waitingBadgeText.textContent = paused ? 'Diretta in pausa' : 'In attesa della diretta';
-      waitingText.textContent = (info && info.waiting_text) || 'La diretta inizierà a breve';
+      waitingBadgeText.textContent = paused ? t('player.paused') : t('player.waiting');
+      // The server's built-in text follows its language: show ours when ?lang= differs.
+      var text = info && info.waiting_text;
+      waitingText.textContent = !text || isBuiltinWaitingText(text) ? t('waiting.builtin') : text;
     }
     var url = status !== 'notfound' && info && info.waiting_video_url;
     if (url && url !== waitingVideoFailed) {
@@ -180,7 +201,7 @@
       waiting.classList.remove('over-video');
     }
     waiting.hidden = false;
-    announce(status === 'notfound' ? 'Diretta non trovata' : paused ? 'Diretta in pausa' : 'In attesa della diretta');
+    announce(status === 'notfound' ? t('player.notFound') : paused ? t('player.paused') : t('player.waiting'));
   }
 
   function hideWaiting() {
@@ -205,7 +226,7 @@
       hideWaiting();
       showSpinner(false);
       liveBadge.hidden = false;
-      announce('Diretta in corso');
+      announce(t('player.playing'));
       log('playing', engine.source, 'via', engine.kind);
     }
     updateUnmute();
@@ -617,8 +638,8 @@
       if (!res.ok) return null;
       return res.json().then(function (data) {
         info = data;
-        document.title = data.title ? data.title + ' · Diretta' : 'Diretta';
-        $('title').textContent = data.title || 'Diretta';
+        if (!langOverride && data.ui_language && setLanguage(data.ui_language)) translateDom(document);
+        renderTitle();
         lastWaitingRefresh = Date.now();
         return data;
       });
@@ -664,7 +685,7 @@
     var l = engine.latency();
     var finite = typeof l === 'number' && isFinite(l) && l >= 0;
     latencyEl.hidden = !(opts.latency && finite);
-    if (finite) latencyEl.textContent = (Math.round(l * 10) / 10).toFixed(1).replace('.', ',') + ' s';
+    if (finite) latencyEl.textContent = formatNumber(l, { minimumFractionDigits: 1, maximumFractionDigits: 1, useGrouping: false }) + ' s';
     goLiveBtn.hidden = !(finite && l > BEHIND_EDGE_S);
     if (video.paused) { lastProgress = { t: Date.now(), time: video.currentTime }; return; }
     if (video.currentTime !== lastProgress.time) {
@@ -698,6 +719,7 @@
     get playing() { return playing; },
     get latency() { var l = engine && playing ? engine.latency() : NaN; return typeof l === 'number' && isFinite(l) ? l : null; },
     get info() { return info; },
+    get language() { return getLanguage(); },
     get options() { return Object.assign({}, opts); },
     setSource: function (src) {
       opts.src = normalizeSrc(src);

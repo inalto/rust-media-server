@@ -535,3 +535,14 @@ rendered frame): p50 35-40 ms, p90 ≤ 54 ms. Chrome `getStats`: video jitter bu
 (it was 2.1 s with the default probe size). Server CPU ≈ 1.5 % of one core idle, 13.6 % with 10 viewers,
 25.8 % with 30 viewers (all at 30 fps, no loss), RSS ≈ 49 MiB; the Opus encoder process ≈ 4 % CPU per
 broadcast. A browser killed without `DELETE` is reaped after ≈ 15 s (5 s ICE disconnected + 10 s grace).
+
+## 17. Phase 5 as-built: UI language (binding; field-level detail in docs/API.md)
+
+- Setting `ui_language` (`it` default | `en`) in the `settings` table (`db::settings::UiLanguage`); `PATCH /api/v1/settings {ui_language}` accepts exactly `"it"`/`"en"` (else 400, nothing written) and emits `HubEvent::SettingsChanged` → admin SSE `settings {ui_language, default_waiting_text}`. Exposed in `Settings`, `GET /api/v1/public/ui` → `{language}` (no auth) and `PublicBroadcast.ui_language`.
+- Built-in waiting text per language (`UiLanguage::builtin_waiting_text`: "La diretta inizierà a breve" / "The live stream will start shortly"). A stored text equal to any built-in text (the `POST /broadcasts` default, or a default text saved unchanged) counts as "no text" (`ViewContext::waiting_text`); `PATCH /settings` deletes such a default text. Custom texts are never rewritten; Italian output is unchanged.
+- `web/mod.rs` sets `<html lang>` on `/`, `/embed`, `/player` from the setting (one SQLite read per page, no cache); `?lang=it|en` (case-insensitive) on the player pages overrides it.
+- `static/i18n.js` (ES module, in the asset table): `t`, `tn` (Intl.PluralRules), `setLanguage`/`getLanguage`/`onLanguageChange`, `translateDom` (`data-i18n`, `data-i18n-title|-aria-label|-placeholder`), `format{Number,Date,Bytes,Duration}` with `it-IT`/`en-US`; dictionaries `it` (reference wording) and `en`, one `'key': 'text',` per line. Missing keys fall back to Italian with one `console.warn` per key.
+- Dashboard flow: `<html lang>` → `GET /public/ui` (before the login view) → `GET /settings` (after login) → SSE `settings` / Settings page "Lingua"; a change re-translates the shell and re-mounts the current view (no reload). Embed options gain "Lingua del player" (`?lang=`).
+- Player: `player.js` is now an ES module (`<script type="module">`) importing `i18n.js`; language = `?lang=` else `<html lang>` then `ui_language` of every info refresh (every 60 s while waiting); a built-in `waiting_text` is shown in the player's language.
+- Tests: `web::tests` parse `i18n.js` (same key set, same `{placeholders}`, built-in texts equal to the server's, every `t()`/`tn()`/`data-i18n*` key in the other static files exists, no unused key) and check `<html lang>`; `api::settings` tests cover validation, persistence, the SSE event and the per-language built-in text.
+- Not translated by design: server error messages (API stays English; the dashboard maps known ones to the UI language), protocol names, OBS values (`CBR`, `zerolatency`), user data (titles, custom texts).

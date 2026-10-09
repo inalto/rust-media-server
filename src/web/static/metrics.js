@@ -1,4 +1,4 @@
-// Broadcast detail — "Metriche" section: viewers over time (Chart.js) + summary tiles.
+// Broadcast detail — "Metrics" section: viewers over time (Chart.js) + summary tiles.
 // Data: GET /broadcasts/{name}/metrics?from&to and /metrics/summary?from&to
 // (ARCHITECTURE.md §8.1). A 501 renders a friendly "not available yet" state.
 
@@ -6,25 +6,27 @@ import {
   api, ApiError, describeError, h, icon, setChildren, uid, loadScript,
   fmtInt, fmtBytes, fmtDuration, fmtWhen, fmtDateTime, totalViewers,
 } from './core.js';
+import { t, formatDate } from './i18n.js';
 
 const CHART_JS = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.1/chart.umd.min.js';
 
 // Categorical palette validated for the dark surface (fixed order, never cycled).
+// Labels are functions: resolved in the UI language when the section is built.
 const SERIES = [
-  { key: 'total', label: 'Totale', color: '#3987e5' },
-  { key: 'flv', label: 'HTTP-FLV', color: '#d95926' },
-  { key: 'ws_flv', label: 'WS-FLV', color: '#199e70' },
-  { key: 'hls', label: 'LL-HLS', color: '#c98500' },
-  { key: 'dash', label: 'LL-DASH', color: '#d55181' },
-  { key: 'webrtc', label: 'WebRTC', color: '#008300' },
+  { key: 'total', label: () => t('common.total'), color: '#3987e5' },
+  { key: 'flv', label: () => 'HTTP-FLV', color: '#d95926' },
+  { key: 'ws_flv', label: () => 'WS-FLV', color: '#199e70' },
+  { key: 'hls', label: () => 'LL-HLS', color: '#c98500' },
+  { key: 'dash', label: () => 'LL-DASH', color: '#d55181' },
+  { key: 'webrtc', label: () => 'WebRTC', color: '#008300' },
 ];
 
 const RANGES = [
-  { key: '1h', label: '1h', secs: 3600 },
-  { key: '6h', label: '6h', secs: 6 * 3600 },
-  { key: '24h', label: '24h', secs: 24 * 3600 },
-  { key: '7d', label: '7g', secs: 7 * 86400 },
-  { key: 'custom', label: 'Personalizzato' },
+  { key: '1h', label: () => t('metrics.range1h'), secs: 3600 },
+  { key: '6h', label: () => t('metrics.range6h'), secs: 6 * 3600 },
+  { key: '24h', label: () => t('metrics.range24h'), secs: 24 * 3600 },
+  { key: '7d', label: () => t('metrics.range7d'), secs: 7 * 86400 },
+  { key: 'custom', label: () => t('metrics.rangeCustom') },
 ];
 
 const REFRESH_MS = 30000;
@@ -71,18 +73,18 @@ export function metricsSection(name) {
   const rangeButtons = RANGES.map((r) => h('button', {
     type: 'button', class: 'seg', 'aria-pressed': String(r.key === range),
     onclick: () => selectRange(r.key),
-  }, r.label));
+  }, r.label()));
   const fromId = uid('from');
   const toId = uid('to');
   const fromInput = h('input', { id: fromId, type: 'datetime-local', required: true });
   const toInput = h('input', { id: toId, type: 'datetime-local', required: true });
   const customError = h('p', { class: 'hint error', hidden: true, role: 'alert' });
   const customForm = h('form', { class: 'custom-range', hidden: true, onsubmit: (e) => { e.preventDefault(); applyCustom(); } },
-    h('div', { class: 'field' }, h('label', { for: fromId }, 'Dal'), fromInput),
-    h('div', { class: 'field' }, h('label', { for: toId }, 'Al'), toInput),
-    h('button', { type: 'submit', class: 'btn primary' }, 'Applica'),
+    h('div', { class: 'field' }, h('label', { for: fromId }, t('metrics.from')), fromInput),
+    h('div', { class: 'field' }, h('label', { for: toId }, t('metrics.to')), toInput),
+    h('button', { type: 'submit', class: 'btn primary' }, t('metrics.apply')),
     customError);
-  const refreshBtn = h('button', { type: 'button', class: 'btn icon-only', 'aria-label': 'Aggiorna metriche', title: 'Aggiorna metriche', onclick: () => refresh() }, icon('refresh'));
+  const refreshBtn = h('button', { type: 'button', class: 'btn icon-only', 'aria-label': t('metrics.refresh'), title: t('metrics.refresh'), onclick: () => refresh() }, icon('refresh'));
 
   // --- tiles
   const tile = (label) => {
@@ -91,18 +93,18 @@ export function metricsSection(name) {
     return { el: h('div', { class: 'tile' }, h('span', { class: 'tile-label' }, label), value, sub), value, sub };
   };
   const tiles = {
-    now: tile('Spettatori ora'),
-    peak: tile('Picco'),
-    sessions: tile('Sessioni totali'),
-    avg: tile('Durata media visione'),
-    bytes: tile('Dati ricevuti'),
+    now: tile(t('metrics.now')),
+    peak: tile(t('metrics.peak')),
+    sessions: tile(t('metrics.sessions')),
+    avg: tile(t('metrics.avgWatch')),
+    bytes: tile(t('common.bytesIn')),
   };
 
   // --- series toggles (HTML legend, keyboard accessible)
   const toggles = SERIES.map((s, i) => {
     const btn = h('button', { type: 'button', class: 'legend-item', 'aria-pressed': String(!!visible[s.key]) },
       h('span', { class: 'swatch', style: { background: s.color }, 'aria-hidden': 'true' }),
-      s.label);
+      s.label());
     btn.addEventListener('click', () => {
       visible[s.key] = !visible[s.key];
       btn.setAttribute('aria-pressed', String(visible[s.key]));
@@ -115,30 +117,30 @@ export function metricsSection(name) {
     return btn;
   });
 
-  const canvas = h('canvas', { role: 'img', 'aria-label': 'Grafico degli spettatori nel tempo' });
+  const canvas = h('canvas', { role: 'img', 'aria-label': t('metrics.chartLabel') });
   const chartBox = h('div', { class: 'chart-box' }, canvas);
-  const chartEmpty = h('p', { class: 'chart-empty', hidden: true }, 'Nessuno spettatore nel periodo selezionato.');
+  const chartEmpty = h('p', { class: 'chart-empty', hidden: true }, t('metrics.empty'));
   const tableBody = h('tbody');
   const tableDetails = h('details', { class: 'data-table' },
-    h('summary', null, 'Mostra i dati in tabella'),
+    h('summary', null, t('metrics.showTable')),
     h('div', { class: 'table-wrap tall' },
       h('table', null,
-        h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Ora'), ...SERIES.map((s) => h('th', { scope: 'col', class: 'num' }, s.label)))),
+        h('thead', null, h('tr', null, h('th', { scope: 'col' }, t('metrics.time')), ...SERIES.map((s) => h('th', { scope: 'col', class: 'num' }, s.label())))),
         tableBody)));
   tableDetails.addEventListener('toggle', () => { if (tableDetails.open) renderTable(); });
 
   const content = h('div', { class: 'metrics-content' },
     h('div', { class: 'tiles' }, ...Object.values(tiles).map((t) => t.el)),
-    h('div', { class: 'legend', role: 'group', 'aria-label': 'Serie visibili nel grafico' }, ...toggles),
+    h('div', { class: 'legend', role: 'group', 'aria-label': t('metrics.legend') }, ...toggles),
     h('div', { class: 'chart-wrap' }, chartBox, chartEmpty),
     tableDetails);
   const state = h('div', { class: 'state-box', hidden: true });
 
   const el = h('section', { class: 'panel', id: 'sec-metrics', 'aria-labelledby': titleId },
     h('div', { class: 'panel-head' },
-      h('h2', { id: titleId }, icon('chart'), 'Metriche'),
+      h('h2', { id: titleId }, icon('chart'), t('detail.nav.metrics')),
       h('div', { class: 'panel-tools' },
-        h('div', { class: 'segmented', role: 'group', 'aria-label': 'Intervallo di tempo' }, ...rangeButtons),
+        h('div', { class: 'segmented', role: 'group', 'aria-label': t('metrics.rangeLabel') }, ...rangeButtons),
         refreshBtn)),
     customForm,
     state,
@@ -166,7 +168,7 @@ export function metricsSection(name) {
     const to = new Date(toInput.value);
     customError.hidden = true;
     if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from >= to) {
-      customError.textContent = "L'inizio deve precedere la fine.";
+      customError.textContent = t('metrics.rangeError');
       customError.hidden = false;
       return;
     }
@@ -215,12 +217,11 @@ export function metricsSection(name) {
       if (e && e.name === 'AbortError') return;
       if (e instanceof ApiError && e.status === 501) {
         unavailable = true; // no point in polling an endpoint the server does not have
-        showState('info', 'Metriche non ancora disponibili',
-          'Questa versione del server non registra ancora lo storico degli spettatori. Il conteggio in tempo reale è nella sezione «Stato».');
+        showState('info', t('metrics.unavailable'), t('metrics.unavailableText'));
       } else if (e instanceof ApiError && e.status === 401) {
         return;
       } else {
-        showState('error', 'Impossibile caricare le metriche', describeError(e));
+        showState('error', t('metrics.loadError'), describeError(e));
       }
     } finally {
       if (inflight === ctrl) inflight = null;
@@ -234,19 +235,19 @@ export function metricsSection(name) {
     tiles.now.value.textContent = fmtInt(current);
     const peak = s.peak || {};
     tiles.peak.value.textContent = fmtInt(peak.value);
-    tiles.peak.sub.textContent = peak.at ? `alle ${fmtWhen(peak.at)}` : '';
+    tiles.peak.sub.textContent = peak.at ? t('metrics.peakAt', { when: fmtWhen(peak.at) }) : '';
     tiles.sessions.value.textContent = fmtInt(s.sessions_total);
     tiles.avg.value.textContent = fmtDuration(s.avg_watch_secs);
     tiles.bytes.value.textContent = fmtBytes(s.bytes_in);
-    tiles.bytes.sub.textContent = s.live_since ? `in diretta dalle ${fmtWhen(s.live_since)}` : '';
+    tiles.bytes.sub.textContent = s.live_since ? t('metrics.liveSince', { when: fmtWhen(s.live_since) }) : '';
   }
 
   function tickFormatter(span) {
     return (v) => {
       const d = new Date(v);
-      const hm = d.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+      const hm = formatDate(d, { hour: '2-digit', minute: '2-digit' });
       if (span <= 26 * 3600e3) return hm;
-      return d.toLocaleDateString('it-IT', { day: '2-digit', month: '2-digit' }) + ' ' + hm;
+      return formatDate(d, { day: '2-digit', month: '2-digit' }) + ' ' + hm;
     };
   }
 
@@ -255,12 +256,12 @@ export function metricsSection(name) {
     try {
       Chart = await loadScript(CHART_JS, 'Chart');
     } catch (_) {
-      showState('error', 'Impossibile caricare la libreria dei grafici', 'Controlla la connessione a Internet (Chart.js viene caricato da cdnjs).');
+      showState('error', t('metrics.libError'), t('metrics.libErrorText'));
       return;
     }
     if (destroyed) return;
     const datasets = SERIES.map((s) => ({
-      label: s.label,
+      label: s.label(),
       data: points.map((p) => ({ x: Date.parse(p.t), y: Number(p[s.key]) || 0 })),
       borderColor: s.color,
       backgroundColor: s.key === 'total' ? s.color + '2e' : s.color,
@@ -305,7 +306,7 @@ export function metricsSection(name) {
             beginAtZero: true, suggestedMax: 5,
             ticks: { color: ink, precision: 0 },
             grid: { color: grid }, border: { display: false },
-            title: { display: true, text: 'Spettatori', color: ink },
+            title: { display: true, text: t('common.viewers'), color: ink },
           },
         },
         plugins: {
@@ -324,7 +325,7 @@ export function metricsSection(name) {
     const rows = points.slice(-500).reverse().map((p) => h('tr', null,
       h('th', { scope: 'row' }, fmtDateTime(p.t)),
       ...SERIES.map((s) => h('td', { class: 'num' }, fmtInt(p[s.key] || 0)))));
-    setChildren(tableBody, rows.length ? rows : h('tr', null, h('td', { colspan: String(SERIES.length + 1) }, 'Nessun dato.')));
+    setChildren(tableBody, rows.length ? rows : h('tr', null, h('td', { colspan: String(SERIES.length + 1) }, t('metrics.noData'))));
   }
 
   return {

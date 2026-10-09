@@ -34,9 +34,14 @@ pub enum HubEvent {
     ViewerCountChanged { name: String, counts: ViewerCounts },
     /// The persisted broadcast was created, modified (pause, key, settings...) or deleted.
     BroadcastUpdated { name: String },
+    /// Global settings changed (`PATCH /api/v1/settings`: UI language, default waiting
+    /// text). Not tied to a broadcast.
+    SettingsChanged,
 }
 
 impl HubEvent {
+    /// Broadcast the event refers to; `""` for [`HubEvent::SettingsChanged`] (never a
+    /// valid broadcast name).
     pub fn name(&self) -> &str {
         match self {
             HubEvent::StreamStarted { name }
@@ -44,6 +49,7 @@ impl HubEvent {
             | HubEvent::Metadata { name }
             | HubEvent::ViewerCountChanged { name, .. }
             | HubEvent::BroadcastUpdated { name } => name,
+            HubEvent::SettingsChanged => "",
         }
     }
 }

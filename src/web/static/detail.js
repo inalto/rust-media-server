@@ -10,6 +10,7 @@ import {
   PROTOCOLS, statusBadge, totalViewers,
 } from './core.js';
 import { metricsSection } from './metrics.js';
+import { t, tn, formatNumber, isBuiltinWaitingText } from './i18n.js';
 
 const LIVE_POLL_MS = 5000;
 const SESSIONS_POLL_MS = 10000;
@@ -50,7 +51,7 @@ export function mountDetail(root, name, { navigate }) {
   const offs = [];
   const sections = [];
 
-  setChildren(root, h('div', { class: 'loading-page', role: 'status' }, h('span', { class: 'spinner' }), 'Caricamento…'));
+  setChildren(root, h('div', { class: 'loading-page', role: 'status' }, h('span', { class: 'spinner' }), t('common.loading')));
 
   const every = (fn, ms) => { const t = setInterval(() => { if (!document.hidden) fn(); }, ms); timers.push(t); };
 
@@ -70,9 +71,9 @@ export function mountDetail(root, name, { navigate }) {
 
   function notFound() {
     setChildren(root, h('div', { class: 'empty' },
-      icon('alert', 32), h('h1', null, 'Diretta non trovata'),
-      h('p', { class: 'muted' }, `Non esiste una diretta chiamata «${name}» (forse è stata eliminata).`),
-      h('a', { class: 'btn primary', href: '#/' }, icon('back'), h('span', null, 'Torna alle dirette'))));
+      icon('alert', 32), h('h1', null, t('detail.notFound')),
+      h('p', { class: 'muted' }, t('detail.notFoundText', { name })),
+      h('a', { class: 'btn primary', href: '#/' }, icon('back'), h('span', null, t('detail.back')))));
   }
 
   async function act(fn, okMessage) {
@@ -93,18 +94,18 @@ export function mountDetail(root, name, { navigate }) {
   function headerSection() {
     const title = h('h1', null);
     const badge = h('span');
-    const rec = h('span', { class: 'rec-chip', hidden: true }, h('span', { class: 'dot', 'aria-hidden': 'true' }), 'REC');
+    const rec = h('span', { class: 'rec-chip', hidden: true }, h('span', { class: 'dot', 'aria-hidden': 'true' }), t('common.rec'));
     const slug = h('span', { class: 'mono' });
     const desc = h('span', { class: 'desc' });
-    const viewers = h('span', { class: 'viewers-chip', title: 'Spettatori connessi' }, icon('users', 16), h('strong'));
-    const playerLink = h('a', { class: 'btn', target: '_blank', rel: 'noopener' }, icon('external'), h('span', null, 'Apri player'));
+    const viewers = h('span', { class: 'viewers-chip', title: t('detail.viewersTitle') }, icon('users', 16), h('strong'));
+    const playerLink = h('a', { class: 'btn', target: '_blank', rel: 'noopener' }, icon('external'), h('span', null, t('detail.openPlayer')));
     const el = h('header', { class: 'detail-head' },
       h('div', { class: 'detail-title' },
-        h('a', { class: 'back', href: '#/' }, icon('back', 16), h('span', null, 'Dirette')),
+        h('a', { class: 'back', href: '#/' }, icon('back', 16), h('span', null, t('nav.broadcasts'))),
         h('div', { class: 'title-row' }, title, badge, rec, viewers),
         h('p', { class: 'muted sub' }, slug, desc)),
       h('div', { class: 'head-actions' },
-        iconButton('edit', 'Modifica', () => editDialog()),
+        iconButton('edit', t('action.edit'), () => editDialog()),
         playerLink));
     return {
       el,
@@ -116,7 +117,8 @@ export function mountDetail(root, name, { navigate }) {
         slug.textContent = b.name;
         desc.textContent = b.description ? ` · ${b.description}` : '';
         viewers.querySelector('strong').textContent = fmtInt(totalViewers(b.viewers));
-        viewers.setAttribute('aria-label', `${fmtInt(totalViewers(b.viewers))} spettatori connessi`);
+        const n = totalViewers(b.viewers);
+        viewers.setAttribute('aria-label', tn('detail.viewersLabel', n, { n: fmtInt(n) }));
         playerLink.href = b.urls.player;
       },
       viewers(counts) { viewers.querySelector('strong').textContent = fmtInt(totalViewers(counts)); },
@@ -125,10 +127,11 @@ export function mountDetail(root, name, { navigate }) {
 
   function subnav() {
     const items = [
-      ['sec-status', 'Stato'], ['sec-preview', 'Anteprima'], ['sec-obs', 'OBS'], ['sec-links', 'Link e embed'],
-      ['sec-metrics', 'Metriche'], ['sec-recordings', 'Registrazioni'], ['sec-waiting', 'Video di attesa'],
+      ['sec-status', t('common.status')], ['sec-preview', t('detail.nav.preview')], ['sec-obs', t('detail.nav.obs')],
+      ['sec-links', t('detail.nav.links')], ['sec-metrics', t('detail.nav.metrics')],
+      ['sec-recordings', t('detail.nav.recordings')], ['sec-waiting', t('detail.nav.waiting')],
     ];
-    return h('nav', { class: 'subnav', 'aria-label': 'Sezioni della diretta' },
+    return h('nav', { class: 'subnav', 'aria-label': t('detail.sections') },
       ...items.map(([id, label]) => h('button', {
         type: 'button', class: 'chip',
         onclick: () => {
@@ -142,33 +145,33 @@ export function mountDetail(root, name, { navigate }) {
   }
 
   // -------------------------------------------------------------------------
-  // Stato
+  // Status
   // -------------------------------------------------------------------------
   function statusSection() {
     const rows = {
-      status: kvRow('Stato'), since: kvRow('In diretta da'), ip: kvRow('IP encoder'), video: kvRow('Video'),
-      audio: kvRow('Audio'), bitrate: kvRow('Bitrate in ingresso'), bytes: kvRow('Dati ricevuti'), rec: kvRow('Registrazione'),
+      status: kvRow(t('common.status')), since: kvRow(t('state.since')), ip: kvRow(t('state.ip')), video: kvRow(t('state.video')),
+      audio: kvRow(t('state.audio')), bitrate: kvRow(t('state.bitrate')), bytes: kvRow(t('common.bytesIn')), rec: kvRow(t('state.recording')),
     };
     const pauseBtn = h('button', { type: 'button', class: 'btn' });
-    const discBtn = iconButton('power', 'Disconnetti encoder', async () => {
+    const discBtn = iconButton('power', t('action.disconnect'), async () => {
       const ok = await confirmDialog({
-        title: 'Disconnettere l\'encoder?',
-        message: 'OBS verrà scollegato dal server. Se è configurato per riconnettersi, ripartirà da solo dopo qualche secondo: per fermarlo davvero rigenera la chiave o metti in pausa.',
-        confirmLabel: 'Disconnetti', danger: true,
+        title: t('state.disconnectTitle'),
+        message: t('state.disconnectText'),
+        confirmLabel: t('state.disconnectOk'), danger: true,
       });
-      if (ok) act(() => api(`/broadcasts/${enc(name)}/disconnect`, { method: 'POST' }), 'Encoder disconnesso.');
+      if (ok) act(() => api(`/broadcasts/${enc(name)}/disconnect`, { method: 'POST' }), t('state.disconnected'));
     });
     const recBtn = h('button', { type: 'button', class: 'btn' });
-    const delBtn = iconButton('trash', 'Elimina', async () => {
+    const delBtn = iconButton('trash', t('action.delete'), async () => {
       const ok = await confirmDialog({
-        title: 'Eliminare la diretta?',
-        message: [`La diretta «${b.title}» verrà eliminata definitivamente insieme al suo video di attesa. L'encoder connesso viene scollegato; le registrazioni restano disponibili.`],
-        confirmLabel: 'Elimina diretta', danger: true,
+        title: t('state.deleteTitle'),
+        message: [t('state.deleteText', { title: b.title })],
+        confirmLabel: t('state.deleteOk'), danger: true,
       });
       if (!ok) return;
       try {
         await api(`/broadcasts/${enc(name)}`, { method: 'DELETE' });
-        toast('Diretta eliminata.', 'success');
+        toast(t('state.deleted'), 'success');
         store.remove(name);
         navigate('#/');
       } catch (e) { toast(describeError(e), 'error'); }
@@ -177,36 +180,36 @@ export function mountDetail(root, name, { navigate }) {
     pauseBtn.addEventListener('click', () => {
       const paused = b.status === 'paused';
       act(() => api(`/broadcasts/${enc(name)}/${paused ? 'resume' : 'pause'}`, { method: 'POST' }),
-        paused ? 'Diretta ripresa: i player tornano al live.' : 'Diretta in pausa: i player mostrano il video di attesa.');
+        paused ? t('state.resumed') : t('toast.paused'));
     });
     recBtn.addEventListener('click', async () => {
       const recording = !!(b.live && b.live.recording);
       const res = await act(() => api(`/broadcasts/${enc(name)}/record/${recording ? 'stop' : 'start'}`, { method: 'POST' }),
-        recording ? 'Registrazione fermata.' : 'Registrazione avviata.');
+        recording ? t('state.recStopped') : t('state.recStarted'));
       if (res !== undefined) { reload(); recordings.load(); }
     });
 
     const protoCells = {};
     const protoTable = h('table', { class: 'proto-table' },
-      h('caption', { class: 'sr-only' }, 'Spettatori per protocollo'),
-      h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Protocollo'), h('th', { scope: 'col', class: 'num' }, 'Spettatori'))),
+      h('caption', { class: 'sr-only' }, t('state.byProtocol')),
+      h('thead', null, h('tr', null, h('th', { scope: 'col' }, t('common.protocol')), h('th', { scope: 'col', class: 'num' }, t('common.viewers')))),
       h('tbody', null,
         ...PROTOCOLS.map((p) => { protoCells[p.key] = h('td', { class: 'num' }, '0'); return h('tr', null, h('th', { scope: 'row' }, p.label), protoCells[p.key]); }),
-        h('tr', { class: 'total' }, h('th', { scope: 'row' }, 'Totale'), (protoCells.total = h('td', { class: 'num' }, '0')))));
+        h('tr', { class: 'total' }, h('th', { scope: 'row' }, t('common.total')), (protoCells.total = h('td', { class: 'num' }, '0')))));
 
     const sessionsBody = h('tbody');
     const sessionsCount = h('span', { class: 'count' }, '0');
     const sessionsWrap = h('div', { class: 'table-wrap' },
       h('table', null,
-        h('thead', null, h('tr', null, ...['Protocollo', 'IP', 'Client', 'Connesso'].map((t) => h('th', { scope: 'col' }, t)))),
+        h('thead', null, h('tr', null, ...[t('common.protocol'), t('state.colIp'), t('state.colClient'), t('state.colConnected')].map((label) => h('th', { scope: 'col' }, label)))),
         sessionsBody));
 
-    const el = panel('sec-status', 'activity', 'Stato',
+    const el = panel('sec-status', 'activity', t('common.status'),
       h('div', { class: 'actions-row' }, pauseBtn, discBtn, recBtn, delBtn),
       h('dl', { class: 'kv' }, ...Object.values(rows).map((r) => r.row)),
       h('div', { class: 'split' },
-        h('div', null, h('h3', null, 'Spettatori per protocollo'), protoTable),
-        h('div', { class: 'grow' }, h('h3', null, 'Sessioni connesse ', sessionsCount), sessionsWrap)));
+        h('div', null, h('h3', null, t('state.byProtocol')), protoTable),
+        h('div', { class: 'grow' }, h('h3', null, t('state.sessions'), sessionsCount), sessionsWrap)));
 
     let bitrate = { started: null, t: 0, bytes: 0, kbps: null };
 
@@ -226,7 +229,7 @@ export function mountDetail(root, name, { navigate }) {
             h('td', { class: 'mono' }, s.ip || '—'),
             h('td', { title: s.user_agent || '' }, shortUA(s.user_agent)),
             h('td', { title: fmtDateTime(s.started_at) }, fmtSince(s.started_at))))
-          : h('tr', null, h('td', { colspan: '4', class: 'muted' }, 'Nessuno spettatore connesso.')));
+          : h('tr', null, h('td', { colspan: '4', class: 'muted' }, t('state.noSessions'))));
       } catch (e) {
         if (!(e instanceof ApiError && e.status === 401)) setChildren(sessionsBody, h('tr', null, h('td', { colspan: '4', class: 'error' }, describeError(e))));
       }
@@ -238,7 +241,7 @@ export function mountDetail(root, name, { navigate }) {
       loadSessions,
       update(b) {
         const live = b.live;
-        rows.status.dd.replaceChildren(statusBadge(b.status), b.status === 'paused' && live ? h('span', { class: 'hint inline' }, ' Il segnale arriva ma i player mostrano il video di attesa.') : '');
+        rows.status.dd.replaceChildren(statusBadge(b.status), b.status === 'paused' && live ? h('span', { class: 'hint inline' }, t('state.pausedHint')) : '');
         rows.since.dd.textContent = live ? `${fmtTime(live.started_at)} (${fmtSince(live.started_at)})` : '—';
         rows.ip.dd.textContent = (live && live.publisher_ip) || '—';
         if (live) {
@@ -254,25 +257,25 @@ export function mountDetail(root, name, { navigate }) {
             bitrate.t = now;
             bitrate.bytes = live.bytes_in;
           }
-          rows.bitrate.dd.textContent = bitrate.kbps == null ? 'misura in corso…' : `${fmtBitrate(bitrate.kbps)} (misurato)`;
+          rows.bitrate.dd.textContent = bitrate.kbps == null ? t('state.measuring') : t('state.measured', { rate: fmtBitrate(bitrate.kbps) });
           rows.bytes.dd.textContent = fmtBytes(live.bytes_in);
-          rows.rec.dd.textContent = live.recording ? `In corso dalle ${fmtTime(live.recording.started_at)}` : 'No';
+          rows.rec.dd.textContent = live.recording ? t('state.recSince', { time: fmtTime(live.recording.started_at) }) : t('common.no');
         } else {
           bitrate = { started: null, t: 0, bytes: 0, kbps: null };
           for (const k of ['video', 'audio', 'bitrate', 'bytes']) rows[k].dd.textContent = '—';
-          rows.rec.dd.textContent = 'No';
+          rows.rec.dd.textContent = t('common.no');
         }
         setCounts(b.viewers);
 
         const paused = b.status === 'paused';
-        setChildren(pauseBtn, icon(paused ? 'play' : 'pause'), h('span', null, paused ? 'Riprendi' : 'Pausa'));
-        pauseBtn.title = paused ? 'Torna a mostrare il live ai player' : 'Mostra il video di attesa ai player senza fermare OBS';
+        setChildren(pauseBtn, icon(paused ? 'play' : 'pause'), h('span', null, paused ? t('action.resume') : t('action.pause')));
+        pauseBtn.title = paused ? t('state.resumeTitle') : t('state.pauseTitle');
         discBtn.disabled = !live;
         const recording = !!(live && live.recording);
-        setChildren(recBtn, icon(recording ? 'stop' : 'record'), h('span', null, recording ? 'Ferma registrazione' : 'Registra ora'));
+        setChildren(recBtn, icon(recording ? 'stop' : 'record'), h('span', null, recording ? t('action.stopRecording') : t('action.recordNow')));
         recBtn.classList.toggle('recording', recording);
         recBtn.disabled = !live;
-        recBtn.title = live ? '' : 'Disponibile quando la diretta riceve il segnale';
+        recBtn.title = live ? '' : t('state.recDisabledTitle');
 
         if (live && !sessionsTimer) {
           loadSessions();
@@ -289,7 +292,7 @@ export function mountDetail(root, name, { navigate }) {
   }
 
   // -------------------------------------------------------------------------
-  // Anteprima live
+  // Live preview
   // -------------------------------------------------------------------------
   function previewSection() {
     const key = 'rmsPreview';
@@ -298,17 +301,17 @@ export function mountDetail(root, name, { navigate }) {
     const src = `/embed/${enc(name)}?muted=1&autoplay=1&latency=1`;
     const frameBox = h('div', { class: 'preview-box' });
     const toggle = h('button', { type: 'button', class: 'btn', 'aria-pressed': String(enabled) });
-    const reloadBtn = iconButton('refresh', 'Ricarica anteprima', () => { if (enabled) render(true); }, { showLabel: false });
+    const reloadBtn = iconButton('refresh', t('preview.reload'), () => { if (enabled) render(true); }, { showLabel: false });
     function render(force) {
-      setChildren(toggle, icon(enabled ? 'eyeOff' : 'eye'), h('span', null, enabled ? 'Disattiva' : 'Attiva'));
+      setChildren(toggle, icon(enabled ? 'eyeOff' : 'eye'), h('span', null, enabled ? t('preview.turnOff') : t('preview.turnOn')));
       toggle.setAttribute('aria-pressed', String(enabled));
       reloadBtn.disabled = !enabled;
       if (!enabled) {
-        setChildren(frameBox, h('div', { class: 'preview-off' }, icon('video', 28), h('p', null, 'Anteprima disattivata.')));
+        setChildren(frameBox, h('div', { class: 'preview-off' }, icon('video', 28), h('p', null, t('preview.off'))));
         return;
       }
       if (force || !frameBox.querySelector('iframe')) {
-        setChildren(frameBox, h('iframe', { src, title: 'Anteprima della diretta', allow: 'autoplay; fullscreen; picture-in-picture', loading: 'lazy' }));
+        setChildren(frameBox, h('iframe', { src, title: t('preview.frameTitle'), allow: 'autoplay; fullscreen; picture-in-picture', loading: 'lazy' }));
       }
     }
     toggle.addEventListener('click', () => {
@@ -316,54 +319,55 @@ export function mountDetail(root, name, { navigate }) {
       try { localStorage.setItem(key, enabled ? '1' : '0'); } catch (_) { /* ignore */ }
       render(true);
     });
-    const el = panel('sec-preview', 'video', 'Anteprima live', frameBox,
-      h('p', { class: 'hint' }, 'È il player embed, come lo vedono gli spettatori (senza audio). L\'anteprima conta come uno spettatore.'));
+    const el = panel('sec-preview', 'video', t('preview.title'), frameBox,
+      h('p', { class: 'hint' }, t('preview.hint')));
     el.tools.append(toggle, reloadBtn);
     render(false);
     return { el, update() {} };
   }
 
   // -------------------------------------------------------------------------
-  // Impostazioni OBS
+  // OBS settings
   // -------------------------------------------------------------------------
   function obsSection() {
-    const server = copyField({ label: 'Server', value: '', hint: 'In OBS: Impostazioni › Stream › Servizio «Personalizzato».' });
-    const regen = iconButton('refresh', 'Rigenera', async () => {
+    const server = copyField({ label: t('obs.server'), value: '', hint: t('obs.serverHint') });
+    const regen = iconButton('refresh', t('action.regenerate'), async () => {
       const ok = await confirmDialog({
-        title: 'Rigenerare la chiave stream?',
-        message: 'La chiave attuale non sarà più accettata: dovrai incollare quella nuova in OBS. Un encoder già collegato resta connesso finché non si disconnette.',
-        confirmLabel: 'Rigenera chiave', danger: true,
+        title: t('obs.regenConfirmTitle'),
+        message: t('obs.regenConfirmText'),
+        confirmLabel: t('obs.regenConfirmOk'), danger: true,
       });
-      if (ok) act(() => api(`/broadcasts/${enc(name)}/regenerate-key`, { method: 'POST' }), 'Nuova chiave generata: aggiornala in OBS.');
-    }, { attrs: { title: 'Genera una nuova chiave stream' } });
-    const key = copyField({ label: 'Chiave stream', value: '', secret: true, extra: [regen], hint: 'Segreta: chi la conosce può trasmettere su questa diretta.' });
+      if (ok) act(() => api(`/broadcasts/${enc(name)}/regenerate-key`, { method: 'POST' }), t('obs.regenerated'));
+    }, { attrs: { title: t('obs.regenTitle') } });
+    const key = copyField({ label: t('obs.key'), value: '', secret: true, extra: [regen], hint: t('obs.keyHint') });
     const gopWarn = h('div', { class: 'banner warn', role: 'alert', hidden: true });
 
+    // Recommended OBS settings (labels follow OBS's own wording in each language).
     const reco = {
       x264: [
-        ['Modalità di output', 'Avanzata (Impostazioni › Output)'],
-        ['Controllo frequenza', 'CBR'],
-        ['Bitrate', '2500–6000 kbps, secondo la banda in upload (lascia margine)'],
-        ['Intervallo fotogrammi chiave', '2 s (1 s per la latenza minima)'],
-        ['Preset utilizzo CPU', 'veryfast (o più veloce)'],
-        ['Profilo', 'main o high'],
-        ['Tune', 'zerolatency'],
-        ['Opzioni x264', 'bframes=0'],
+        [t('obs.outputMode'), t('obs.outputModeValue')],
+        [t('obs.rateControl'), 'CBR'],
+        [t('obs.bitrate'), t('obs.bitrateValue')],
+        [t('obs.keyframe'), t('obs.keyframeValue')],
+        [t('obs.cpuPreset'), t('obs.cpuPresetValue')],
+        [t('obs.profile'), t('obs.profileValue')],
+        [t('obs.tune'), 'zerolatency'],
+        [t('obs.x264Options'), 'bframes=0'],
       ],
       nvenc: [
-        ['Modalità di output', 'Avanzata (Impostazioni › Output)'],
-        ['Controllo frequenza', 'CBR'],
-        ['Intervallo fotogrammi chiave', '2 s (1 s per la latenza minima)'],
-        ['Preset', 'P4 (equilibrato) o più veloce'],
-        ['Tuning', 'Bassa latenza o Latenza ultra bassa'],
-        ['Multipass', 'Disattivato'],
-        ['B-frame massimi', '0'],
-        ['Look-ahead', 'Disattivato'],
+        [t('obs.outputMode'), t('obs.outputModeValue')],
+        [t('obs.rateControl'), 'CBR'],
+        [t('obs.keyframe'), t('obs.keyframeValue')],
+        [t('obs.preset'), t('obs.presetValue')],
+        [t('obs.tuning'), t('obs.tuningValue')],
+        [t('obs.multipass'), t('obs.off')],
+        [t('obs.maxBframes'), '0'],
+        [t('obs.lookahead'), t('obs.off')],
       ],
       common: [
-        ['Audio', 'AAC 128–160 kbps, 48 kHz'],
-        ['Video', '720p o 1080p, frame rate costante (30 o 60)'],
-        ['Ritardo flusso', 'Disattivato (Impostazioni › Avanzate)'],
+        [t('obs.audio'), t('obs.audioValue')],
+        [t('obs.video'), t('obs.videoValue')],
+        [t('obs.streamDelay'), t('obs.streamDelayValue')],
       ],
     };
     let encoder = 'x264';
@@ -378,17 +382,17 @@ export function mountDetail(root, name, { navigate }) {
     }
     renderReco();
 
-    const el = panel('sec-obs', 'monitor', 'Impostazioni OBS',
+    const el = panel('sec-obs', 'monitor', t('obs.title'),
       gopWarn,
       h('div', { class: 'grid-2' },
         h('div', { class: 'stack' },
           server, key,
-          h('p', { class: 'hint' }, 'Il server accetta qualsiasi nome di applicazione: basta che la chiave sia corretta. Sono supportati H.264 + AAC (consigliato) e, solo per HTTP-FLV, HEVC/AV1 con Enhanced RTMP.')),
+          h('p', { class: 'hint' }, t('obs.serverNote'))),
         h('div', { class: 'reco' },
-          h('h3', null, 'Impostazioni consigliate per la bassa latenza'),
-          h('div', { class: 'segmented', role: 'group', 'aria-label': 'Encoder' }, ...encButtons),
+          h('h3', null, t('obs.recoTitle')),
+          h('div', { class: 'segmented', role: 'group', 'aria-label': t('obs.encoder') }, ...encButtons),
           recoList,
-          h('p', { class: 'hint' }, 'In OBS l\'intervallo dei fotogrammi chiave predefinito è «0» (automatico, fino a 8 s): impostalo esplicitamente, altrimenti LL-HLS e LL-DASH avranno latenza alta.'))));
+          h('p', { class: 'hint' }, t('obs.keyframeNote')))));
 
     return {
       el,
@@ -400,8 +404,8 @@ export function mountDetail(root, name, { navigate }) {
         if (typeof gop === 'number' && Number.isFinite(gop) && gop > 4) {
           setChildren(gopWarn, icon('alert'),
             h('div', null,
-              h('strong', null, `Intervallo tra fotogrammi chiave troppo lungo: ${String(Math.round(gop * 10) / 10).replace('.', ',')} s. `),
-              'In OBS imposta «Intervallo fotogrammi chiave» a 2 s (o 1 s): con GOP lunghi LL-HLS e LL-DASH hanno latenza alta e avvio lento.'));
+              h('strong', null, t('obs.gopWarnTitle', { secs: formatNumber(gop, { maximumFractionDigits: 1, useGrouping: false }) })),
+              t('obs.gopWarnText')));
           gopWarn.hidden = false;
         } else {
           gopWarn.hidden = true;
@@ -411,7 +415,7 @@ export function mountDetail(root, name, { navigate }) {
   }
 
   // -------------------------------------------------------------------------
-  // Link e embed
+  // Links and embed
   // -------------------------------------------------------------------------
   function linksSection() {
     const fields = {
@@ -420,16 +424,17 @@ export function mountDetail(root, name, { navigate }) {
       hls: copyField({ label: 'LL-HLS', value: '' }),
       dash: copyField({ label: 'LL-DASH', value: '' }),
       whep: copyField({ label: 'WebRTC (WHEP)', value: '' }),
-      embed: copyField({ label: 'Pagina embed', value: '' }),
-      player: copyField({ label: 'Pagina player', value: '' }),
+      embed: copyField({ label: t('links.embedPage'), value: '' }),
+      player: copyField({ label: t('links.playerPage'), value: '' }),
     };
     const disabledTag = {};
     for (const k of ['flv', 'ws_flv', 'hls', 'dash', 'whep']) {
-      disabledTag[k] = h('span', { class: 'tag', hidden: true }, 'disattivato');
+      disabledTag[k] = h('span', { class: 'tag', hidden: true }, t('links.disabled'));
       fields[k].querySelector('label').append(' ', disabledTag[k]);
     }
     let embed = null;
-    const opts = { autoplay: true, muted: true, controls: true, src: 'auto' };
+    // lang: '' = the server setting (no ?lang= in the URL), else 'it' | 'en'.
+    const opts = { autoplay: true, muted: true, controls: true, src: 'auto', lang: '' };
     const iframeCode = h('textarea', { class: 'code', rows: '4', readonly: true, spellcheck: 'false', id: uid('iframe') });
     const check = (key, label) => {
       const id = uid('opt');
@@ -438,18 +443,24 @@ export function mountDetail(root, name, { navigate }) {
     };
     const srcId = uid('src');
     const srcSelect = h('select', { id: srcId, onchange: (e) => { opts.src = e.target.value; renderIframe(); } },
-      h('option', { value: 'auto' }, 'Automatica (consigliata)'),
+      h('option', { value: 'auto' }, t('links.sourceAuto')),
       h('option', { value: 'webrtc' }, 'WebRTC (WHEP)'),
       h('option', { value: 'flv' }, 'HTTP-FLV'),
       h('option', { value: 'hls' }, 'LL-HLS'),
       h('option', { value: 'dash' }, 'LL-DASH'));
+    const langId = uid('plang');
+    const langSelect = h('select', { id: langId, onchange: (e) => { opts.lang = e.target.value; renderIframe(); } },
+      h('option', { value: '' }, t('links.langDefault')),
+      h('option', { value: 'it' }, t('links.langIt')),
+      h('option', { value: 'en' }, t('links.langEn')));
     const optsForm = h('fieldset', { class: 'embed-opts' },
-      h('legend', null, 'Opzioni embed'),
-      check('autoplay', 'Avvio automatico'),
-      check('muted', 'Senza audio all\'avvio'),
-      check('controls', 'Controlli del player'),
-      h('div', { class: 'field inline' }, h('label', { for: srcId }, 'Sorgente'), srcSelect),
-      h('p', { class: 'hint' }, 'I browser bloccano l\'avvio automatico con l\'audio: lascia «Senza audio» attivo, lo spettatore può attivarlo con un tocco.'));
+      h('legend', null, t('links.optsLegend')),
+      check('autoplay', t('links.autoplay')),
+      check('muted', t('links.muted')),
+      check('controls', t('links.controls')),
+      h('div', { class: 'field inline' }, h('label', { for: srcId }, t('links.source')), srcSelect),
+      h('div', { class: 'field inline' }, h('label', { for: langId }, t('links.lang')), langSelect),
+      h('p', { class: 'hint' }, t('links.autoplayHint')));
     const snippetBox = h('div', { class: 'snippets' });
 
     function embedUrl() {
@@ -458,6 +469,7 @@ export function mountDetail(root, name, { navigate }) {
       if (!opts.muted) u.searchParams.set('muted', '0');
       if (!opts.controls) u.searchParams.set('controls', '0');
       if (opts.src !== 'auto') u.searchParams.set('src', opts.src);
+      if (opts.lang) u.searchParams.set('lang', opts.lang);
       return u.toString();
     }
     function renderIframe() {
@@ -468,16 +480,16 @@ export function mountDetail(root, name, { navigate }) {
     function renderSnippets() {
       if (!embed) return;
       const items = [
-        ['hlsjs', 'Esempio con hls.js (LL-HLS)'],
-        ['mpegtsjs', 'Esempio con mpegts.js (HTTP-FLV)'],
-        ['dashjs', 'Esempio con dash.js (LL-DASH)'],
-        ['whep', 'Esempio WebRTC (WHEP, senza librerie)'],
+        ['hlsjs', t('links.snippetHlsjs')],
+        ['mpegtsjs', t('links.snippetMpegtsjs')],
+        ['dashjs', t('links.snippetDashjs')],
+        ['whep', t('links.snippetWhep')],
       ];
       setChildren(snippetBox, ...items.map(([k, label]) => h('details', { class: 'snippet' },
         h('summary', null, icon('code', 16), label),
         h('div', { class: 'code-wrap' },
           h('pre', null, h('code', null, embed.snippets[k] || '')),
-          copyButton(() => embed.snippets[k] || '', 'Copia codice', { showLabel: true })))));
+          copyButton(() => embed.snippets[k] || '', t('links.copyCode'), { showLabel: true })))));
     }
     async function loadEmbed() {
       try {
@@ -491,16 +503,16 @@ export function mountDetail(root, name, { navigate }) {
     }
 
     const iframeLabelId = uid('lbl');
-    const el = panel('sec-links', 'link', 'Link e embed',
+    const el = panel('sec-links', 'link', t('detail.nav.links'),
       h('div', { class: 'grid-2' },
         h('div', { class: 'stack' }, ...Object.values(fields)),
         h('div', { class: 'stack' },
           optsForm,
           h('div', { class: 'field' },
-            h('label', { for: iframeCode.id, id: iframeLabelId }, 'Codice iframe da incollare nel sito'),
+            h('label', { for: iframeCode.id, id: iframeLabelId }, t('links.iframeLabel')),
             iframeCode,
-            h('div', { class: 'row-end' }, copyButton(() => iframeCode.value, 'Copia iframe', { showLabel: true, cls: 'btn primary' }))),
-          h('h3', null, 'Integrazione con un player JavaScript'),
+            h('div', { class: 'row-end' }, copyButton(() => iframeCode.value, t('links.copyIframe'), { showLabel: true, cls: 'btn primary' }))),
+          h('h3', null, t('links.jsTitle')),
           snippetBox)));
     loadEmbed();
 
@@ -515,19 +527,19 @@ export function mountDetail(root, name, { navigate }) {
   }
 
   // -------------------------------------------------------------------------
-  // Registrazioni
+  // Recordings
   // -------------------------------------------------------------------------
   const REC_STATUS = {
-    recording: ['In registrazione', 'status-live'],
-    processing: ['In elaborazione', 'status-paused'],
-    ready: ['Pronta', 'status-ok'],
-    failed: ['Errore', 'status-error'],
+    recording: [() => t('rec.statusRecording'), 'status-live'],
+    processing: [() => t('rec.statusProcessing'), 'status-paused'],
+    ready: [() => t('rec.statusReady'), 'status-ok'],
+    failed: [() => t('rec.statusFailed'), 'status-error'],
   };
 
   function recordingsSection() {
     const body = h('div');
-    const el = panel('sec-recordings', 'film', 'Registrazioni', body);
-    const refreshBtn = iconButton('refresh', 'Aggiorna registrazioni', () => load(), { showLabel: false });
+    const el = panel('sec-recordings', 'film', t('detail.nav.recordings'), body);
+    const refreshBtn = iconButton('refresh', t('rec.refresh'), () => load(), { showLabel: false });
     el.tools.append(refreshBtn);
     let playing = null;
     let lastRecordingId;
@@ -539,27 +551,27 @@ export function mountDetail(root, name, { navigate }) {
 
     async function remove(r) {
       const ok = await confirmDialog({
-        title: 'Eliminare la registrazione?',
-        message: `La registrazione del ${fmtDateTime(r.started_at)} (${fmtBytes(r.size_bytes)}) verrà cancellata dal disco.`,
-        confirmLabel: 'Elimina', danger: true,
+        title: t('rec.deleteTitle'),
+        message: t('rec.deleteText', { date: fmtDateTime(r.started_at), size: fmtBytes(r.size_bytes) }),
+        confirmLabel: t('action.delete'), danger: true,
       });
       if (!ok) return;
       try {
         await api(`/recordings/${enc(r.id)}`, { method: 'DELETE' });
-        toast('Registrazione eliminata.', 'success');
+        toast(t('rec.deleted'), 'success');
         load();
       } catch (e) { toast(describeError(e), 'error'); }
     }
 
     function render(list) {
-      if (!list.length) { stateBox('film', 'Nessuna registrazione', 'Avvia «Registra ora» durante la diretta, oppure attiva la registrazione automatica in «Modifica».'); return; }
+      if (!list.length) { stateBox('film', t('rec.none'), t('rec.noneHint')); return; }
       const tbody = h('tbody');
       for (const r of list) {
-        const [label, cls] = REC_STATUS[r.status] || [r.status, 'status-offline'];
+        const [label, cls] = REC_STATUS[r.status] || [() => r.status, 'status-offline'];
         const url = `/api/v1/recordings/${enc(r.id)}/download`;
         const playable = r.status === 'ready' && r.format === 'mp4';
         const playerRow = h('tr', { class: 'player-row', hidden: true }, h('td', { colspan: '6' }));
-        const playBtn = playable ? iconButton('play', 'Riproduci', () => {
+        const playBtn = playable ? iconButton('play', t('action.play'), () => {
           const open = !playerRow.hidden;
           if (playing) { playing.hidden = true; playing.querySelector('td').replaceChildren(); }
           playing = null;
@@ -570,11 +582,11 @@ export function mountDetail(root, name, { navigate }) {
         }, { showLabel: false }) : null;
         const actions = h('td', null, h('div', { class: 'actions-cell' },
           playBtn,
-          r.status === 'ready' ? h('a', { class: 'btn icon-only', href: `${url}?download=1`, download: '', 'aria-label': 'Scarica', title: 'Scarica' }, icon('download')) : null,
-          r.status !== 'recording' ? iconButton('trash', 'Elimina registrazione', () => remove(r), { showLabel: false, cls: 'btn danger-ghost' }) : null));
+          r.status === 'ready' ? h('a', { class: 'btn icon-only', href: `${url}?download=1`, download: '', 'aria-label': t('action.download'), title: t('action.download') }, icon('download')) : null,
+          r.status !== 'recording' ? iconButton('trash', t('rec.delete'), () => remove(r), { showLabel: false, cls: 'btn danger-ghost' }) : null));
         tbody.append(
           h('tr', null,
-            h('td', null, h('span', { class: `badge ${cls}`, title: r.error || '' }, label)),
+            h('td', null, h('span', { class: `badge ${cls}`, title: r.error || '' }, label())),
             h('td', null, fmtDateTime(r.started_at)),
             h('td', { class: 'num' }, r.duration_secs != null ? fmtDuration(r.duration_secs) : (r.status === 'recording' ? fmtSince(r.started_at) : '—')),
             h('td', { class: 'num' }, fmtBytes(r.size_bytes)),
@@ -584,10 +596,11 @@ export function mountDetail(root, name, { navigate }) {
       }
       setChildren(body,
         h('div', { class: 'table-wrap' }, h('table', null,
-          h('thead', null, h('tr', null, ...['Stato', 'Inizio', 'Durata', 'Dimensione', 'Formato', 'Azioni'].map((t) => h('th', { scope: 'col' }, t)))),
+          h('thead', null, h('tr', null, ...[t('common.status'), t('rec.colStart'), t('rec.colDuration'), t('rec.colSize'), t('rec.colFormat'), t('rec.colActions')]
+            .map((label) => h('th', { scope: 'col' }, label)))),
           tbody)),
         list.some((r) => r.format === 'flv' && r.status === 'ready')
-          ? h('p', { class: 'hint' }, 'Le registrazioni FLV (senza ffmpeg sul server) non si riproducono nel browser: scaricale e aprile con VLC.') : null);
+          ? h('p', { class: 'hint' }, t('rec.flvHint')) : null);
     }
 
     async function load() {
@@ -605,12 +618,12 @@ export function mountDetail(root, name, { navigate }) {
         }
       } catch (e) {
         if (destroyed || (e instanceof ApiError && e.status === 401)) return;
-        if (e instanceof ApiError && e.status === 501) stateBox('info', 'Registrazioni non ancora disponibili', 'Questa versione del server non gestisce ancora l\'archivio delle registrazioni.');
-        else stateBox('alert', 'Impossibile caricare le registrazioni', describeError(e));
+        if (e instanceof ApiError && e.status === 501) stateBox('info', t('rec.unavailable'), t('rec.unavailableText'));
+        else stateBox('alert', t('rec.loadError'), describeError(e));
       }
     }
 
-    stateBox('film', 'Caricamento…');
+    stateBox('film', t('common.loading'));
     return {
       el,
       load,
@@ -623,7 +636,7 @@ export function mountDetail(root, name, { navigate }) {
   }
 
   // -------------------------------------------------------------------------
-  // Video di attesa
+  // Waiting video
   // -------------------------------------------------------------------------
   function waitingSection() {
     const current = h('div', { class: 'waiting-current' });
@@ -631,20 +644,20 @@ export function mountDetail(root, name, { navigate }) {
       endpoint: `/broadcasts/${enc(name)}/waiting-video`,
       getLimits: () => ({ maxMb: settings ? settings.max_upload_mb : null, ffmpeg: settings ? settings.ffmpeg_available : true }),
       onDone: (res) => { if (res && res.name) store.upsert(res); renderCurrent(true); },
-      label: 'Carica un nuovo video di attesa',
+      label: t('waiting.uploadLabel'),
     });
     const text = textField({
-      label: 'Testo di attesa', name: 'waiting_text', textarea: true, rows: 2,
-      hint: 'Mostrato quando non c\'è un video di attesa. Se lo lasci vuoto viene usato il testo predefinito globale.',
-      attrs: { maxlength: '500' },
+      label: t('waiting.textLabel'), name: 'waiting_text', textarea: true, rows: 2,
+      hint: t('waiting.textHint'),
+      attrs: { maxlength: '500', placeholder: t('create.defaultPlaceholder', { text: t('waiting.builtin') }) },
     });
     let dirty = false;
     text.control.addEventListener('input', () => { dirty = true; });
     const textForm = h('form', { class: 'stack', onsubmit: async (e) => {
       e.preventDefault();
-      const res = await act(() => api(`/broadcasts/${enc(name)}`, { method: 'PATCH', body: { waiting_text: text.control.value } }), 'Testo di attesa salvato.');
+      const res = await act(() => api(`/broadcasts/${enc(name)}`, { method: 'PATCH', body: { waiting_text: text.control.value } }), t('waiting.textSaved'));
       if (res) dirty = false;
-    } }, text, h('div', null, h('button', { type: 'submit', class: 'btn primary' }, 'Salva testo')));
+    } }, text, h('div', null, h('button', { type: 'submit', class: 'btn primary' }, t('common.saveText'))));
 
     let shownUrl;
     async function renderCurrent(force) {
@@ -654,8 +667,8 @@ export function mountDetail(root, name, { navigate }) {
       shownUrl = url;
       if (!url) {
         setChildren(current,
-          h('div', { class: 'waiting-placeholder' }, icon('film', 28), h('p', null, 'Nessun video di attesa')),
-          h('p', { class: 'hint' }, 'Il player mostra il titolo e il testo di attesa su uno sfondo animato. Puoi caricare un video qui oppure impostarne uno predefinito per tutte le dirette in «Impostazioni».'));
+          h('div', { class: 'waiting-placeholder' }, icon('film', 28), h('p', null, t('waiting.none'))),
+          h('p', { class: 'hint' }, t('waiting.noneHint')));
         return;
       }
       let poster = null;
@@ -668,23 +681,25 @@ export function mountDetail(root, name, { navigate }) {
       setChildren(current,
         h('video', { class: 'waiting-preview', src: url, poster: poster || null, controls: true, muted: true, loop: true, playsinline: true, preload: 'metadata' }),
         h('div', { class: 'row-between' },
-          h('p', { class: 'hint' }, own ? 'Video specifico di questa diretta.' : 'Nessun video specifico: è in uso il video predefinito globale (modificabile in «Impostazioni»).'),
-          own ? iconButton('trash', 'Elimina video', async () => {
-            const ok = await confirmDialog({ title: 'Eliminare il video di attesa?', message: 'Il file verrà cancellato. Se è impostato, i player useranno il video predefinito globale.', confirmLabel: 'Elimina', danger: true });
-            if (ok) { await act(() => api(`/broadcasts/${enc(name)}/waiting-video`, { method: 'DELETE' }), 'Video di attesa eliminato.'); }
+          h('p', { class: 'hint' }, own ? t('waiting.own') : t('waiting.usingDefault')),
+          own ? iconButton('trash', t('action.deleteVideo'), async () => {
+            const ok = await confirmDialog({ title: t('waiting.deleteTitle'), message: t('waiting.deleteText'), confirmLabel: t('action.delete'), danger: true });
+            if (ok) { await act(() => api(`/broadcasts/${enc(name)}/waiting-video`, { method: 'DELETE' }), t('waiting.deleted')); }
           }, { cls: 'btn danger-ghost' }) : null));
     }
 
-    const el = panel('sec-waiting', 'film', 'Video di attesa',
-      h('p', { class: 'hint lead' }, 'Il player lo mostra in loop, senza audio, quando la diretta è offline o in pausa, e passa da solo al live quando arriva il segnale.'),
+    const el = panel('sec-waiting', 'film', t('detail.nav.waiting'),
+      h('p', { class: 'hint lead' }, t('waiting.lead')),
       h('div', { class: 'grid-2' }, current, h('div', { class: 'stack' }, upload, textForm)));
     return {
       el,
       refreshLimits: () => upload.refreshLimits(),
-      setDefaultText: (t) => { if (t) text.control.placeholder = `Predefinito: ${t}`; },
+      setDefaultText: (value) => { if (value) text.control.placeholder = t('create.defaultPlaceholder', { text: value }); },
       update(b) {
         renderCurrent(false);
-        if (!dirty && document.activeElement !== text.control) text.control.value = b.waiting_text || '';
+        // A stored built-in text (API default) is shown as "use the default" (placeholder).
+        const own = isBuiltinWaitingText(b.waiting_text) ? '' : (b.waiting_text || '');
+        if (!dirty && document.activeElement !== text.control) text.control.value = own;
       },
     };
   }
@@ -694,15 +709,15 @@ export function mountDetail(root, name, { navigate }) {
   // -------------------------------------------------------------------------
   function editDialog() {
     if (!b) return;
-    const dlg = modal({ title: 'Modifica diretta' });
-    const title = textField({ label: 'Titolo', name: 'title', value: b.title, attrs: { required: true, maxlength: '200' } });
-    const desc = textField({ label: 'Descrizione', name: 'description', value: b.description, textarea: true, rows: 3, attrs: { maxlength: '5000' } });
+    const dlg = modal({ title: t('edit.title') });
+    const title = textField({ label: t('create.titleLabel'), name: 'title', value: b.title, attrs: { required: true, maxlength: '200' } });
+    const desc = textField({ label: t('edit.description'), name: 'description', value: b.description, textarea: true, rows: 3, attrs: { maxlength: '5000' } });
     const err = h('p', { class: 'error', role: 'alert', hidden: true });
-    const save = h('button', { type: 'submit', class: 'btn primary' }, 'Salva');
+    const save = h('button', { type: 'submit', class: 'btn primary' }, t('common.save'));
     const form = h('form', { class: 'stack' }, title, desc,
-      h('p', { class: 'hint' }, `Nome (non modificabile): `, h('span', { class: 'mono' }, b.name)),
+      h('p', { class: 'hint' }, t('edit.nameNote'), h('span', { class: 'mono' }, b.name)),
       flagFields(b), err,
-      h('div', { class: 'modal-actions' }, h('button', { type: 'button', class: 'btn', onclick: () => dlg.close('cancel') }, 'Annulla'), save));
+      h('div', { class: 'modal-actions' }, h('button', { type: 'button', class: 'btn', onclick: () => dlg.close('cancel') }, t('common.cancel')), save));
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       err.hidden = true;
@@ -710,7 +725,7 @@ export function mountDetail(root, name, { navigate }) {
       try {
         const res = await api(`/broadcasts/${enc(name)}`, { method: 'PATCH', body: { title: title.control.value, description: desc.control.value, ...readFlags(form) } });
         store.upsert(res);
-        toast('Modifiche salvate.', 'success');
+        toast(t('edit.saved'), 'success');
         dlg.close('ok');
       } catch (ex) {
         err.textContent = describeError(ex);
@@ -757,7 +772,7 @@ export function mountDetail(root, name, { navigate }) {
   }));
   offs.push(bus.on('deleted', (n) => {
     if (n !== name || destroyed) return;
-    toast('Questa diretta è stata eliminata.', 'info');
+    toast(t('detail.deletedElsewhere'), 'info');
     navigate('#/');
   }));
   offs.push(bus.on('list', () => { const nb = store.broadcasts.get(name); if (nb && nb !== b && !destroyed) update(nb); }));

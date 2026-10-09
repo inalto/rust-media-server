@@ -4,50 +4,52 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Diretta</title>
+  <title>rms</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/player.css">
 </head>
 <!-- Served at /embed/{name} (data-mode="embed", for iframes) and /player/{name}
      (data-mode="player", full page with the title). Query: autoplay, muted, controls,
-     src=auto|webrtc|flv|hls|dash, latency=1 (show the latency indicator). -->
+     src=auto|webrtc|flv|hls|dash, latency=1 (show the latency indicator), lang=it|en
+     (overrides the ui_language setting; the server sets <html lang> accordingly).
+     Texts are Italian fallbacks resolved by player.js (data-i18n*, i18n.js). -->
 <body data-mode="embed" data-name="{{NAME}}">
   <div class="page">
     <header class="player-header">
-      <h1 id="title">Diretta</h1>
+      <h1 id="title"></h1>
     </header>
     <div id="stage" class="stage" data-state="loading">
       <video id="video" playsinline webkit-playsinline></video>
       <video id="waiting-video" class="waiting-video" muted loop playsinline webkit-playsinline autoplay preload="auto" aria-hidden="true" hidden></video>
       <div id="waiting" class="waiting" hidden>
         <div class="waiting-card">
-          <span id="waiting-badge" class="pulse-badge"><span class="dot" aria-hidden="true"></span><span id="waiting-badge-text">In attesa della diretta</span></span>
+          <span id="waiting-badge" class="pulse-badge"><span class="dot" aria-hidden="true"></span><span id="waiting-badge-text"></span></span>
           <h2 id="waiting-title" class="waiting-title"></h2>
           <p id="waiting-text" class="waiting-text"></p>
         </div>
       </div>
-      <div id="spinner" class="spinner" role="status" aria-label="Caricamento della diretta" hidden></div>
+      <div id="spinner" class="spinner" role="status" aria-label="Caricamento della diretta" data-i18n-aria-label="player.loading" hidden></div>
       <div class="hud">
-        <span id="live-badge" class="live-badge" hidden>LIVE</span>
-        <span id="latency" class="latency" title="Ritardo stimato rispetto al live" hidden></span>
+        <span id="live-badge" class="live-badge" data-i18n="player.live" hidden>LIVE</span>
+        <span id="latency" class="latency" title="Ritardo stimato rispetto al live" data-i18n-title="player.latencyTitle" hidden></span>
       </div>
       <div class="actions">
         <button id="play" type="button" class="pill" hidden>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><path d="M7 4.5v15l12-7.5z"/></svg>
-          <span>Riproduci</span>
+          <span data-i18n="player.play">Riproduci</span>
         </button>
         <button id="go-live" type="button" class="pill" hidden>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m13 19 7-7-7-7M5 19l7-7-7-7"/></svg>
-          <span>Vai al live</span>
+          <span data-i18n="player.goLive">Vai al live</span>
         </button>
         <button id="unmute" type="button" class="pill" hidden>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M11 5 6 9H2v6h4l5 4zM23 9l-6 6M17 9l6 6"/></svg>
-          <span>Attiva audio</span>
+          <span data-i18n="player.unmute">Attiva audio</span>
         </button>
       </div>
       <p id="sr-status" class="sr-only" aria-live="polite"></p>
     </div>
   </div>
-  <script src="/static/player.js"></script>
+  <script type="module" src="/static/player.js"></script>
 </body>
 </html>

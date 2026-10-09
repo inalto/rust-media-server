@@ -1,41 +1,43 @@
 <!doctype html>
+<!-- Texts are Italian fallbacks: data-i18n* attributes are resolved by app.js (i18n.js);
+     the server sets <html lang> from the ui_language setting. -->
 <html lang="it">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#0b0e14">
-  <title>rms · Pannello dirette</title>
+  <title data-i18n="app.docTitle">rms · Pannello dirette</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <a class="skip-link" href="#app">Vai al contenuto</a>
+  <a class="skip-link" href="#app" data-i18n="app.skip">Vai al contenuto</a>
   <header id="topbar" class="topbar" hidden>
-    <a class="brand" href="#/" aria-label="rms, elenco dirette">
+    <a class="brand" href="#/" aria-label="rms, elenco dirette" data-i18n-aria-label="nav.brandLabel">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49M7.76 16.24a6 6 0 0 1 0-8.49M19.07 4.93a10 10 0 0 1 0 14.14M4.93 19.07a10 10 0 0 1 0-14.14"/></svg>
       <span>rms</span>
     </a>
-    <nav class="nav" aria-label="Navigazione principale">
-      <a href="#/" data-nav="list">Dirette</a>
-      <a href="#/settings" data-nav="settings">Impostazioni</a>
+    <nav class="nav" aria-label="Navigazione principale" data-i18n-aria-label="nav.label">
+      <a href="#/" data-nav="list" data-i18n="nav.broadcasts">Dirette</a>
+      <a href="#/settings" data-nav="settings" data-i18n="nav.settings">Impostazioni</a>
     </nav>
     <div class="topbar-end">
-      <span id="conn" class="conn" data-state="connecting" role="status"><span class="conn-dot" aria-hidden="true"></span><span class="conn-label">Connessione…</span></span>
-      <button id="logout" type="button" class="btn ghost small" title="Esci dal pannello" aria-label="Esci">
+      <span id="conn" class="conn" data-state="connecting" role="status"><span class="conn-dot" aria-hidden="true"></span><span class="conn-label" data-i18n="conn.connecting">Connessione…</span></span>
+      <button id="logout" type="button" class="btn ghost small" title="Esci dal pannello" aria-label="Esci" data-i18n-title="logout.title" data-i18n-aria-label="logout.label">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
-        <span class="logout-label">Esci</span>
+        <span class="logout-label" data-i18n="logout.label">Esci</span>
       </button>
     </div>
   </header>
 
   <main id="app" tabindex="-1">
-    <div class="loading-page" role="status"><span class="spinner"></span>Caricamento…</div>
+    <div class="loading-page" role="status"><span class="spinner"></span><span data-i18n="common.loading">Caricamento…</span></div>
   </main>
 
   <div id="toasts" class="toasts" aria-live="polite"></div>
 
-  <noscript><p class="noscript">Per usare il pannello è necessario JavaScript.</p></noscript>
+  <noscript><p class="noscript">Per usare il pannello è necessario JavaScript. · JavaScript is required to use the dashboard.</p></noscript>
   <script type="module" src="/static/app.js"></script>
 </body>
 </html>
