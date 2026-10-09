@@ -1,0 +1,109 @@
+# rms cluster: PostgreSQL 16 + two rms nodes (same image) + HAProxy (docs/CLUSTER.md §4-§5).
+#
+#   Internet ──TLS──> Nginx Proxy Manager ──> lb:8080 ──> rms1 | rms2      (HTTP, see deploy/haproxy.cfg)
+#   OBS ──1935/tcp──> lb:1935 ──> rms1 | rms2                            (any node takes any key)
+#   Browser ──8443/udp──> rms1, ──8444/udp──> rms2                       (WebRTC, direct)
+#
+# Build the image first, then start:
+#   docker build -t rms:latest .            (podman build --format docker -t rms:latest .)
+#   (variables: export them or put them in a .env file next to this one)
+#   docker compose -f docker-compose.cluster.yml up -d     (podman-compose -f docker-compose.cluster.yml up -d)
+#
+# Required variables: RMS_ADMIN_TOKEN (identical on every node), PG_PASSWORD,
+# RMS_INTERNAL_SECRET (>= 32 characters). Optional: PUBLIC_URL, PUBLIC_IP (WebRTC host
+# candidates: the public IP of this host), RMS_IMAGE, and the published ports below
+# (standard values in the defaults; change them only to avoid conflicts, e.g. a test
+# next to a single-node rms already using 8080/1935/8443).
+#
+# Standard ports: 8080/tcp (lb, HTTP: point NPM here; keep it private), 1935/tcp (lb,
+# RTMP), 8404/tcp (lb statistics, keep it private), 8443/udp (rms1) and 8444/udp (rms2).
+
+x-rms: &rms
+  image: ${RMS_IMAGE:-rms:latest}
+  restart: unless-stopped
+  depends_on:
+    db:
+      condition: service_healthy
+  volumes:
+    - rms-data:/data          # shared by every node: recordings, waiting videos, VOD (NFS across hosts)
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+    interval: 5s
+    timeout: 3s
+    retries: 3
+    start_period: 10s
+
+x-rms-env: &rms-env
+  RMS_ADMIN_TOKEN: ${RMS_ADMIN_TOKEN:?set RMS_ADMIN_TOKEN (identical on every node)}
+  RMS_SERVER_PUBLIC_URL: ${PUBLIC_URL:-}
+  RMS_SERVER_TRUST_PROXY: "true"
+  RMS_CLUSTER_ENABLED: "true"
+  RMS_CLUSTER_DATABASE_URL: postgres://rms:${PG_PASSWORD:?set PG_PASSWORD}@db:5432/rms
+  RMS_CLUSTER_INTERNAL_BIND: 0.0.0.0:8081
+  RMS_CLUSTER_INTERNAL_SECRET: ${RMS_INTERNAL_SECRET:?set RMS_INTERNAL_SECRET (>= 32 characters)}
+  RMS_CLUSTER_HEARTBEAT_SECS: "5"
+  RMS_CLUSTER_NODE_TTL_SECS: "15"
+  RMS_WEBRTC_PUBLIC_IP: ${PUBLIC_IP:-}
+
+services:
+  db:
+    image: docker.io/library/postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: rms
+      POSTGRES_USER: rms
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?set PG_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # PostgreSQL 16 layout (18+: /var/lib/postgresql)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rms -d rms"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  rms1:
+    <<: *rms
+    hostname: rms1
+    environment:
+      <<: *rms-env
+      RMS_CLUSTER_NODE_ID: rms1
+      RMS_CLUSTER_ADVERTISE_URL: http://rms1:8081
+      RMS_WEBRTC_UDP_PORT: "8443"
+      RMS_WEBRTC_PUBLIC_PORT: ${RMS1_WEBRTC_PORT:-8443}
+    ports:
+      - "${RMS1_WEBRTC_PORT:-8443}:8443/udp"   # WebRTC: directly to this node, never via the proxy
+
+  rms2:
+    <<: *rms
+    hostname: rms2
+    environment:
+      <<: *rms-env
+      RMS_CLUSTER_NODE_ID: rms2
+      RMS_CLUSTER_ADVERTISE_URL: http://rms2:8081
+      RMS_WEBRTC_UDP_PORT: "8444"
+      RMS_WEBRTC_PUBLIC_PORT: ${RMS2_WEBRTC_PORT:-8444}
+    ports:
+      - "${RMS2_WEBRTC_PORT:-8444}:8444/udp"
+
+  lb:
+    image: docker.io/library/haproxy:2.9
+    restart: unless-stopped
+    depends_on: [rms1, rms2]
+    volumes:
+      - ./deploy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "${LB_HTTP_PORT:-8080}:8080"     # HTTP for NPM (bind to 127.0.0.1 or a private network in production)
+      - "${LB_RTMP_PORT:-1935}:1935"     # RTMP from OBS
+      - "${LB_STATS_PORT:-8404}:8404"    # HAProxy statistics (/stats): keep it private
+
+volumes:
+  rms-data: {}
+  pgdata: {}
+
+# Podman/Docker pick a free 10.x/172.x subnet for the default network; on hosts whose
+# routes already cover it (e.g. a 10.0.0.0/8 LAN: "could not find free subnet") set one:
+# networks:
+#   default:
+#     ipam:
+#       config:
+#         - subnet: 172.30.42.0/24
