@@ -291,7 +291,7 @@ impl VodConfig {
         vec![
             VodLadder {
                 name: "standard".into(),
-                description: "1080p → 360p, per desktop e mobile".into(),
+                description: "1080p to 360p (desktop and mobile)".into(),
                 renditions: vec![
                     VodRendition::new("1080p", 1080, 5000, 160),
                     VodRendition::new("720p", 720, 2800, 128),
@@ -301,7 +301,7 @@ impl VodConfig {
             },
             VodLadder {
                 name: "mobile".into(),
-                description: "720p e 360p, leggero per le reti mobili".into(),
+                description: "720p and 360p (light, mobile networks)".into(),
                 renditions: vec![
                     VodRendition::new("720p", 720, 2200, 128),
                     VodRendition::new("360p", 360, 700, 64),
@@ -309,7 +309,7 @@ impl VodConfig {
             },
             VodLadder {
                 name: "single".into(),
-                description: "Una sola qualità, alla risoluzione originale (CRF 23)".into(),
+                description: "Single quality at the source resolution (CRF 23)".into(),
                 renditions: vec![VodRendition::new("source", 0, 0, 128)],
             },
         ]

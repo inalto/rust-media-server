@@ -72,7 +72,7 @@ keep_source = true         # keep the original after transcoding (needed to re-t
 # Renditions taller than the source are skipped (never upscale); at least one is kept.
 [[vod.ladders]]
 name = "standard"
-description = "1080p → 360p, per desktop e mobile"
+description = "1080p to 360p (desktop and mobile)"
 renditions = [
   { name = "1080p", height = 1080, video_kbps = 5000, audio_kbps = 160 },
   { name = "720p",  height = 720,  video_kbps = 2800, audio_kbps = 128 },
@@ -82,7 +82,7 @@ renditions = [
 
 [[vod.ladders]]
 name = "mobile"
-description = "720p e 360p, leggero per le reti mobili"
+description = "720p and 360p (light, mobile networks)"
 renditions = [
   { name = "720p", height = 720, video_kbps = 2200, audio_kbps = 128 },
   { name = "360p", height = 360, video_kbps = 700,  audio_kbps = 64 },
@@ -90,7 +90,7 @@ renditions = [
 
 [[vod.ladders]]
 name = "single"
-description = "Una sola qualità, alla risoluzione originale (CRF 23)"
+description = "Single quality at the source resolution (CRF 23)"
 renditions = [
   { name = "source", height = 0, video_kbps = 0, audio_kbps = 128 },   # height 0 = keep source size, kbps 0 = CRF 23
 ]
