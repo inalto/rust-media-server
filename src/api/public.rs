@@ -35,6 +35,9 @@ pub struct PublicSources {
     pub ws_flv: Option<String>,
     pub hls: Option<String>,
     pub dash: Option<String>,
+    /// WHEP endpoint; `null` when WebRTC is disabled (server or broadcast), unavailable,
+    /// or the live video codec cannot be sent over WebRTC (not H.264).
+    pub whep: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,12 +54,25 @@ pub struct PublicBroadcast {
     pub enable_flv: bool,
     pub enable_hls: bool,
     pub enable_dash: bool,
+    pub enable_webrtc: bool,
+}
+
+/// WebRTC usable for `b` right now (see [`PublicSources::whep`]).
+fn whep_available(state: &AppState, b: &Broadcast) -> bool {
+    if !(b.enable_webrtc && state.webrtc.available()) {
+        return false;
+    }
+    match state.hub.get(&b.name) {
+        Some(s) => s.info().video_codec.is_none_or(|c| c == "h264"),
+        None => true,
+    }
 }
 
 pub fn public_view(state: &AppState, ctx: &ViewContext, b: &Broadcast) -> PublicBroadcast {
     let urls = PlaybackUrls::new(&ctx.base, &b.name);
     let enable_hls = b.enable_hls && state.config.hls.enabled;
     let enable_dash = b.enable_dash && state.config.dash.enabled;
+    let enable_webrtc = whep_available(state, b);
     let waiting_rel = ctx.waiting_video_path(b);
     let poster_url = waiting_rel.as_deref().and_then(|rel| {
         let poster = poster_path_for(rel);
@@ -80,10 +96,12 @@ pub fn public_view(state: &AppState, ctx: &ViewContext, b: &Broadcast) -> Public
             ws_flv: b.enable_flv.then(|| urls.ws_flv.clone()),
             hls: enable_hls.then(|| urls.hls.clone()),
             dash: enable_dash.then(|| urls.dash.clone()),
+            whep: enable_webrtc.then(|| urls.whep.clone()),
         },
         enable_flv: b.enable_flv,
         enable_hls,
         enable_dash,
+        enable_webrtc,
     }
 }
 

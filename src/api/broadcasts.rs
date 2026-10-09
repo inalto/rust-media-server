@@ -42,6 +42,7 @@ pub struct CreateBody {
     pub enable_flv: Option<bool>,
     pub enable_hls: Option<bool>,
     pub enable_dash: Option<bool>,
+    pub enable_webrtc: Option<bool>,
     pub waiting_text: Option<String>,
 }
 
@@ -55,6 +56,7 @@ pub struct PatchBody {
     pub enable_flv: Option<bool>,
     pub enable_hls: Option<bool>,
     pub enable_dash: Option<bool>,
+    pub enable_webrtc: Option<bool>,
     pub waiting_text: Option<String>,
 }
 
@@ -168,6 +170,7 @@ async fn create(
     new.enable_flv = body.enable_flv.unwrap_or(true);
     new.enable_hls = body.enable_hls.unwrap_or(true);
     new.enable_dash = body.enable_dash.unwrap_or(true);
+    new.enable_webrtc = body.enable_webrtc.unwrap_or(true);
 
     let created = repo::create(&state.db, new).await.map_err(|e| {
         if e.is_unique_violation() {
@@ -208,6 +211,7 @@ async fn update(
         enable_flv: body.enable_flv,
         enable_hls: body.enable_hls,
         enable_dash: body.enable_dash,
+        enable_webrtc: body.enable_webrtc,
         ..Default::default()
     };
     if let Some(t) = body.title {
@@ -224,6 +228,9 @@ async fn update(
     let updated = repo::update(&state.db, &name, patch)
         .await?
         .ok_or_else(ApiError::broadcast_not_found)?;
+    if !updated.enable_webrtc {
+        state.webrtc.close_broadcast(&name);
+    }
     changed(&state, &name);
     view_of(&state, &headers, updated).await
 }
@@ -239,6 +246,7 @@ async fn delete_one(
     let deleted = repo::delete(&state.db, &b.name)
         .await?
         .ok_or_else(ApiError::broadcast_not_found)?;
+    state.webrtc.close_broadcast(&b.name);
     if let Some(rel) = deleted.waiting_video.as_deref() {
         remove_waiting_file(&state, rel).await;
         remove_waiting_file(&state, &poster_path_for(rel)).await;

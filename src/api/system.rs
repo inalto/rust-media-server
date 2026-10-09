@@ -32,6 +32,7 @@ pub struct SystemInfo {
     pub http_bind: String,
     pub public_url: String,
     pub hub: HubInfo,
+    pub webrtc: crate::webrtc::WebRtcStatus,
 }
 
 async fn system(State(state): State<AppState>) -> Json<SystemInfo> {
@@ -50,5 +51,6 @@ async fn system(State(state): State<AppState>) -> Json<SystemInfo> {
         hub: HubInfo {
             live_streams: state.hub.live_count(),
         },
+        webrtc: state.webrtc.status(),
     })
 }

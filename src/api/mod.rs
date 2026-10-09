@@ -177,6 +177,8 @@ pub struct PlaybackUrls {
     pub ws_flv: String,
     pub hls: String,
     pub dash: String,
+    /// WHEP endpoint (WebRTC): `POST` an SDP offer here.
+    pub whep: String,
     pub embed: String,
     pub player: String,
 }
@@ -188,6 +190,7 @@ impl PlaybackUrls {
             ws_flv: format!("{}/ws/live/{name}.flv", base.ws),
             hls: format!("{}/hls/{name}/master.m3u8", base.http),
             dash: format!("{}/dash/{name}/manifest.mpd", base.http),
+            whep: format!("{}/whep/{name}", base.http),
             embed: format!("{}/embed/{name}", base.http),
             player: format!("{}/player/{name}", base.http),
         }
@@ -376,6 +379,8 @@ pub struct EmbedSnippets {
     pub hlsjs: String,
     pub mpegtsjs: String,
     pub dashjs: String,
+    /// Vanilla JavaScript WHEP (WebRTC) client, no library.
+    pub whep: String,
 }
 
 /// `GET /broadcasts/{name}/embed`: ready-to-paste embed code.
@@ -445,6 +450,32 @@ impl EmbedInfo {
             lib = cdn::DASH_JS,
             src = e(&urls.dash)
         );
+        let whep = format!(
+            r#"{video}
+<script>
+  (async function () {{
+    var video = document.getElementById('rms-player');
+    var endpoint = '{src}';
+    var pc = new RTCPeerConnection();
+    var stream = new MediaStream();
+    pc.addTransceiver('video', {{ direction: 'recvonly' }});
+    pc.addTransceiver('audio', {{ direction: 'recvonly' }});
+    pc.ontrack = function (e) {{ stream.addTrack(e.track); video.srcObject = stream; }};
+    var offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    var res = await fetch(endpoint, {{
+      method: 'POST', headers: {{ 'Content-Type': 'application/sdp' }}, body: pc.localDescription.sdp
+    }});
+    if (res.status !== 201) {{ console.error('WHEP error', res.status, await res.text()); pc.close(); return; }}
+    var session = new URL(res.headers.get('Location'), endpoint).href;
+    await pc.setRemoteDescription({{ type: 'answer', sdp: await res.text() }});
+    window.addEventListener('pagehide', function () {{
+      fetch(session, {{ method: 'DELETE', keepalive: true }}); pc.close();
+    }});
+  }})();
+</script>"#,
+            src = e(&urls.whep)
+        );
         Self {
             iframe,
             urls,
@@ -453,6 +484,7 @@ impl EmbedInfo {
                 hlsjs,
                 mpegtsjs,
                 dashjs,
+                whep,
             },
         }
     }
@@ -498,6 +530,7 @@ mod tests {
             urls.dash,
             "https://stream.example.com/dash/show/manifest.mpd"
         );
+        assert_eq!(urls.whep, "https://stream.example.com/whep/show");
         assert_eq!(urls.embed, "https://stream.example.com/embed/show");
         assert_eq!(urls.player, "https://stream.example.com/player/show");
         let obs = ObsSettings::new(&b, &cfg, "k");
@@ -531,5 +564,8 @@ mod tests {
         assert!(e.snippets.hlsjs.contains(&urls.hls) && e.snippets.hlsjs.contains("hls.js@1.7.3"));
         assert!(e.snippets.mpegtsjs.contains(&urls.flv));
         assert!(e.snippets.dashjs.contains(&urls.dash));
+        assert!(e.snippets.whep.contains(&urls.whep));
+        assert!(e.snippets.whep.contains("application/sdp"));
+        assert!(e.snippets.whep.contains("recvonly"));
     }
 }
