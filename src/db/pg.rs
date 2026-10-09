@@ -26,7 +26,7 @@ use super::{DbResult, PgPool};
 pub const MIGRATION_LOCK_KEY: i64 = 0x0072_6d73_5f6d_6967;
 
 /// `(version, SQL)` in order. Append new versions; never edit an applied one.
-pub const MIGRATIONS: &[(i32, &str)] = &[(1, SCHEMA_V1), (2, SCHEMA_V2)];
+pub const MIGRATIONS: &[(i32, &str)] = &[(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)];
 
 /// Latest PostgreSQL schema version.
 pub fn schema_version() -> i32 {
@@ -97,6 +97,49 @@ CREATE TABLE singleton_tasks (
 /// (`ts_epoch >= now - window`, all broadcasts): index it.
 const SCHEMA_V2: &str = r#"
 CREATE INDEX idx_samples_epoch ON viewer_samples(ts_epoch);
+"#;
+
+/// Phase 8A (docs/ACCOUNTS.md §1, SQLite schema v5): users, API keys, buckets, bucket
+/// objects and the links of `vod_items` to them (+ `output_bytes`, the encoding size
+/// counted in the quotas).
+const SCHEMA_V3: &str = r#"
+CREATE TABLE users (
+  id TEXT COLLATE "C" PRIMARY KEY, username TEXT COLLATE "C" NOT NULL UNIQUE,
+  display_name TEXT NOT NULL, email TEXT, status TEXT COLLATE "C" NOT NULL DEFAULT 'active',
+  quota_bytes BIGINT NOT NULL DEFAULT 0, max_buckets BIGINT NOT NULL DEFAULT 10,
+  default_ladder TEXT, created_at TEXT COLLATE "C" NOT NULL, updated_at TEXT COLLATE "C" NOT NULL,
+  last_login_at TEXT COLLATE "C");
+CREATE TABLE api_keys (
+  id TEXT COLLATE "C" PRIMARY KEY,
+  user_id TEXT COLLATE "C" NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL, key_prefix TEXT NOT NULL, key_hash TEXT COLLATE "C" NOT NULL UNIQUE,
+  scopes TEXT NOT NULL DEFAULT '[]', permissions TEXT NOT NULL DEFAULT '[]',
+  expires_at TEXT COLLATE "C", last_used_at TEXT COLLATE "C", revoked_at TEXT COLLATE "C",
+  created_at TEXT COLLATE "C" NOT NULL);
+CREATE INDEX idx_api_keys_user ON api_keys(user_id);
+CREATE TABLE buckets (
+  id TEXT COLLATE "C" PRIMARY KEY,
+  user_id TEXT COLLATE "C" NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT COLLATE "C" NOT NULL UNIQUE, description TEXT NOT NULL DEFAULT '', default_ladder TEXT,
+  auto_encode BOOLEAN NOT NULL DEFAULT true, public_playback BOOLEAN NOT NULL DEFAULT true,
+  signing_key TEXT NOT NULL, bytes_used BIGINT NOT NULL DEFAULT 0,
+  objects_count BIGINT NOT NULL DEFAULT 0, created_at TEXT COLLATE "C" NOT NULL,
+  updated_at TEXT COLLATE "C" NOT NULL);
+CREATE INDEX idx_buckets_user ON buckets(user_id);
+CREATE TABLE bucket_objects (
+  id TEXT COLLATE "C" PRIMARY KEY,
+  bucket_id TEXT COLLATE "C" NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
+  path TEXT COLLATE "C" NOT NULL, is_dir BOOLEAN NOT NULL DEFAULT false,
+  size BIGINT NOT NULL DEFAULT 0, content_type TEXT, sha256 TEXT,
+  created_at TEXT COLLATE "C" NOT NULL, updated_at TEXT COLLATE "C" NOT NULL,
+  UNIQUE (bucket_id, path));
+CREATE INDEX idx_objects_bucket_path ON bucket_objects(bucket_id, path);
+ALTER TABLE vod_items ADD COLUMN user_id TEXT COLLATE "C", ADD COLUMN bucket_id TEXT COLLATE "C",
+  ADD COLUMN object_id TEXT COLLATE "C", ADD COLUMN visibility TEXT COLLATE "C" NOT NULL DEFAULT 'public',
+  ADD COLUMN output_bytes BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX idx_vod_user ON vod_items(user_id);
+CREATE INDEX idx_vod_bucket ON vod_items(bucket_id);
+CREATE INDEX idx_vod_object ON vod_items(object_id);
 "#;
 
 /// Apply the pending [`MIGRATIONS`] in one transaction under

@@ -136,6 +136,10 @@ mod tests {
             "nodes",
             "live_streams",
             "singleton_tasks",
+            "users",
+            "api_keys",
+            "buckets",
+            "bucket_objects",
         ] {
             let sql = format!("SELECT COUNT(*) FROM {table}");
             assert_eq!(scalar_i64(&db, &sql).await, 0, "{table}");

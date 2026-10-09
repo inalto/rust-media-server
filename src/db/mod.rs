@@ -24,18 +24,22 @@
 //! PostgreSQL (RFC 3339 text on SQLite); `viewer_samples.ts_epoch` holds the Unix second
 //! of `ts` on both.
 
+pub mod api_keys;
 pub mod broadcasts;
+pub mod buckets;
 pub mod cache;
 pub mod cluster;
 pub mod live_streams;
 pub mod metrics;
 pub mod nodes;
+pub mod objects;
 pub mod pg;
 pub mod recordings;
 pub mod settings;
 pub mod stream_sessions;
 #[cfg(test)]
 pub(crate) mod testkit;
+pub mod users;
 pub mod vod;
 
 use std::path::Path;
@@ -265,7 +269,7 @@ impl Db {
 }
 
 /// Current schema version (stored in `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Schema v1 = ARCHITECTURE.md §7, verbatim.
 const SCHEMA_V1: &str = r#"
@@ -338,6 +342,46 @@ CREATE TABLE IF NOT EXISTS singleton_tasks (
   name TEXT PRIMARY KEY, leased_by TEXT NOT NULL DEFAULT '', leased_until TEXT NOT NULL DEFAULT '');
 "#;
 
+/// Schema v5 (phase 8A, docs/ACCOUNTS.md §1): users, API keys, buckets, the index of the
+/// bucket files and the links of an encoding to its bucket object. The foreign keys are
+/// declarative only (SQLite runs with `foreign_keys=OFF`): the repositories delete the
+/// dependent rows themselves. `vod_items.output_bytes` (size of the encoding output,
+/// counted in the quotas) is an addition to the contract.
+const SCHEMA_V5: &str = r#"
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL, email TEXT,
+  status TEXT NOT NULL DEFAULT 'active', quota_bytes INTEGER NOT NULL DEFAULT 0,
+  max_buckets INTEGER NOT NULL DEFAULT 10, default_ladder TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_login_at TEXT);
+CREATE TABLE IF NOT EXISTS api_keys (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL, key_prefix TEXT NOT NULL, key_hash TEXT UNIQUE NOT NULL,
+  scopes TEXT NOT NULL DEFAULT '[]', permissions TEXT NOT NULL DEFAULT '[]',
+  expires_at TEXT, last_used_at TEXT, revoked_at TEXT, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+CREATE TABLE IF NOT EXISTS buckets (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT UNIQUE NOT NULL, description TEXT NOT NULL DEFAULT '', default_ladder TEXT,
+  auto_encode INTEGER NOT NULL DEFAULT 1, public_playback INTEGER NOT NULL DEFAULT 1,
+  signing_key TEXT NOT NULL, bytes_used INTEGER NOT NULL DEFAULT 0,
+  objects_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_buckets_user ON buckets(user_id);
+CREATE TABLE IF NOT EXISTS bucket_objects (
+  id TEXT PRIMARY KEY, bucket_id TEXT NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
+  path TEXT NOT NULL, is_dir INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0,
+  content_type TEXT, sha256 TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE (bucket_id, path));
+CREATE INDEX IF NOT EXISTS idx_objects_bucket_path ON bucket_objects(bucket_id, path);
+ALTER TABLE vod_items ADD COLUMN user_id TEXT;
+ALTER TABLE vod_items ADD COLUMN bucket_id TEXT;
+ALTER TABLE vod_items ADD COLUMN object_id TEXT;
+ALTER TABLE vod_items ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public';
+ALTER TABLE vod_items ADD COLUMN output_bytes INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_vod_user ON vod_items(user_id);
+CREATE INDEX IF NOT EXISTS idx_vod_bucket ON vod_items(bucket_id);
+CREATE INDEX IF NOT EXISTS idx_vod_object ON vod_items(object_id);
+"#;
+
 /// Apply pending migrations. Later schema changes append a new `if version < N` block
 /// and bump [`SCHEMA_VERSION`] (and add the same change to [`pg::MIGRATIONS`]).
 pub fn migrate(conn: &mut Connection) -> DbResult<()> {
@@ -369,6 +413,13 @@ pub fn migrate(conn: &mut Connection) -> DbResult<()> {
         tx.execute_batch("PRAGMA user_version = 4")?;
         tx.commit()?;
         tracing::info!("database schema migrated to version 4");
+    }
+    if version < 5 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V5)?;
+        tx.execute_batch("PRAGMA user_version = 5")?;
+        tx.commit()?;
+        tracing::info!("database schema migrated to version 5");
     }
     Ok(())
 }
@@ -419,6 +470,10 @@ mod tests {
             "nodes",
             "live_streams",
             "singleton_tasks",
+            "users",
+            "api_keys",
+            "buckets",
+            "bucket_objects",
         ] {
             assert!(tables.iter().any(|x| x == t), "missing table {t}");
         }
@@ -469,7 +524,37 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_v4_to_v5_links_existing_vod_items_to_the_admin_library() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 4").unwrap();
+        conn.execute(
+            "INSERT INTO vod_items (id, title, source_path, status, ladder, created_at, updated_at) \
+             VALUES ('v', 'V', 'v/source.mp4', 'ready', 'standard', 'x', 'x')",
+            [],
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        let (user, bucket, visibility, out): (Option<String>, Option<String>, String, i64) = conn
+            .query_row(
+                "SELECT user_id, bucket_id, visibility, output_bytes FROM vod_items WHERE id = 'v'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((user, bucket), (None, None), "admin library");
+        assert_eq!((visibility.as_str(), out), ("public", 0));
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
+        migrate(&mut conn).unwrap();
     }
 
     #[test]

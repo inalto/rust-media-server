@@ -32,6 +32,13 @@ pub const STATUSES: [&str; 4] = [
 /// `vod_items.origin` values.
 pub const ORIGIN_UPLOAD: &str = "upload";
 pub const ORIGIN_INBOX: &str = "inbox";
+/// Encoding of a file of a user's bucket (phase 8A): `source_path` is the object path.
+pub const ORIGIN_STORAGE: &str = "storage";
+
+/// `vod_items.visibility` values: a private item needs a signed URL (phase 8A).
+pub const VISIBILITY_PUBLIC: &str = "public";
+pub const VISIBILITY_PRIVATE: &str = "private";
+pub const VISIBILITIES: [&str; 2] = [VISIBILITY_PUBLIC, VISIBILITY_PRIVATE];
 
 /// One rendition produced by a transcode (stored as JSON in `renditions_json`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -53,7 +60,8 @@ pub struct VodItem {
     pub id: String,
     pub title: String,
     pub description: String,
-    /// Source file, relative to `data/vod/` (`<id>/source.<ext>`).
+    /// Source file, relative to `data/vod/` (`<id>/source.<ext>`); for an encoding of a
+    /// bucket file (`bucket_id` set) the object path inside the bucket (`/videos/a.mp4`).
     pub source_path: String,
     /// Original file name (download name).
     pub source_name: String,
@@ -75,6 +83,16 @@ pub struct VodItem {
     pub updated_at: DateTime<Utc>,
     pub ready_at: Option<DateTime<Utc>>,
     pub plays: u64,
+    /// Owner (phase 8A); `None` = admin library.
+    pub user_id: Option<String>,
+    /// Bucket of the original file (encodings of bucket files).
+    pub bucket_id: Option<String>,
+    /// `bucket_objects.id` of the original file.
+    pub object_id: Option<String>,
+    /// `public` | `private` (signed URLs needed for playback).
+    pub visibility: String,
+    /// Size of the encoding output (renditions + poster), counted in the quotas.
+    pub output_bytes: u64,
 }
 
 impl VodItem {
@@ -102,17 +120,28 @@ impl VodItem {
             updated_at: now,
             ready_at: None,
             plays: 0,
+            user_id: None,
+            bucket_id: None,
+            object_id: None,
+            visibility: VISIBILITY_PUBLIC.into(),
+            output_bytes: 0,
         }
     }
 
     pub fn is_ready(&self) -> bool {
         self.status == STATUS_READY
     }
+
+    /// Playback needs a signed URL.
+    pub fn is_private(&self) -> bool {
+        self.visibility == VISIBILITY_PRIVATE
+    }
 }
 
 const COLUMNS: &str = "id, title, description, source_path, source_name, source_size, \
      source_duration_secs, source_width, source_height, source_codec, origin, status, progress, \
-     ladder, renditions_json, error, created_at, updated_at, ready_at, plays";
+     ladder, renditions_json, error, created_at, updated_at, ready_at, plays, user_id, bucket_id, \
+     object_id, visibility, output_bytes";
 
 fn from_row(r: &Row<'_>) -> rusqlite::Result<VodItem> {
     let renditions: String = r.get(14)?;
@@ -142,6 +171,11 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<VodItem> {
         updated_at: parse_ts(&r.get::<_, String>(17)?),
         ready_at: r.get::<_, Option<String>>(18)?.map(|s| parse_ts(&s)),
         plays: r.get::<_, i64>(19)?.max(0) as u64,
+        user_id: r.get(20)?,
+        bucket_id: r.get(21)?,
+        object_id: r.get(22)?,
+        visibility: r.get(23)?,
+        output_bytes: r.get::<_, i64>(24)?.max(0) as u64,
     })
 }
 
@@ -170,7 +204,7 @@ pub async fn insert(db: &Db, item: &VodItem) -> DbResult<()> {
     if let Some(pool) = db.pg() {
         q_dyn(format!(
             "INSERT INTO vod_items ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-             $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)"
+             $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)"
         ))
         .bind(it.id)
         .bind(it.title)
@@ -192,6 +226,11 @@ pub async fn insert(db: &Db, item: &VodItem) -> DbResult<()> {
         .bind(fmt_ts(&it.updated_at))
         .bind(it.ready_at.as_ref().map(fmt_ts))
         .bind(i64_of(it.plays))
+        .bind(it.user_id)
+        .bind(it.bucket_id)
+        .bind(it.object_id)
+        .bind(it.visibility)
+        .bind(i64_of(it.output_bytes))
         .execute(pool)
         .await?;
         return Ok(());
@@ -200,7 +239,7 @@ pub async fn insert(db: &Db, item: &VodItem) -> DbResult<()> {
         c.execute(
             &format!(
                 "INSERT INTO vod_items ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
-                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
+                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
             ),
             params![
                 it.id,
@@ -223,6 +262,11 @@ pub async fn insert(db: &Db, item: &VodItem) -> DbResult<()> {
                 fmt_ts(&it.updated_at),
                 it.ready_at.as_ref().map(fmt_ts),
                 i64_of(it.plays),
+                it.user_id,
+                it.bucket_id,
+                it.object_id,
+                it.visibility,
+                i64_of(it.output_bytes),
             ],
         )?;
         Ok(())
@@ -576,7 +620,7 @@ pub async fn requeue(db: &Db, id: &str, ladder: &str) -> DbResult<Option<VodItem
         let n = q(
             "UPDATE vod_items SET status = 'queued', progress = 0, ladder = $2, \
                    renditions_json = '[]', error = NULL, ready_at = NULL, updated_at = $3, \
-                   claimed_by = NULL, lease_until = NULL, attempts = 0 \
+                   claimed_by = NULL, lease_until = NULL, attempts = 0, output_bytes = 0 \
                    WHERE id = $1 AND status != 'processing'",
         )
         .bind(id.clone())
@@ -594,7 +638,7 @@ pub async fn requeue(db: &Db, id: &str, ladder: &str) -> DbResult<Option<VodItem
         let n = c.execute(
             "UPDATE vod_items SET status = 'queued', progress = 0, ladder = ?2, renditions_json = '[]', \
              error = NULL, ready_at = NULL, updated_at = ?3, claimed_by = NULL, lease_until = NULL, \
-             attempts = 0 WHERE id = ?1 AND status != 'processing'",
+             attempts = 0, output_bytes = 0 WHERE id = ?1 AND status != 'processing'",
             params![id, ladder, now_ts()],
         )?;
         if n == 0 {
@@ -841,7 +885,223 @@ fn pg_row(r: &PgRow) -> DbResult<VodItem> {
         updated_at: parse_ts(&r.try_get::<String, _>(17)?),
         ready_at: r.try_get::<Option<String>, _>(18)?.map(|s| parse_ts(&s)),
         plays: get_u64(r, 19)?,
+        user_id: r.try_get(20)?,
+        bucket_id: r.try_get(21)?,
+        object_id: r.try_get(22)?,
+        visibility: r.try_get(23)?,
+        output_bytes: get_u64(r, 24)?,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Encodings of bucket files (phase 8A)
+// ---------------------------------------------------------------------------
+
+/// Rows matching `column = value`, newest first.
+async fn list_where(db: &Db, column: &'static str, value: &str) -> DbResult<Vec<VodItem>> {
+    let value = value.to_string();
+    if let Some(pool) = db.pg() {
+        return q_dyn(format!(
+            "SELECT {COLUMNS} FROM vod_items WHERE {column} = $1 ORDER BY created_at DESC, id"
+        ))
+        .bind(value)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(pg_row)
+        .collect();
+    }
+    db.call(move |c| {
+        let mut st = c.prepare(&format!(
+            "SELECT {COLUMNS} FROM vod_items WHERE {column} = ?1 ORDER BY created_at DESC, id"
+        ))?;
+        let rows = st
+            .query_map([value], from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+/// Encodings of a user, newest first.
+pub async fn list_for_user(db: &Db, user_id: &str) -> DbResult<Vec<VodItem>> {
+    list_where(db, "user_id", user_id).await
+}
+
+/// Encodings of the files of a bucket, newest first.
+pub async fn list_by_bucket(db: &Db, bucket_id: &str) -> DbResult<Vec<VodItem>> {
+    list_where(db, "bucket_id", bucket_id).await
+}
+
+/// The encoding of a bucket object (the most recent one if there were several).
+pub async fn find_by_object(db: &Db, object_id: &str) -> DbResult<Option<VodItem>> {
+    Ok(list_where(db, "object_id", object_id)
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// Encodings of the given bucket objects (directory listings).
+pub async fn list_by_objects(db: &Db, object_ids: &[String]) -> DbResult<Vec<VodItem>> {
+    if object_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = object_ids.to_vec();
+    if let Some(pool) = db.pg() {
+        return q_dyn(format!(
+            "SELECT {COLUMNS} FROM vod_items WHERE object_id = ANY($1) ORDER BY created_at DESC, id"
+        ))
+        .bind(ids)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(pg_row)
+        .collect();
+    }
+    db.call(move |c| {
+        let mut out = Vec::new();
+        // Bounded statements (SQLite's variable limit).
+        for chunk in ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(", ");
+            let mut st = c.prepare(&format!(
+                "SELECT {COLUMNS} FROM vod_items WHERE object_id IN ({marks}) ORDER BY created_at DESC, id"
+            ))?;
+            let rows = st
+                .query_map(rusqlite::params_from_iter(chunk.iter()), from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            out.extend(rows);
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Store the measured size of the encoding output.
+pub async fn set_output_bytes(db: &Db, id: &str, bytes: u64) -> DbResult<bool> {
+    let id = id.to_string();
+    if let Some(pool) = db.pg() {
+        let n = q("UPDATE vod_items SET output_bytes = $2 WHERE id = $1")
+            .bind(id)
+            .bind(i64_of(bytes))
+            .execute(pool)
+            .await?
+            .rows_affected();
+        return Ok(n == 1);
+    }
+    db.call(move |c| {
+        Ok(c.execute(
+            "UPDATE vod_items SET output_bytes = ?2 WHERE id = ?1",
+            params![id, i64_of(bytes)],
+        )? == 1)
+    })
+    .await
+}
+
+/// Change the visibility. Returns the row, `None` when it does not exist.
+pub async fn set_visibility(db: &Db, id: &str, visibility: &str) -> DbResult<Option<VodItem>> {
+    let (id, visibility) = (id.to_string(), visibility.to_string());
+    if let Some(pool) = db.pg() {
+        return q_dyn(format!(
+            "UPDATE vod_items SET visibility = $2, updated_at = $3 WHERE id = $1 RETURNING {COLUMNS}"
+        ))
+        .bind(id)
+        .bind(visibility)
+        .bind(now_ts())
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(pg_row)
+        .transpose();
+    }
+    db.call(move |c| {
+        Ok(c.query_row(
+            &format!(
+                "UPDATE vod_items SET visibility = ?2, updated_at = ?3 WHERE id = ?1 RETURNING {COLUMNS}"
+            ),
+            params![id, visibility, now_ts()],
+            from_row,
+        )
+        .optional()?)
+    })
+    .await
+}
+
+/// Re-queue an item in **any** status (overwrite of a bucket file, `?action=encode`):
+/// like [`requeue`] but a `processing` row is taken away from its job too (the job loses
+/// its claim: it cancels itself at the next lease renewal and its result is discarded).
+/// `source_size` updates the size of the new original. Returns the row.
+pub async fn requeue_any(
+    db: &Db,
+    id: &str,
+    ladder: &str,
+    source_size: Option<u64>,
+) -> DbResult<Option<VodItem>> {
+    let (id, ladder) = (id.to_string(), ladder.to_string());
+    let size = source_size.map(i64_of);
+    if let Some(pool) = db.pg() {
+        return q_dyn(format!(
+            "UPDATE vod_items SET status = 'queued', progress = 0, ladder = $2, \
+             renditions_json = '[]', error = NULL, ready_at = NULL, updated_at = $3, \
+             claimed_by = NULL, lease_until = NULL, attempts = 0, output_bytes = 0, \
+             source_size = COALESCE($4, source_size), source_duration_secs = CASE WHEN $4 IS NULL \
+             THEN source_duration_secs ELSE NULL END WHERE id = $1 RETURNING {COLUMNS}"
+        ))
+        .bind(id)
+        .bind(ladder)
+        .bind(now_ts())
+        .bind(size)
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(pg_row)
+        .transpose();
+    }
+    db.call(move |c| {
+        Ok(c.query_row(
+            &format!(
+                "UPDATE vod_items SET status = 'queued', progress = 0, ladder = ?2, \
+                 renditions_json = '[]', error = NULL, ready_at = NULL, updated_at = ?3, \
+                 claimed_by = NULL, lease_until = NULL, attempts = 0, output_bytes = 0, \
+                 source_size = COALESCE(?4, source_size), source_duration_secs = CASE WHEN ?4 IS NULL \
+                 THEN source_duration_secs ELSE NULL END WHERE id = ?1 RETURNING {COLUMNS}"
+            ),
+            params![id, ladder, now_ts(), size],
+            from_row,
+        )
+        .optional()?)
+    })
+    .await
+}
+
+/// What `/vod/{id}/*` needs to authorize a request: the visibility and, for an encoding
+/// of a bucket file, the bucket's signing key. `None` for an unknown id.
+pub async fn playback_access(db: &Db, id: &str) -> DbResult<Option<(String, Option<String>)>> {
+    let id = id.to_string();
+    let sql_pg = "SELECT v.visibility, b.signing_key FROM vod_items v \
+                  LEFT JOIN buckets b ON b.id = v.bucket_id WHERE v.id = $1";
+    if let Some(pool) = db.pg() {
+        return q(sql_pg)
+            .bind(id)
+            .fetch_optional(pool)
+            .await?
+            .map(|r| {
+                Ok((
+                    r.try_get::<String, _>(0)?,
+                    r.try_get::<Option<String>, _>(1)?,
+                ))
+            })
+            .transpose();
+    }
+    db.call(move |c| {
+        Ok(c.query_row(
+            "SELECT v.visibility, b.signing_key FROM vod_items v \
+             LEFT JOIN buckets b ON b.id = v.bucket_id WHERE v.id = ?1",
+            [id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1083,4 +1343,106 @@ mod tests {
         assert_eq!(get(&db, "b").await.unwrap().unwrap().status, STATUS_READY);
     }
     crate::db::testkit::dual_db_test!(leases, leases_body);
+
+    /// Phase 8A: encodings linked to bucket objects, visibility, output size, forced
+    /// re-queue, playback access with the bucket signing key.
+    async fn storage_links_body(db: Db) {
+        let user = crate::db::users::User::new("alice", "Alice");
+        crate::db::users::insert(&db, &user).await.unwrap();
+        let bucket = crate::db::buckets::Bucket::new(&user.id, "media");
+        crate::db::buckets::insert(&db, &bucket).await.unwrap();
+        let mut a = item("a", "2026-10-09T10:00:00.000Z");
+        a.user_id = Some(user.id.clone());
+        a.bucket_id = Some(bucket.id.clone());
+        a.object_id = Some("o1".into());
+        a.visibility = VISIBILITY_PRIVATE.into();
+        a.origin = ORIGIN_STORAGE.into();
+        a.source_path = "/videos/a.mp4".into();
+        let b = item("b", "2026-10-09T11:00:00.000Z");
+        insert(&db, &a).await.unwrap();
+        insert(&db, &b).await.unwrap();
+        assert_eq!(get(&db, "a").await.unwrap().unwrap(), a);
+        assert!(a.is_private() && !b.is_private());
+        assert_eq!(b.visibility, VISIBILITY_PUBLIC);
+
+        let ids = |v: Vec<VodItem>| v.into_iter().map(|i| i.id).collect::<Vec<_>>();
+        assert_eq!(ids(list_for_user(&db, &user.id).await.unwrap()), ["a"]);
+        assert_eq!(ids(list_by_bucket(&db, &bucket.id).await.unwrap()), ["a"]);
+        assert_eq!(find_by_object(&db, "o1").await.unwrap().unwrap().id, "a");
+        assert!(find_by_object(&db, "o2").await.unwrap().is_none());
+        assert_eq!(
+            ids(list_by_objects(&db, &["o1".into(), "zz".into()])
+                .await
+                .unwrap()),
+            ["a"]
+        );
+        assert!(list_by_objects(&db, &[]).await.unwrap().is_empty());
+
+        assert!(set_output_bytes(&db, "a", 4242).await.unwrap());
+        assert_eq!(get(&db, "a").await.unwrap().unwrap().output_bytes, 4242);
+        assert_eq!(
+            crate::db::users::usage(&db, &user.id)
+                .await
+                .unwrap()
+                .encodings_bytes,
+            4242
+        );
+
+        assert_eq!(
+            playback_access(&db, "a").await.unwrap(),
+            Some((
+                VISIBILITY_PRIVATE.to_string(),
+                Some(bucket.signing_key.clone())
+            ))
+        );
+        assert_eq!(
+            playback_access(&db, "b").await.unwrap(),
+            Some((VISIBILITY_PUBLIC.to_string(), None))
+        );
+        assert_eq!(playback_access(&db, "zz").await.unwrap(), None);
+        let v = set_visibility(&db, "a", VISIBILITY_PUBLIC)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!v.is_private());
+        assert!(
+            set_visibility(&db, "zz", VISIBILITY_PUBLIC)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Forced re-queue works while processing and drops the claim.
+        assert!(claim(&db, "a").await.unwrap());
+        let r = requeue_any(&db, "a", "mobile", Some(99))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                r.status.as_str(),
+                r.ladder.as_str(),
+                r.source_size,
+                r.output_bytes
+            ),
+            (STATUS_QUEUED, "mobile", 99, 0)
+        );
+        assert!(
+            !set_progress(&db, "a", 50).await.unwrap(),
+            "old job lost its claim"
+        );
+        assert!(!mark_ready(&db, "a", &[]).await.unwrap());
+        let r = requeue_any(&db, "a", "standard", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.source_size, 99);
+        assert!(
+            requeue_any(&db, "zz", "standard", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    crate::db::testkit::dual_db_test!(storage_links, storage_links_body);
 }
