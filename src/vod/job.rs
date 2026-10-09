@@ -147,7 +147,7 @@ async fn keep_lease(
 /// Claim the oldest `queued` item not already running here.
 async fn next(mgr: &VodManager) -> Result<Option<String>, crate::db::DbError> {
     for id in repo::queued_ids(mgr.db(), 16).await? {
-        if mgr.is_running(&id) {
+        if mgr.is_running(&id) || mgr.is_held(&id) {
             continue;
         }
         if repo::claim(mgr.db(), &id).await? {
@@ -346,7 +346,21 @@ async fn process(mgr: &VodManager, id: &str, cancel: &CancellationToken) -> Resu
         }
         Err(e) => return Err(format!("database: {e}").into()),
     }
-    if !mgr.config.vod.keep_source {
+    // Size of the output (renditions + poster): counted in the owner's quota.
+    let measured = item_dir.clone();
+    let bytes = tokio::task::spawn_blocking(move || super::dir_size(&measured))
+        .await
+        .unwrap_or(0);
+    if let Err(e) = repo::set_output_bytes(db, id, bytes).await {
+        tracing::warn!(id = %id, error = %e, "cannot store the output size");
+    }
+    if let Some(bucket) = &item.bucket_id
+        && let Err(e) = crate::db::buckets::recount(db, bucket).await
+    {
+        tracing::warn!(id = %id, error = %e, "cannot recount the bucket usage");
+    }
+    // The original of a bucket file belongs to the bucket: never removed here.
+    if !mgr.config.vod.keep_source && item.bucket_id.is_none() {
         match tokio::fs::remove_file(&source).await {
             Ok(()) => tracing::info!(id = %id, "source removed (vod.keep_source = false)"),
             Err(e) => tracing::warn!(id = %id, error = %e, "cannot remove the source"),
