@@ -12,6 +12,7 @@ pub mod metrics;
 pub mod recordings;
 pub mod settings;
 pub mod stream_sessions;
+pub mod vod;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -98,7 +99,7 @@ impl Db {
 }
 
 /// Current schema version (stored in `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Schema v1 = ARCHITECTURE.md §7, verbatim.
 const SCHEMA_V1: &str = r#"
@@ -131,6 +132,19 @@ CREATE INDEX IF NOT EXISTS idx_vsessions ON viewer_sessions(broadcast_id, starte
 const SCHEMA_V2: &str =
     "ALTER TABLE broadcasts ADD COLUMN enable_webrtc INTEGER NOT NULL DEFAULT 1;";
 
+/// Schema v3: video on demand items (phase 7B, see `db::vod`).
+const SCHEMA_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS vod_items (
+  id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+  source_path TEXT NOT NULL, source_name TEXT NOT NULL DEFAULT '', source_size INTEGER NOT NULL DEFAULT 0,
+  source_duration_secs REAL, source_width INTEGER, source_height INTEGER, source_codec TEXT,
+  origin TEXT NOT NULL DEFAULT 'upload',
+  status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, ladder TEXT NOT NULL,
+  renditions_json TEXT NOT NULL DEFAULT '[]', error TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, ready_at TEXT, plays INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_vod_status ON vod_items(status, created_at);
+"#;
+
 /// Apply pending migrations. Later schema changes append a new `if version < N` block
 /// and bump [`SCHEMA_VERSION`].
 pub fn migrate(conn: &mut Connection) -> DbResult<()> {
@@ -148,6 +162,13 @@ pub fn migrate(conn: &mut Connection) -> DbResult<()> {
         tx.execute_batch("PRAGMA user_version = 2")?;
         tx.commit()?;
         tracing::info!("database schema migrated to version 2");
+    }
+    if version < 3 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V3)?;
+        tx.execute_batch("PRAGMA user_version = 3")?;
+        tx.commit()?;
+        tracing::info!("database schema migrated to version 3");
     }
     Ok(())
 }
@@ -194,6 +215,7 @@ mod tests {
             "stream_sessions",
             "viewer_samples",
             "viewer_sessions",
+            "vod_items",
         ] {
             assert!(tables.iter().any(|x| x == t), "missing table {t}");
         }
