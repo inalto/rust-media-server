@@ -59,6 +59,8 @@ pub struct WebRtcStatus {
     /// The UDP port is bound and WHEP offers are accepted.
     pub available: bool,
     pub udp_port: u16,
+    /// Port advertised in the candidates (`webrtc.public_port`, or `udp_port` when 0).
+    pub public_port: u16,
     pub public_ip: Vec<String>,
     /// Host candidates advertised to viewers (`ip:port`).
     pub candidates: Vec<String>,
@@ -182,6 +184,7 @@ impl WebRtcManager {
             enabled: self.cfg().enabled,
             available: self.available(),
             udp_port: self.cfg().udp_port,
+            public_port: self.cfg().advertised_port(),
             public_ip: self.cfg().public_ip.clone(),
             candidates: running
                 .map(|r| r.candidates.iter().map(|a| a.to_string()).collect())
@@ -529,9 +532,12 @@ impl WebRtcManager {
 }
 
 /// Host candidate addresses: `webrtc.public_ip` when set, otherwise the IPv4 addresses
-/// of the local interfaces (the default-route address first), else loopback.
+/// of the local interfaces (the default-route address first), else loopback; with the
+/// advertised port (`webrtc.public_port`, else the bound `udp_port`). Inbound datagrams
+/// are tagged with the first of these addresses, so the ICE agent matches them against
+/// the advertised candidate even when NAT maps another port to `udp_port`.
 pub fn advertised_addrs(cfg: &WebRtcConfig) -> Vec<SocketAddr> {
-    let port = cfg.udp_port;
+    let port = cfg.advertised_port();
     let mut ips: Vec<IpAddr> = cfg
         .public_ip
         .iter()
@@ -633,6 +639,13 @@ mod tests {
         let local = advertised_addrs(&cfg);
         assert!(!local.is_empty());
         assert!(local.iter().all(|a| a.port() == 18443 && a.is_ipv4()));
+        // NAT port mapping: the advertised port differs from the bound one.
+        cfg.public_ip = vec!["203.0.113.7".into()];
+        cfg.public_port = 8444;
+        assert_eq!(
+            advertised_addrs(&cfg),
+            vec!["203.0.113.7:8444".parse::<SocketAddr>().unwrap()]
+        );
     }
 
     #[test]

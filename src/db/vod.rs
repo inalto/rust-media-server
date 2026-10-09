@@ -656,31 +656,36 @@ pub async fn requeue_interrupted(db: &Db) -> DbResult<usize> {
 
 /// Periodic (every node): jobs of **other** nodes whose lease expired (node dead or cut
 /// off from the database) go back to `queued` (or `failed` after [`MAX_ATTEMPTS`]).
-pub async fn requeue_expired(db: &Db) -> DbResult<usize> {
+/// Returns the ids changed.
+pub async fn requeue_expired(db: &Db) -> DbResult<Vec<String>> {
     let node = db.node_id().to_string();
     if let Some(pool) = db.pg() {
-        let n = q_dyn(format!(
+        return q_dyn(format!(
             "UPDATE vod_items SET {REQUEUE_SET_PG} WHERE status = 'processing' AND \
-             lease_until < now() AND claimed_by IS DISTINCT FROM $2"
+             lease_until < now() AND claimed_by IS DISTINCT FROM $2 RETURNING id"
         ))
         .bind(now_ts())
         .bind(node)
         .bind(MAX_ATTEMPTS as i32)
         .bind(TOO_MANY_ATTEMPTS)
-        .execute(pool)
+        .fetch_all(pool)
         .await?
-        .rows_affected();
-        return Ok(n as usize);
+        .iter()
+        .map(|r| Ok(r.try_get::<String, _>(0)?))
+        .collect();
     }
     db.call(move |c| {
         let now = now_ts();
-        Ok(c.execute(
-            &format!(
-                "UPDATE vod_items SET {REQUEUE_SET_SQLITE} WHERE status = 'processing' AND \
-                 lease_until < ?1 AND (claimed_by IS NULL OR claimed_by != ?2)"
-            ),
-            params![now, node, MAX_ATTEMPTS, TOO_MANY_ATTEMPTS],
-        )?)
+        let mut st = c.prepare(&format!(
+            "UPDATE vod_items SET {REQUEUE_SET_SQLITE} WHERE status = 'processing' AND \
+             lease_until < ?1 AND (claimed_by IS NULL OR claimed_by != ?2) RETURNING id"
+        ))?;
+        let ids = st
+            .query_map(params![now, node, MAX_ATTEMPTS, TOO_MANY_ATTEMPTS], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
     })
     .await
 }
@@ -1021,7 +1026,7 @@ mod tests {
         assert!(!set_progress(&n2, "a", 20).await.unwrap());
         // A valid lease of another node survives this node's startup and sweeps.
         assert_eq!(requeue_interrupted(&n2).await.unwrap(), 0);
-        assert_eq!(requeue_expired(&n2).await.unwrap(), 0);
+        assert!(requeue_expired(&n2).await.unwrap().is_empty());
         assert!(!mark_ready(&n2, "a", &[]).await.unwrap(), "only the holder");
         assert!(
             !mark_failed(&n2, "a", "x").await.unwrap(),
@@ -1052,12 +1057,11 @@ mod tests {
             "UPDATE vod_items SET lease_until = '2000-01-01T00:00:00.000Z' WHERE id = 'a'"
         };
         crate::db::testkit::execute(&db, expire).await;
-        assert_eq!(
-            requeue_expired(&n2).await.unwrap(),
-            0,
+        assert!(
+            requeue_expired(&n2).await.unwrap().is_empty(),
             "own rows: startup only"
         );
-        assert_eq!(requeue_expired(&n1).await.unwrap(), 1);
+        assert_eq!(requeue_expired(&n1).await.unwrap(), ["a"]);
         assert!(claim(&n1, "a").await.unwrap());
         assert_eq!(attempts(&db, "a").await, 3);
         // Graceful shutdown does not count as an attempt.

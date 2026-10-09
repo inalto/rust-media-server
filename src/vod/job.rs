@@ -3,12 +3,17 @@
 //! The runner wakes up when an item is queued (or a job ends, or every 15 s for items
 //! queued by another instance sharing the database), takes the oldest `queued` items
 //! while a slot of `vod.max_parallel_jobs` is free and claims each one atomically
-//! (`UPDATE … SET status='processing' WHERE id=? AND status='queued'`, one row or
-//! nothing). A job: probe → renditions → poster → one ffmpeg pass with progress (≥ 1 %
-//! steps, at most every 0.5 s) → playlist/MPD post-processing → swap
-//! `abr.tmp/` into `abr/` → `ready`. Failures keep the source and set `failed` with the
-//! error (tail of ffmpeg's stderr); a re-transcode re-queues the item. A forced delete
-//! cancels the job (ffmpeg killed); on shutdown the item goes back to `queued`.
+//! (`UPDATE … SET status='processing', claimed_by=<node>, lease_until=now+60 s,
+//! attempts=attempts+1 WHERE id=? AND status='queued'`, one row or nothing). A job:
+//! probe → renditions → poster → one ffmpeg pass with progress (≥ 1 % steps, at most
+//! every 0.5 s) → playlist/MPD post-processing → swap `abr.tmp/` into `abr/` → `ready`
+//! (only while this node still holds the claim). The lease is renewed every 15 s while
+//! the job runs; when it is lost (another node re-queued the item after the lease
+//! expired) the job is cancelled and its result discarded. Every 15 s the runner also
+//! re-queues the jobs of other nodes whose lease expired (`db::vod::requeue_expired`).
+//! Failures keep the source and set `failed` with the error (tail of ffmpeg's stderr);
+//! a re-transcode re-queues the item. A forced delete cancels the job (ffmpeg killed);
+//! on shutdown the item goes back to `queued`.
 
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -49,6 +54,8 @@ pub async fn runner(mgr: Arc<VodManager>, shutdown: CancellationToken) {
         slots = mgr.config.vod.max_parallel_jobs,
         "started"
     );
+    let mut sweep = tokio::time::interval(POLL);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         while let Ok(permit) = Arc::clone(&slots).try_acquire_owned() {
             let id = match next(&mgr).await {
@@ -77,10 +84,56 @@ pub async fn runner(mgr: Arc<VodManager>, shutdown: CancellationToken) {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = mgr.wake.notified() => {}
-            _ = tokio::time::sleep(POLL) => {}
+            _ = sweep.tick() => requeue_expired(&mgr).await,
         }
     }
     tracing::info!(task = "vod-runner", "stopped");
+}
+
+/// Re-queue the jobs of other nodes whose lease expired (dead node).
+async fn requeue_expired(mgr: &VodManager) {
+    match repo::requeue_expired(mgr.db()).await {
+        Ok(ids) => {
+            for id in ids {
+                tracing::warn!(id = %id, "VOD job of another node lost its lease; re-queued");
+                mgr.changed(&id);
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "cannot re-queue expired VOD jobs"),
+    }
+}
+
+/// Renew the job lease every `LEASE_RENEW_SECS` until the job ends. When the lease is
+/// lost (the row is no longer `processing` for this node) it fires `lost` and cancels
+/// the job. Never returns (dropped when the job ends).
+async fn keep_lease(
+    mgr: &VodManager,
+    id: &str,
+    cancel: &CancellationToken,
+    lost: &CancellationToken,
+) -> std::convert::Infallible {
+    let mut tick = tokio::time::interval(Duration::from_secs(repo::LEASE_RENEW_SECS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await; // the claim just set the lease
+    loop {
+        tick.tick().await;
+        if cancel.is_cancelled() {
+            continue;
+        }
+        match repo::renew_lease(mgr.db(), id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // Deleted (the delete handler cancels the job) or taken over by another
+                // node after the lease expired: stop working on it.
+                if repo::get(mgr.db(), id).await.ok().flatten().is_some() {
+                    tracing::warn!(id = %id, "VOD job lost its lease; cancelling");
+                    lost.cancel();
+                }
+                cancel.cancel();
+            }
+            Err(e) => tracing::warn!(id = %id, error = %e, "cannot renew the VOD job lease"),
+        }
+    }
 }
 
 /// Claim the oldest `queued` item not already running here.
@@ -111,9 +164,19 @@ impl From<String> for JobError {
 pub async fn run(mgr: &VodManager, id: &str, cancel: &CancellationToken) {
     let started = Instant::now();
     tracing::info!(id = %id, "VOD transcode started");
-    match process(mgr, id, cancel).await {
+    let lost = CancellationToken::new();
+    let outcome = tokio::select! {
+        r = process(mgr, id, cancel) => r,
+        never = keep_lease(mgr, id, cancel, &lost) => match never {},
+    };
+    match outcome {
         Ok(()) => {
             tracing::info!(id = %id, secs = format!("{:.1}", started.elapsed().as_secs_f64()), "VOD transcode finished");
+        }
+        Err(JobError::Cancelled) if lost.is_cancelled() => {
+            // Another node owns the item now: leave its files and its row alone.
+            tracing::warn!(id = %id, "VOD transcode abandoned (lease lost); result discarded");
+            mgr.changed(id);
         }
         Err(JobError::Cancelled) => {
             let _ = tokio::fs::remove_dir_all(mgr.item_dir(id).join("abr.tmp")).await;

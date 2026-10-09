@@ -7,8 +7,9 @@
 //!   query gets exactly one sample despite timer jitter.
 //! - When a stream ends it inserts a final zero sample.
 //! - Retention: at startup and then daily, deletes samples (and closed viewer
-//!   sessions) older than `metrics.retention_days`; at startup it also closes viewer
-//!   sessions left open by a previous process.
+//!   sessions) older than `metrics.retention_days` (in cluster mode only on the node
+//!   holding the `metrics-retention` singleton lease); at startup it also closes the
+//!   viewer sessions left open by a previous process of this node.
 //!
 //! `HubEvent::ViewerCountChanged` is *not* emitted here: the tracker already emits it
 //! on every change.
@@ -26,6 +27,9 @@ use crate::db::{self, Db};
 use crate::hub::{Hub, HubEvent};
 
 const RETENTION_PERIOD: Duration = Duration::from_secs(24 * 3600);
+/// Cluster-wide lease of the retention run: the first node after expiry runs it, the
+/// others skip (at most about two runs a day whatever the number of nodes).
+const RETENTION_LEASE: Duration = Duration::from_secs(12 * 3600);
 
 /// Spawn the sampler task (call once at startup).
 pub fn spawn_sampler(
@@ -152,6 +156,23 @@ impl Sampler {
     }
 
     async fn retention(&self, days: u64) {
+        match db::cluster::try_lease(
+            &self.db,
+            db::cluster::TASK_METRICS_RETENTION,
+            RETENTION_LEASE,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(task = "metrics-sampler", "retention runs on another node");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(task = "metrics-sampler", error = %e, "cannot take the retention lease");
+                return;
+            }
+        }
         let days = days.min(365 * 100) as i64;
         let cutoff = Utc::now() - chrono::Duration::days(days);
         match db::metrics::delete_samples_older_than(&self.db, cutoff).await {
