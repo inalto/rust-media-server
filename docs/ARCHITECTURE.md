@@ -527,3 +527,11 @@ browsers' WebRTC decoders: encoders must disable them); new viewers wait for the
 interval); audio/video sync relies on RTCP sender reports of the send time (Opus leaves ffmpeg ≈ 30 ms
 after the AAC frame arrives); the unauthenticated POST can hold a session slot for up to 30 s without
 connecting (`webrtc.max_sessions` bounds it; per-IP limits are future work).
+
+**Measured (2026-10-09, localhost, Chrome 150 headless, x264 veryfast zerolatency 720p30 2.5 Mbit/s + AAC
+128 kbit/s).** Glass-to-glass (wall-clock code burned into the frame before encoding, decoded from the
+rendered frame): p50 35-40 ms, p90 ≤ 54 ms. Chrome `getStats`: video jitter buffer 7-8 ms, audio 50-60 ms,
+0 packets lost, 0 freezes over 20 s. WHEP POST → ICE connected ≈ 240 ms. ffmpeg Opus path adds ≈ 30 ms
+(it was 2.1 s with the default probe size). Server CPU ≈ 1.5 % of one core idle, 13.6 % with 10 viewers,
+25.8 % with 30 viewers (all at 30 fps, no loss), RSS ≈ 49 MiB; the Opus encoder process ≈ 4 % CPU per
+broadcast. A browser killed without `DELETE` is reaped after ≈ 15 s (5 s ICE disconnected + 10 s grace).
