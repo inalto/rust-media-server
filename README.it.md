@@ -1,5 +1,7 @@
 # rust-media-server (rms)
 
+[🇬🇧 English](README.md) · 🇮🇹 Italiano
+
 Media server per dirette a bassa latenza scritto in Rust, in un unico binario. Ispirato ad
 Ant Media Server e a `xiu`: OBS pubblica in RTMP, il server ridistribuisce ai browser in
 WebRTC (WHEP), HTTP-FLV / WebSocket-FLV, LL-HLS e LL-DASH (CMAF), registra su richiesta, raccoglie le
@@ -8,7 +10,7 @@ pronti da incollare e un video d'attesa quando la diretta non c'è.
 
 - Ingest: **RTMP** (stream key segreta per ogni diretta; Enhanced RTMP accettato per HEVC/AV1 ma impacchettato in HLS/DASH solo H.264/AAC)
 - Distribuzione: **WebRTC/WHEP** (sotto il secondo), **HTTP-FLV**, **WS-FLV** (≈1–2 s), **LL-HLS** (≈2–3 s), **LL-DASH** (≈2–3 s)
-- Dashboard in italiano: dirette, impostazioni OBS, link/embed, metriche con grafici, registrazioni, video d'attesa
+- Dashboard in italiano o inglese: dirette, impostazioni OBS, link/embed, metriche con grafici, registrazioni, video d'attesa
 - Registrazione: automatica (flag) o manuale; FLV nativo → MP4 via ffmpeg
 - Metriche: spettatori simultanei per protocollo campionati su SQLite, grafici Chart.js, picco/sessioni/durata media
 - Video d'attesa per diretta o globale, mostrato dal player quando la diretta è offline o **in pausa**
@@ -19,6 +21,7 @@ pronti da incollare e un video d'attesa quando la diretta non c'è.
 Architettura e contratto API: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (inglese).
 Standard di streaming a bassa latenza e raccomandazioni: [docs/PROTOCOLS.md](docs/PROTOCOLS.md).
 Riferimento API: [docs/API.md](docs/API.md).
+Guida d'uso (wiki, inglese): [docs/wiki/](docs/wiki/Home.md).
 
 ## Requisiti
 
@@ -392,4 +395,4 @@ docs/              architettura, protocolli, API, cluster
 
 ## Licenza
 
-MIT.
+[MIT](LICENSE).
