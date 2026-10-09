@@ -86,7 +86,7 @@ Chiavi principali:
 | `vod.default_ladder` | `standard` | ladder usata quando non se ne sceglie una |
 | `vod.keep_source` | `true` | conserva il file originale (serve per ricodificare e per scaricarlo) |
 | `vod.ladders` | `standard`, `mobile`, `single` | elenco delle ladder `[[vod.ladders]]`: vedi [Video on demand](#video-on-demand) |
-| `cluster.enabled` | `false` | modalità cluster (anteprima): vedi sotto |
+| `cluster.enabled` | `false` | modalità cluster: vedi [Modalità cluster](#modalità-cluster) |
 
 **Lingua dell'interfaccia.** Dashboard e player sono in italiano (predefinito) o in inglese: si sceglie
 nella dashboard in *Impostazioni → Lingua e tema* (oppure `PATCH /api/v1/settings {"ui_language":"en"}`), vale
@@ -94,20 +94,76 @@ subito per le dashboard aperte e per i testi del player incorporato (badge di at
 di attesa predefinito: «La diretta inizierà a breve» / «The live stream will start shortly»). I testi di
 attesa personalizzati restano come sono. Un singolo embed può forzare la lingua con `?lang=it|en`.
 
-**Modalità cluster (anteprima).** Con `[cluster] enabled = true` più istanze condividono un database
-**PostgreSQL** (`cluster.database_url`) al posto di SQLite: dirette, impostazioni, metriche (sommate fra i
-nodi), registrazioni e coda dei video on demand (con lease per nodo). Ogni nodo si registra nella tabella
-`nodes` con un heartbeat; *Impostazioni → Cluster* e `GET /api/v1/system` mostrano i nodi attivi. Servono
-`cluster.node_id` (default: nome host), `cluster.advertise_url`, `cluster.internal_secret` (≥ 32 caratteri)
-e `server.admin_token` uguale su tutti i nodi. Per ora ogni stream si guarda solo dal nodo che riceve
-l'RTMP (il relay fra nodi arriva nella fase successiva): architettura e limiti in
-[docs/CLUSTER.md](docs/CLUSTER.md). Senza `[cluster]` nulla cambia (SQLite, nodo singolo).
+**Modalità cluster.** Più istanze dietro un load balancer, con un database PostgreSQL comune: vedi
+[Modalità cluster](#modalità-cluster). Senza `[cluster]` nulla cambia (SQLite, nodo singolo).
 
 **Controllo di salute.** `GET /healthz` (pubblico) risponde `200` con `{"node_id", "cluster", "db",
-"live_streams", "version"}` finché il server è in servizio, anche se il database non risponde (`"db": false`),
-e `503` durante l'arresto: lo usano l'`HEALTHCHECK` del Dockerfile, il compose e i load balancer.
+"live_streams", "version", "draining"}` finché il server è in servizio, anche se il database non risponde
+(`"db": false`), e `503` durante l'arresto o il drain: lo usano l'`HEALTHCHECK` del Dockerfile, il compose e i
+load balancer.
 
 **Tema chiaro/scuro.** Il tema predefinito di dashboard e player (*Sistema*, che segue il dispositivo, *Chiaro* o *Scuro*) si sceglie in *Impostazioni → Lingua e tema* (oppure `PATCH /api/v1/settings {"ui_theme":"light"}`); ogni browser può cambiarlo per sé con il pulsante sole/luna in alto nella dashboard e un singolo embed può forzarlo con `?theme=light|dark|system`.
+
+## Modalità cluster
+
+Con `[cluster] enabled = true` più nodi rms condividono un database **PostgreSQL** al posto di SQLite e si
+comportano come un unico server: ogni nodo accetta qualunque chiave RTMP e serve qualunque diretta.
+
+- **Chi pubblica possiede lo stream.** Il nodo che riceve l'RTMP registra lo stream nella tabella
+  `live_streams` (con heartbeat); se la stessa chiave arriva su un altro nodo (es. OBS che si riconnette
+  passando dal load balancer) il nuovo nodo scollega il vecchio publisher e prende lo stream in ~0,5 s.
+- **Relay fra nodi.** Uno spettatore su un altro nodo (FLV, WS-FLV, LL-HLS, LL-DASH, WebRTC) avvia un relay
+  HTTP-FLV dal nodo proprietario sulla rete interna (un relay per stream e nodo, fermato dopo
+  `cluster.relay_idle_secs` senza spettatori). Ritardo aggiunto misurato: < 1 ms in rete locale.
+- **Stato ed eventi condivisi.** Stato delle dirette, spettatori (somma dei nodi), dashboard (SSE),
+  impostazioni e video on demand si aggiornano su tutti i nodi tramite `LISTEN/NOTIFY` di PostgreSQL.
+- **Registrazioni** sul nodo proprietario; il download funziona da ogni nodo (volume condiviso
+  consigliato, altrimenti il file viene letto dal nodo che l'ha scritto). La coda dei **video on demand**
+  è comune (lease per nodo).
+- **Guasti.** Se un nodo muore, i suoi stream risultano offline dopo `cluster.node_ttl_secs` (15 s di
+  default); OBS si riconnette a un altro nodo. `POST /internal/drain` (o `SIGTERM`) toglie un nodo dal
+  pool senza interrompere chi sta già trasmettendo.
+
+**Requisiti.** PostgreSQL (provato con la 16); su ogni nodo `cluster.node_id` univoco,
+`cluster.advertise_url` (URL interno raggiungibile dagli altri nodi, es. `http://rms1:8081`), lo stesso
+`cluster.internal_secret` (≥ 32 caratteri) e lo stesso `server.admin_token`; un volume condiviso per
+`data/` (stesso host o NFS) per registrazioni, video d'attesa e VOD. Il listener interno
+(`cluster.internal_bind`, porta 8081) non va mai esposto su Internet.
+
+**Compose pronto** (`docker-compose.cluster.yml`: PostgreSQL 16, due nodi `rms1`/`rms2` dalla stessa
+immagine, HAProxy 2.9 con `deploy/haproxy.cfg`):
+
+```bash
+podman build --format docker -t rms:latest .     # oppure: docker build -t rms:latest .
+export RMS_ADMIN_TOKEN="$(openssl rand -hex 24)" PG_PASSWORD="$(openssl rand -hex 16)" \
+       RMS_INTERNAL_SECRET="$(openssl rand -hex 32)" PUBLIC_IP=203.0.113.10 PUBLIC_URL=https://stream.example.com
+podman-compose -f docker-compose.cluster.yml up -d    # oppure: docker compose -f docker-compose.cluster.yml up -d
+curl -s -D - http://127.0.0.1:8080/healthz | grep -i x-rms-node    # quale nodo ha risposto
+```
+
+**HAProxy** (`deploy/haproxy.cfg`): HTTP su `:8080` in round robin con health check `/healthz`;
+`/hls/` e `/dash/` con hash su `X-Real-IP` (lo stesso spettatore resta sullo stesso nodo: ogni nodo
+impacchetta la propria timeline); RTMP TCP su `:1935` (`balance first`); statistiche su `:8404/stats`;
+`/internal/` bloccato. **NPM davanti:** Internet → Nginx Proxy Manager (TLS, HTTP/2) → HAProxy `:8080` →
+nodi; NPM da solo non bilancia (vedi [deploy/nginx-proxy-manager.md](deploy/nginx-proxy-manager.md) §10).
+
+**Porte.**
+
+| Porta | Dove | Uso |
+|---|---|---|
+| 8080/tcp | HAProxy (privata, verso NPM) | dashboard, API, player, FLV, HLS, DASH, segnalazione WHEP |
+| 1935/tcp | HAProxy | RTMP da OBS (verso qualunque nodo) |
+| 8404/tcp | HAProxy (privata) | statistiche |
+| 8443/udp, 8444/udp | rms1, rms2 direttamente | WebRTC: una porta UDP per nodo (`RMS_WEBRTC_PUBLIC_PORT`), mai attraverso il proxy |
+| 8081/tcp | rete interna fra i nodi | `/internal/*` (relay, kick, stato, file), protetto dal segreto |
+| 5432/tcp | rete interna | PostgreSQL |
+
+WebRTC: un nodo senza UDP raggiungibile (`webrtc.enabled = false`) risponde `307` verso il `whep_url` di un
+altro nodo (`cluster.whep_url` per nodo, es. `https://rms1.example.com/whep`); con un solo hostname per
+tutti i nodi conviene instradare `/whep/` solo verso i nodi WebRTC (backend `rms_whep`). LL-HLS/LL-DASH:
+se il nodo di uno spettatore muore, il player ricarica da un altro nodo (timeline nuova). Dettagli,
+misure e limiti: [docs/CLUSTER.md](docs/CLUSTER.md); API interne e header `X-Rms-Node`:
+[docs/API.md](docs/API.md) §4.8.
 
 ## Flusso di lavoro
 
@@ -258,6 +314,8 @@ curl -s -H "$H" -H 'Content-Type: application/json' -X PATCH -d '{"ui_language":
 ## Deploy
 
 - `deploy/rms.service`: unit systemd (modificare utente e percorsi).
+- `docker-compose.yml` (nodo singolo) e `docker-compose.cluster.yml` + `deploy/haproxy.cfg` (cluster, vedi
+  [Modalità cluster](#modalità-cluster)); `deploy/nginx-proxy-manager.md`: NPM davanti a rms o ad HAProxy.
 - `deploy/nginx.conf.example` / `deploy/Caddyfile.example`: reverse proxy con TLS, WebSocket e
   senza buffering (indispensabile per FLV, LL-HLS e LL-DASH). Impostare `server.public_url`
   all'URL pubblico e `server.trust_proxy = true`. Il proxy inoltra anche `/whep/` (HTTP), ma **non** la
@@ -274,7 +332,7 @@ src/packager/      muxer CMAF, store, playlist HLS, MPD DASH
 src/recorder/      registrazione FLV → MP4 src/metrics/    tracker spettatori, campionatore
 src/api/           REST + SSE (axum)       src/web/        dashboard e player (statici incorporati)
 src/vod/           video on demand: probe, ladder, ffmpeg in un passaggio, playlist HLS/MPD, job, inbox, playback
-src/db/            SQLite (rusqlite) o PostgreSQL (sqlx)    src/cluster/  registro nodi, /healthz
+src/db/            SQLite (rusqlite) o PostgreSQL (sqlx)    src/cluster/  nodi, proprietà stream, NOTIFY, relay, /internal
 docs/              architettura, protocolli, API, cluster
 ```
 
@@ -284,7 +342,7 @@ docs/              architettura, protocolli, API, cluster
 - WebRTC: solo video H.264 senza B-frame (HEVC/AV1 → `415`, il player usa un'altra sorgente); solo IPv4; nessun TURN né trickle ICE; un nuovo spettatore parte dal keyframe successivo; senza ffmpeg niente audio.
 - Dirette senza transcoding/ABR: la qualità è quella inviata da OBS (consigliati 2–6 Mbit/s CBR, keyframe 2 s). L'ABR c'è per i video on demand.
 - Video on demand: solo encoder H.264 (gli encoder hardware NVENC/QSV/VAAPI sono previsti ma non verificati in questo ambiente); niente anteprime sulla barra di avanzamento né sottotitoli; più istanze condividono la coda delle codifiche solo in modalità cluster (PostgreSQL, lease per nodo).
-- Modalità cluster in anteprima: registro dei nodi e database condiviso, ma niente relay fra nodi né eventi fra nodi (fasi successive in `docs/CLUSTER.md` §3.12).
+- Modalità cluster: LL-HLS/LL-DASH hanno una timeline per nodo (serve l'affinità per IP nel load balancer; dopo un failover il player riparte); failover di uno stream dopo `cluster.node_ttl_secs`; senza storage condiviso solo le registrazioni si leggono dagli altri nodi (non video d'attesa e VOD); `docs/CLUSTER.md` §3.12.
 - Safari nativo e HTTP/2 non sono stati verificati in questo ambiente (vedi `docs/ARCHITECTURE.md` §15).
 - Prossimi passi previsti: ingest SRT/WHIP, token per gli spettatori, TURN/IPv6 per WebRTC.
 

@@ -20,7 +20,10 @@ pub struct FfmpegInfo {
 
 #[derive(Debug, Serialize)]
 pub struct HubInfo {
+    /// Streams published on this node.
     pub live_streams: usize,
+    /// Relays of streams published on other nodes (cluster mode).
+    pub relays: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,7 +56,11 @@ async fn system(State(state): State<AppState>) -> Json<SystemInfo> {
         http_bind: state.config.server.http_bind.clone(),
         public_url: state.config.server.public_url.clone(),
         hub: HubInfo {
-            live_streams: state.hub.live_count(),
+            live_streams: state.hub.local_count(),
+            relays: state
+                .hub
+                .live_count()
+                .saturating_sub(state.hub.local_count()),
         },
         webrtc: state.webrtc.status(),
         vod: state.vod.status().await,

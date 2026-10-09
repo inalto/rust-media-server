@@ -1,7 +1,8 @@
 //! Metrics endpoints (ARCHITECTURE.md §8.1).
 //!
-//! - `/broadcasts/{name}/sessions`, `/metrics/overview`: live, from the in-memory
-//!   `ViewerTracker`;
+//! - `/broadcasts/{name}/sessions`: live, from this node's `ViewerTracker`;
+//! - `/metrics/overview`: live counts of every node (local tracker + the other nodes'
+//!   latest samples in cluster mode);
 //! - `/broadcasts/{name}/metrics?from&to&step`, `/broadcasts/{name}/metrics/summary?from&to`:
 //!   from the persisted samples/sessions (logic in `metrics::query`).
 
@@ -16,7 +17,7 @@ use super::BroadcastStatus;
 use super::broadcasts::load;
 use crate::db;
 use crate::error::{ApiError, ApiResult};
-use crate::metrics::query::{self, Series, Summary};
+use crate::metrics::query::{self, RemoteLive, Series, Summary};
 use crate::metrics::{SessionInfo, ViewerCounts};
 use crate::state::AppState;
 
@@ -72,9 +73,29 @@ async fn summary(
     let Query(q) = q?;
     let (from, to) = q.range()?;
     let b = load(&state, &name).await?;
+    let remote = remote_live(&state, &b.name).await;
     Ok(Json(
-        query::summary(&state.db, &state.hub, &state.tracker, &b, from, to).await?,
+        query::summary(&state.db, &state.hub, &state.tracker, &b, from, to, remote).await?,
     ))
+}
+
+/// The other nodes' part of a summary (cluster mode): their viewers and, when another
+/// node publishes the stream, the owner's live period.
+async fn remote_live(state: &AppState, name: &str) -> RemoteLive {
+    if !state.cluster.enabled() {
+        return RemoteLive::default();
+    }
+    let stream = match state.cluster.directory.remote_owner(name) {
+        Some(owner) => Some(match state.cluster.remote_status(name).await {
+            Some(r) => (r.started_at, r.bytes_in),
+            None => (owner.row.started_at, 0),
+        }),
+        None => None,
+    };
+    RemoteLive {
+        viewers: state.cluster.directory.remote_viewers(name),
+        stream,
+    }
 }
 
 /// Currently connected viewers: `[{id, protocol, ip, user_agent, started_at}]`.
@@ -108,13 +129,14 @@ async fn overview(State(state): State<AppState>) -> ApiResult<Json<Overview>> {
     let per_broadcast = all
         .into_iter()
         .map(|b| {
-            let viewers = state.tracker.counts(&b.name);
+            // Every node's viewers; live anywhere in the cluster.
+            let viewers = state.viewer_counts(&b.name);
             total.add(&viewers);
-            if state.hub.is_live(&b.name) {
+            if state.is_live(&b.name) {
                 live += 1;
             }
             OverviewEntry {
-                status: BroadcastStatus::of(&b, &state.hub),
+                status: BroadcastStatus::of(&b, &state),
                 name: b.name,
                 title: b.title,
                 viewers,

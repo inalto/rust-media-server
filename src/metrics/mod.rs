@@ -178,6 +178,9 @@ pub struct ViewerTracker {
     session_timeout: Duration,
     /// `metrics.sample_interval_secs` (bucket used to add up the samples of several nodes).
     sample_interval_secs: u64,
+    /// Prefix of the request-based session ids (`<node_id>-` in cluster mode, empty on a
+    /// single node): the same viewer on two nodes has two sessions, two rows.
+    session_prefix: String,
 }
 
 /// Guard for a connection-oriented viewer session; dropping it closes the session.
@@ -214,6 +217,12 @@ const DB_BATCH: usize = 256;
 
 impl ViewerTracker {
     pub fn new(config: &Config, db: Option<Db>, events: broadcast::Sender<HubEvent>) -> Arc<Self> {
+        let session_prefix = db
+            .as_ref()
+            .map(|d| d.node_id())
+            .filter(|n| !n.is_empty())
+            .map(|n| format!("{n}-"))
+            .unwrap_or_default();
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
             events,
@@ -222,6 +231,7 @@ impl ViewerTracker {
             db_dropped: AtomicU64::new(0),
             session_timeout: Duration::from_secs(config.metrics.session_timeout_secs.max(1)),
             sample_interval_secs: config.metrics.sample_interval_secs.max(1),
+            session_prefix,
         })
     }
 
@@ -279,7 +289,11 @@ impl ViewerTracker {
         ip: IpAddr,
         user_agent: &str,
     ) -> bool {
-        let id = Self::request_session_id(name, protocol, ip, user_agent);
+        let id = format!(
+            "{}{}",
+            self.session_prefix,
+            Self::request_session_id(name, protocol, ip, user_agent)
+        );
         self.insert(id, name, protocol, ip, user_agent)
     }
 
@@ -633,6 +647,20 @@ mod tests {
         assert_eq!(t.counts("b").total(), 3);
         t.reap(Instant::now() + Duration::from_secs(5));
         assert_eq!(t.counts("b").total(), 0);
+    }
+
+    #[test]
+    fn request_session_ids_are_node_scoped() {
+        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let (t, _rx) = tracker(30);
+        t.touch("b", Protocol::Hls, ip, "safari");
+        let single = t.sessions("b")[0].id.clone();
+        assert_eq!(single.len(), 64, "single node: plain hash");
+        let (tx, _) = broadcast::channel(16);
+        let db = Db::open_in_memory().unwrap().with_node_id("n2");
+        let t2 = ViewerTracker::new(&Config::default(), Some(db), tx);
+        t2.touch("b", Protocol::Hls, ip, "safari");
+        assert_eq!(t2.sessions("b")[0].id, format!("n2-{single}"));
     }
 
     #[test]

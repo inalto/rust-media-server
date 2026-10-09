@@ -94,11 +94,12 @@ async fn view_of(
     b: Broadcast,
 ) -> ApiResult<Json<BroadcastView>> {
     let ctx = ViewContext::load(state, headers).await?;
-    Ok(Json(ctx.view(state, b)))
+    Ok(Json(ctx.view(state, b).await))
 }
 
+/// Local SSE event + `rms_broadcasts` NOTIFY in cluster mode.
 fn changed(state: &AppState, name: &str) {
-    state.hub.emit(HubEvent::BroadcastUpdated {
+    state.hub.emit_shared(HubEvent::BroadcastUpdated {
         name: name.to_string(),
     });
 }
@@ -109,7 +110,11 @@ async fn list(
 ) -> ApiResult<Json<Vec<BroadcastView>>> {
     let ctx = ViewContext::load(&state, &headers).await?;
     let all = repo::list(&state.db).await?;
-    Ok(Json(all.into_iter().map(|b| ctx.view(&state, b)).collect()))
+    let mut views = Vec::with_capacity(all.len());
+    for b in all {
+        views.push(ctx.view(&state, b).await);
+    }
+    Ok(Json(views))
 }
 
 /// Pick a free slug derived from the title (`title`, `title-2`, `title-3`, ...).
@@ -329,9 +334,15 @@ async fn disconnect(
 ) -> ApiResult<StatusCode> {
     let b = load(&state, &name).await?;
     if state.hub.kick(&b.name) {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::conflict("broadcast is not live"))
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    // Cluster mode: the publisher may be connected to another node.
+    match state.cluster.kick_remote(&b.name).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(ApiError::conflict("broadcast is not live")),
+        Err(e) => Err(ApiError::unavailable(format!(
+            "cannot reach the node of the publisher: {e}"
+        ))),
     }
 }
 

@@ -481,7 +481,12 @@ impl WebRtcManager {
         })?;
         let answer = negotiated.answer.clone();
 
-        let id = uuid::Uuid::new_v4().simple().to_string();
+        let cluster_node = self
+            .config
+            .cluster
+            .enabled
+            .then_some(self.config.cluster.node_id.as_str());
+        let id = new_session_id(cluster_node);
         let mux_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, inbound) = mpsc::channel(mux::SESSION_QUEUE);
         running.mux.register(mux_id, &ufrag, tx);
@@ -529,6 +534,25 @@ impl WebRtcManager {
     pub fn hub(&self) -> &Arc<Hub> {
         &self.hub
     }
+}
+
+/// A new WHEP session id: a UUID (32 hex digits), prefixed with the node id in cluster
+/// mode (`<node_id>-<uuid>`, docs/CLUSTER.md §3.8) so any node can route a `DELETE`.
+pub fn new_session_id(node_id: Option<&str>) -> String {
+    let uuid = uuid::Uuid::new_v4().simple().to_string();
+    match node_id.filter(|n| !n.is_empty()) {
+        Some(node) => format!("{node}-{uuid}"),
+        None => uuid,
+    }
+}
+
+/// The node prefix of a session id made by [`new_session_id`] (`None` without prefix
+/// or for malformed ids). Node ids may contain `-`: the UUID part is the last 32 hex
+/// digits after the last `-`.
+pub fn session_node(id: &str) -> Option<&str> {
+    let (node, uuid) = id.rsplit_once('-')?;
+    let is_uuid = uuid.len() == 32 && uuid.bytes().all(|b| b.is_ascii_hexdigit());
+    (is_uuid && crate::config::is_valid_node_id(node)).then_some(node)
 }
 
 /// Host candidate addresses: `webrtc.public_ip` when set, otherwise the IPv4 addresses
@@ -609,6 +633,29 @@ fn random_token(len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_ids_carry_the_node() {
+        let single = new_session_id(None);
+        assert_eq!(single.len(), 32);
+        assert_eq!(session_node(&single), None);
+        assert_eq!(new_session_id(Some("")).len(), 32);
+        let id = new_session_id(Some("rms-2"));
+        assert!(id.starts_with("rms-2-"), "{id}");
+        assert_eq!(session_node(&id), Some("rms-2"));
+        assert_eq!(
+            session_node(&new_session_id(Some("n1.local"))),
+            Some("n1.local")
+        );
+        for bad in [
+            "n1-xyz",
+            "-0123456789abcdef0123456789abcdef",
+            "n 1-0123456789abcdef0123456789abcdef",
+            "n1-0123456789abcdef0123456789abcde",
+        ] {
+            assert_eq!(session_node(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn link_headers() {

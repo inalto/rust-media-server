@@ -230,6 +230,7 @@ GROUP BY bucket ORDER BY bucket;
 ### 3.8 WebRTC / WHEP
 
 - Ogni nodo ha un proprio endpoint UDP raggiungibile: `webrtc.public_ip` del nodo e una porta propria. rms annuncia `public_ip:public_port` (API.md §4.5): con `webrtc.public_port` (fatto in 7C-1; 0 = `udp_port`) dietro un NAT con più nodi e un solo IP pubblico la porta esterna (8443, 8444, …) può differire da quella interna.
+- **Fatto (7C-2):** id di sessione `<node>-<uuid>`, `DELETE` inoltrato al nodo della sessione (`POST /internal/whep/delete/{session}`), `307` verso il `whep_url` di un altro nodo (`cluster.whep_url` per nodo, `cluster.whep_redirect = true`), provato in Chrome 150 anche cross-origin (§7).
 - Il `POST /whep/{name}` può arrivare a qualunque nodo (dopo relay lazy dell'hub locale). Le risorse `DELETE /whep/{name}/{session}` e `OPTIONS` sono per nodo: oggi un `DELETE` su un altro nodo dà `404` e la sessione viene chiusa dopo ≈ 15 s dal rilevamento ICE (ARCH §16). Proposta: prefisso del nodo nell'id di sessione (`n2-<uuid>`) e instradamento nell'LB (§4), oppure inoltro interno.
 - Il draft WHEP-04 prevede il bilanciamento con **`307 Temporary Redirect`** (non 301/302) e `503` con `Retry-After` in caso di sovraccarico [28]: un nodo senza UDP raggiungibile o saturo può rimandare il client a un nodo con `nodes.whep_url`. Da provare nei browser (redirect cross-origin con `Content-Type: application/sdp`); preferibile restare sullo stesso hostname e instradare nell'LB.
 - Nodi senza UDP raggiungibile: `webrtc.enabled=false`; il POST dà `403` e il player passa a FLV/HLS. Meglio non mandarglieli proprio (backend `rms_whep` solo con i nodi WebRTC, §4).
@@ -238,7 +239,7 @@ GROUP BY bucket ORDER BY bucket;
 ### 3.9 Salute e drain
 
 - `GET /healthz` (pubblico, senza auth; **fatto in 7C-1**): 200 con `{"node_id", "cluster", "db": true|false, "live_streams", "version", "draining"}`; **liveness**, non dipende dal DB (se il DB è giù l'LB non deve togliere tutti i nodi, il data plane funziona). 503 solo in drain o durante l'arresto. Lo usano l'`HEALTHCHECK` del Dockerfile e il compose.
-- Drain: `SIGTERM` o `POST /internal/drain` → `nodes.draining=true`, `/healthz` 503, nessun nuovo relay, le connessioni attive finiscono.
+- Drain: `SIGTERM` o `POST /internal/drain` → `nodes.draining=true`, `/healthz` 503, nessun nuovo relay, le connessioni attive finiscono. **Fatto (7C-2):** anche nessun nuovo publish sul nodo (rifiutato), `DELETE /internal/drain` lo rimette nel pool; HAProxy controlla `/healthz` anche per la porta RTMP.
 
 ### 3.10 Cosa resta per-nodo
 
@@ -282,7 +283,10 @@ sempre   reaper (un nodo qualsiasi): DELETE nodes/live_streams scaduti; vod_item
 
 ### 3.12 Fasi di realizzazione
 
-1. Trait `Store` + `SqliteStore` (nessun cambio funzionale). — **Fatto (7C-1):** `db::Db` con due backend (enum, non trait) e le stesse firme dei repository; SQLite invariato. 2. `PgStore`, migrazioni con lock, cache `broadcasts`, `nodes`, `/healthz`. — **Fatto (7C-1):** PostgreSQL via sqlx (migrazioni sotto `pg_advisory_xact_lock`), cache `broadcasts` con invalidazione locale, registro `nodes` con heartbeat/reaper, `/healthz`; anche `node_id` nelle tabelle, lease VOD, task singleton, `public_port`, IP dal proxy (ARCHITECTURE.md §20). 3. `live_streams`, NOTIFY, listener con resync, listener interno `/internal/*`. 4. Relay FLV (client HTTP), metriche per nodo. 5. VOD con lease, file condivisi/fetch interno. 6. WebRTC per nodo (`public_port`, prefisso sessione). 7. B/C per HLS/DASH, S3 (roadmap).
+1. Trait `Store` + `SqliteStore` (nessun cambio funzionale). — **Fatto (7C-1):** `db::Db` con due backend (enum, non trait) e le stesse firme dei repository; SQLite invariato. 2. `PgStore`, migrazioni con lock, cache `broadcasts`, `nodes`, `/healthz`. — **Fatto (7C-1):** PostgreSQL via sqlx (migrazioni sotto `pg_advisory_xact_lock`), cache `broadcasts` con invalidazione locale, registro `nodes` con heartbeat/reaper, `/healthz`; anche `node_id` nelle tabelle, lease VOD, task singleton, `public_port`, IP dal proxy (ARCHITECTURE.md §20). 3. `live_streams`, NOTIFY, listener con resync, listener interno `/internal/*`. — **Fatto (7C-2):** claim prima di `publish_start` con kick interno dell'owner e retry per ~3 s; heartbeat delle righe (riclaim dopo un'interruzione del DB, kick se un altro nodo le ha prese, rilascio di righe orfane); reaper + NOTIFY; bus `PgListener` su 4 canali con riconnessione e resync; directory in memoria (2 s) per lo stato effettivo; `/internal/{ping,relay,kick,status,drain,files,whep/delete}`. 4. Relay FLV (client HTTP), metriche per nodo. — **Fatto (7C-2):** relay single-flight con `reqwest` (rustls/ring), stop per inattività, retry con backoff finché la riga vive; spettatori, overview, summary e SSE `viewers` sommano i nodi (campioni recenti). 5. VOD con lease, file condivisi/fetch interno. — **Fatto (7C-2):** cartella temporanea per nodo `abr.<node>.tmp`, NOTIFY `rms_vod` che sveglia i runner, download delle registrazioni dal nodo che le ha scritte via `/internal/files` quando lo storage non è condiviso. 6. WebRTC per nodo (`public_port`, prefisso sessione). — **Fatto (7C-2):** id `<node>-<uuid>`, `DELETE` inoltrato al nodo della sessione, `307` verso un altro `whep_url` (`cluster.whep_url`, `cluster.whep_redirect`). 7. B/C per HLS/DASH, S3 (roadmap).
+
+Correzioni rispetto al progetto (fase 7C-2): (a) la presa in carico fa kick dell'owner **sempre** (anche se il suo publisher è attivo): l'ultimo publisher vince, come chiesto per la riconnessione di OBS su un altro nodo (sul nodo singolo un secondo publisher attivo resta rifiutato); (b) il payload NOTIFY ha anche `owner` per `reaped`; (c) l'evento SSE `viewers` di un nodo somma i contatori locali e gli **ultimi campioni** degli altri nodi (non `nodes.viewers`, che non è per broadcast); (d) gli eventi locali tornano a NOTIFY solo da `Hub::emit_shared` (scritture locali), mai dagli eventi ricevuti: nessun ciclo; (e) un nodo in drain non avvia relay (risponde `404 stream offline` come un nodo senza lo stream) e rifiuta i publish; (f) i flussi relay terminano a ogni EOF dell'owner: gli spettatori riconnettono (come dopo una riconnessione del publisher), non c'è ricucitura delle timeline.
+
 
 ## 4. Load balancer e ingest
 
@@ -293,64 +297,21 @@ sempre   reaper (un nodo qualsiasi): DELETE nodes/live_streams scaduti; vod_item
 - **RTMP (1935/tcp).** Due modi. (1) Hostname dedicato `ingest.example.com` verso un solo nodo o un VIP (keepalived): semplice, un publisher vede sempre lo stesso nodo. (2) TCP LB (HAProxy `mode tcp`, o uno **Stream** di NPM verso `lb:1935`): la chiave finisce su un nodo arbitrario, cosa che il relay e `live_streams` gestiscono; si perde l'IP del publisher (rms vede l'LB; il PROXY protocol non è supportato dal listener).
 - **WebRTC.** Non passa da NPM né dall'LB HTTP: UDP per nodo con `public_ip`/porta propri (§3.8). Alternative: TURN, oppure WHEP disattivato (il player cade su FLV/HLS da solo, ARCH §16).
 
+Configurazione completa e verificata (`haproxy -c` con HAProxy 2.9, usata dal compose del §5): **`deploy/haproxy.cfg`**. In sintesi (fase 7C-2):
+
 ```
-# haproxy.cfg (estratto) — dietro NPM
-global
-    log stdout format raw local0
-defaults
-    mode http
-    log global
-    timeout connect 3s
-    timeout client 1h
-    timeout server 1h
-    timeout tunnel 1h
-    timeout client-fin 10s
-resolvers docker                    # DNS embedded di Docker; con Podman: IP del gateway della rete (aardvark-dns)
-    nameserver dns1 127.0.0.11:53
-    resolve_retries 3
-    timeout resolve 1s
-    timeout retry 1s
-    hold valid 10s
-frontend http_in
-    bind :8080
-    http-request del-header X-Forwarded-For
-    http-request set-header X-Forwarded-For %[req.hdr(X-Real-IP)] if { req.hdr(X-Real-IP) -m found }
-    http-request deny if { path_beg /internal/ }
-    use_backend rms_ll   if { path_beg /hls/ /dash/ }
-    use_backend rms_whep if { path_beg /whep/ }
-    default_backend rms_http
-backend rms_http
-    balance leastconn
-    option httpchk
-    http-check send meth GET uri /healthz
-    http-check expect status 200
-    default-server check inter 2s fall 3 rise 2 resolvers docker init-addr libc,none
-    server rms1 rms1:8080
-    server rms2 rms2:8080
-backend rms_ll                      # stesso spettatore → stesso nodo
-    balance hdr(X-Real-IP)
-    hash-type consistent
-    option httpchk
-    http-check send meth GET uri /healthz
-    default-server check inter 2s fall 3 rise 2 resolvers docker init-addr libc,none
-    server rms1 rms1:8080
-    server rms2 rms2:8080
-backend rms_whep                    # solo nodi con UDP raggiungibile
-    balance leastconn
-    default-server check inter 2s fall 3 rise 2 resolvers docker init-addr libc,none
-    server rms1 rms1:8080
-    server rms2 rms2:8080
-frontend rtmp_in
-    mode tcp
-    bind :1935
-    default_backend rms_rtmp
-backend rms_rtmp
-    mode tcp
-    balance leastconn
-    default-server check resolvers docker init-addr libc,none
-    server rms1 rms1:1935
-    server rms2 rms2:1935
+frontend http_in   :8080   X-Real-IP = %[src] se manca (dietro NPM resta quello di NPM); X-Forwarded-For riscritto
+                           /internal/ → 404; /hls/ /dash/ → rms_ll; /whep/ → rms_whep; resto → rms_http
+backend rms_http           balance roundrobin, httpchk GET /healthz (503 in drain = fuori dal pool)
+backend rms_ll             balance hdr(X-Real-IP) + hash-type consistent (stesso spettatore → stesso nodo)
+backend rms_whep           balance leastconn (solo nodi con UDP raggiungibile)
+frontend rtmp_in   :1935   mode tcp → rms_rtmp: balance first, check port 8080 su /healthz
+frontend stats     :8404   /stats (tenerla privata)
+resolvers dns              parse-resolv-conf: DNS di Docker (127.0.0.11) o di Podman (aardvark-dns, gateway)
+                           con init-addr libc,none i nodi non ancora risolvibili partono in manutenzione
 ```
+
+Con NPM davanti `X-Real-IP` arriva da NPM ed è l'IP reale; senza NPM HAProxy è esposto ai client e la riga `set-header X-Real-IP %[src] unless …` va sostituita da `http-request set-header X-Real-IP %[src]` (un client non deve poter scegliere l'header, che rms usa con `trust_proxy`). Misura (prova del §7, 2026-10-09): richieste `/hls/` consecutive dallo stesso client sempre sullo stesso nodo (header `X-Rms-Node`), client diversi distribuiti fra i nodi.
 
 Con un numero variabile di repliche si può usare `server-template rms 1-6 rms:8080 check` con `resolvers` (DNS di Docker `127.0.0.11`; con Podman l'IP del gateway della rete) [30], ma con WebRTC attivo ogni nodo ha porte diverse (§3.8) e i server restano espliciti.
 
@@ -365,45 +326,24 @@ Sul branch `feat/docker` (commit `7bb3cc0`) esistono già `Dockerfile` e `docker
 - **Podman su questo host** (5.8.2, rootless, netavark): `podman-compose` richiede la risoluzione DNS fra container (netavark/aardvark-dns) [36]; le porte < 1024 (NPM 80/443) richiedono `sysctl net.ipv4.ip_unprivileged_port_start=80`; le reti bridge rootless usano `rootlessport`, che **non preserva l'IP del client**, mentre `pasta` sì [36]: per WebRTC e per l'IP dei publisher preferire pasta (`rootless_port_forwarder="pasta"`, sperimentale) o Podman rootful / `network_mode: host`. `podman play kube` accetta un Pod YAML Kubernetes ma non il file Compose (`podman kube generate` produce lo YAML).
 - `--scale` non va bene per i nodi con WebRTC (stesse variabili, stessa porta UDP): servizi espliciti `rms1`, `rms2` con ancora YAML.
 
-```yaml
-# docker-compose.cluster.yml — 2 nodi rms + Postgres + HAProxy (TLS: NPM esterno, che punta a lb:8080)
-x-rms: &rms
-  image: rms:latest
-  restart: unless-stopped
-  depends_on: { db: { condition: service_healthy } }
-  volumes: [ "shared:/data" ]            # su più host: volume NFS (§6)
-  healthcheck: { test: ["CMD","curl","-fsS","http://127.0.0.1:8080/healthz"], interval: 10s, timeout: 3s, retries: 3 }
-x-env: &env
-  RMS_ADMIN_TOKEN: ${RMS_ADMIN_TOKEN:?}            # identico su tutti i nodi
-  RMS_SERVER_PUBLIC_URL: https://stream.example.com
-  RMS_SERVER_TRUST_PROXY: "true"
-  RMS_CLUSTER_ENABLED: "true"
-  RMS_CLUSTER_DATABASE_URL: postgres://rms:${PG_PASSWORD:?}@db:5432/rms
-  RMS_CLUSTER_INTERNAL_SECRET: ${RMS_INTERNAL_SECRET:?}
-  RMS_WEBRTC_PUBLIC_IP: ${PUBLIC_IP:?}
-services:
-  db:
-    image: postgres:18
-    environment: { POSTGRES_DB: rms, POSTGRES_USER: rms, POSTGRES_PASSWORD: "${PG_PASSWORD:?}" }
-    volumes: [ "pgdata:/var/lib/postgresql" ]      # PG ≥ 18: non /var/lib/postgresql/data
-    healthcheck: { test: ["CMD-SHELL","pg_isready -U rms -d rms"], interval: 5s, retries: 10 }
-  rms1:
-    <<: *rms
-    environment: { <<: *env, RMS_CLUSTER_NODE_ID: rms1, RMS_CLUSTER_ADVERTISE_URL: "http://rms1:8081", RMS_WEBRTC_UDP_PORT: "8443" }
-    ports: [ "8443:8443/udp" ]                     # WebRTC: diretto, non via proxy
-  rms2:
-    <<: *rms
-    environment: { <<: *env, RMS_CLUSTER_NODE_ID: rms2, RMS_CLUSTER_ADVERTISE_URL: "http://rms2:8081", RMS_WEBRTC_UDP_PORT: "8444" }
-    ports: [ "8444:8444/udp" ]
-  lb:
-    image: haproxy:3.4
-    volumes: [ "./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro" ]
-    ports: [ "1935:1935" ]                         # RTMP; 8080 resta interno (NPM → lb:8080)
-    depends_on: [ rms1, rms2 ]
-volumes: { shared: {}, pgdata: {} }
+Il file pronto è **`docker-compose.cluster.yml`** (fase 7C-2) con `deploy/haproxy.cfg`:
+
+| Servizio | Immagine | Note |
+|---|---|---|
+| `db` | `postgres:16-alpine` | volume `pgdata` su `/var/lib/postgresql/data` (layout ≤ 17; dalla 18 `/var/lib/postgresql`), healthcheck `pg_isready` |
+| `rms1`, `rms2` | `${RMS_IMAGE:-rms:latest}` (stessa immagine) | `RMS_CLUSTER_*` comuni (ancora YAML), `NODE_ID`/`ADVERTISE_URL` per nodo, UDP 8443 e 8444 pubblicate con `RMS_WEBRTC_PUBLIC_PORT` uguale alla porta pubblicata; volume condiviso `rms-data:/data` su entrambi; healthcheck `/healthz` |
+| `lb` | `haproxy:2.9` | `deploy/haproxy.cfg`; porte 8080 (HTTP per NPM), 1935 (RTMP), 8404 (statistiche) |
+
+Variabili obbligatorie: `RMS_ADMIN_TOKEN`, `PG_PASSWORD`, `RMS_INTERNAL_SECRET` (≥ 32 caratteri); facoltative `PUBLIC_URL`, `PUBLIC_IP` (candidati WebRTC), `RMS_IMAGE` e le porte pubblicate (`LB_HTTP_PORT`, `LB_RTMP_PORT`, `LB_STATS_PORT`, `RMS1_WEBRTC_PORT`, `RMS2_WEBRTC_PORT`; i default sono le porte standard, da cambiare solo in caso di conflitto).
+
+```bash
+podman build --format docker -t rms:latest .          # docker build -t rms:latest .
+export RMS_ADMIN_TOKEN=… PG_PASSWORD=… RMS_INTERNAL_SECRET=$(openssl rand -hex 32) PUBLIC_IP=203.0.113.10
+podman-compose -f docker-compose.cluster.yml up -d    # docker compose -f … up -d
+curl -s http://127.0.0.1:8080/healthz -D - | grep -i x-rms-node
 ```
 
-Con Podman: `podman-compose -f docker-compose.cluster.yml up -d`. Le variabili `RMS_CLUSTER_*` esistono da 7C-1 (§3.1); serve anche `RMS_CLUSTER_ADVERTISE_URL` per nodo.
+Su un host con una rotta che copre le reti private (qui `10.0.0.0/8`) Podman risponde `could not find free subnet from subnet pools`: creare prima la rete (`podman network create --subnet 172.30.42.0/24 <progetto>_default`) o scommentare il blocco `networks:` in fondo al file. Le variabili `RMS_CLUSTER_*` esistono da 7C-1 (§3.1); per nodo servono `RMS_CLUSTER_NODE_ID` e `RMS_CLUSTER_ADVERTISE_URL`. Il listener interno (8081) resta sulla rete del compose, mai pubblicato. Prova del 2026-10-09 con Podman 5.8.2 rootless e `podman-compose` 1.5.0: §7.
 
 ## 6. Storage condiviso (registrazioni, VOD, video d'attesa)
 
@@ -420,6 +360,25 @@ Primo rilascio: volume condiviso **oppure** locale + fetch interno, dietro la st
 ## 7. Prove da fare prima di fidarsi
 
 Latenza reale del relay FLV (cold start e regime); durata del failover con `node_ttl` 10 e 15 s; NOTIFY sotto carico con 3–6 nodi; redirect 307 di WHEP nei browser; aardvark-dns con più container sullo stesso alias; MSN/PDT di un nodo edge vs owner per confermare §3.5.
+
+**Misure della fase 7C-2 (2026-10-09, un host, PostgreSQL 16 in Podman, pattern 720p30 2,5 Mbit/s):**
+
+| Prova | Risultato |
+|---|---|
+| Stato `live` visto dall'altro nodo dopo il publish (NOTIFY) | 0,35 s (avvio di ffmpeg incluso) |
+| Relay FLV: cold start (TTFB) / ritardo aggiunto a regime (stesso tag sui due nodi) | 4–17 ms / mediana 0,31 ms, p95 0,50 ms (loopback) |
+| LL-HLS su un nodo edge: prima playlist a freddo | 1,1 s (primo segmento dal GOP relayato); `ffmpeg -t 6` pulito |
+| WHEP in Chrome 150 su un nodo edge (relay) | `engine = webrtc`, ICE `connected` in < 2 s |
+| WHEP `307` (nodo senza WebRTC → altro nodo, cross-origin) | Chrome rimanda il `POST` con il corpo, preflight CORS ok, riproduzione dal nodo di destinazione; `DELETE` sullo stesso nodo (Location risolta su `res.url`) |
+| `DELETE` di una sessione WHEP inviato all'altro nodo | inoltrato via `/internal/whep/delete`, `200`, sessione chiusa |
+| Fine publish → relay chiuso e `offline` su entrambi i nodi | 0,45 s |
+| Stessa chiave pubblicata sull'altro nodo (kick interno, presa in carico) | 0,29 s (kick → claim 0,1 s; vecchio publisher scollegato, il nodo precedente ora fa relay) |
+| `kill -9` dell'owner (`node_ttl` 10 s, heartbeat 2 s) / container (`node_ttl` 15 s, heartbeat 5 s) | `offline` dopo 10,0 s / 14,3 s; ripubblicando passa al nodo vivo in 0,2 s |
+| Arresto ordinato del container owner (`podman stop`) | `offline` via HAProxy in 2,4 s |
+| Spettatori: un FLV sul nodo 1 + uno sul nodo 2 | serie, summary, overview e vista: `total = 2` su entrambi i nodi |
+| Registrazione con `record = true` (owner n1) | riga `node_id = n1`, download da n2 dal volume condiviso; con dati separati, da `/internal/files` con `Range` (206) |
+| VOD caricato su n2 | codificato da n1 (NOTIFY sveglia il runner), servito da entrambi |
+| HAProxy (compose): `smoke.sh` | 148/148 verdi; HTTP in round robin (`X-Rms-Node` alternato); `/hls/` con lo stesso `X-Real-IP` sempre sullo stesso nodo, IP diversi distribuiti |
 
 ## 8. Fonti
 

@@ -152,6 +152,23 @@ wait
 | IP spettatori = IP di NPM | `server.trust_proxy = false` |
 | WebRTC non si connette, FLV sì | `8443/udp` non raggiungibile o `webrtc.public_ip` errato (vedi `candidates` in `GET /api/v1/system`) |
 
+## 10. Cluster: NPM → HAProxy → nodi
+
+NPM non bilancia fra più istanze (un solo *Forward Hostname* per Proxy Host, nessun health check né affinità; docs/CLUSTER.md §4). Con più nodi rms la catena è:
+
+```
+Internet ──443──> NPM (TLS, HTTP/2) ──http──> lb:8080 (HAProxy) ──> rms1:8080 | rms2:8080
+OBS ─────1935/tcp──> lb:1935 (HAProxy, oppure uno Stream di NPM verso lb:1935) ──> qualunque nodo
+Browser ─8443/udp, 8444/udp──────────────────────────────────────> rms1, rms2 (WebRTC, diretto)
+```
+
+- Proxy Host: *Forward Hostname* `lb`, porta `8080` (il servizio HAProxy di `docker-compose.cluster.yml`, sulla stessa rete di NPM), con le stesse opzioni dei §3–§5 (Websockets ON, Cache Assets OFF, HTTP/2 ON, `proxy_buffering off`).
+- NPM imposta `X-Real-IP` all'IP del client: HAProxy lo usa per tenere ogni spettatore LL-HLS/LL-DASH sullo stesso nodo (`balance hdr(X-Real-IP)`) e rms (`trust_proxy = true`) per i suoi IP. Lasciare in `deploy/haproxy.cfg` la riga che imposta `X-Real-IP` solo se manca.
+- Ogni risposta porta `X-Rms-Node`: con *Developer tools* si vede quale nodo ha risposto.
+- `/internal/` non passa mai: i nodi lo servono su un'altra porta (8081) e HAProxy lo nega comunque; una Custom Location `/internal/` con `return 404;` (§6) è un'ulteriore difesa.
+- WebRTC: ogni nodo ha la propria porta UDP pubblica (8443, 8444, …) con `RMS_WEBRTC_PUBLIC_PORT`; con un solo IP pubblico pubblicare entrambe le porte sull'host.
+- L'interfaccia di statistiche di HAProxy (`:8404/stats`) e la porta 8080 di HAProxy restano private (solo rete del compose o `127.0.0.1`).
+
 ## Fonti
 
 [1] https://github.com/NginxProxyManager/nginx-proxy-manager/releases (v2.16.0, 2026-09-24) · [2] sorgenti NPM `v2.16.0`: `backend/templates/proxy_host.conf`, `_location.conf`, `_access.conf`, `_listen.conf`, `stream.conf`, `docker/rootfs/etc/nginx/nginx.conf`, `conf.d/include/proxy.conf`, `assets.conf`, `block-exploits.conf`, `docker/rootfs/etc/s6-overlay/s6-rc.d/prepare/40-dynamic.sh`, `frontend/src/locale/src/en.json` (https://github.com/NginxProxyManager/nginx-proxy-manager/tree/v2.16.0) · [3] https://nginxproxymanager.com/setup/ e https://nginxproxymanager.com/advanced-config/ (file `/data/nginx/custom/*.conf`, porte degli Stream) · [4] https://man.archlinux.org/man/extra/podman/podman-rootless.7.en · [5] https://github.com/containers/podman-compose · [6] nginx: https://nginx.org/en/docs/http/ngx_http_proxy_module.html (`proxy_buffering`, `proxy_request_buffering`, `proxy_set_header`, `proxy_read_timeout`), https://nginx.org/en/docs/http/websocket.html, https://nginx.org/en/docs/stream/ngx_stream_proxy_module.html (`proxy_timeout`) · [7] https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis (profilo Low-Latency: HTTP/2 o HTTP/3).

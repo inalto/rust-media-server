@@ -238,17 +238,17 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // Video on demand: re-queue interrupted jobs, job runner, inbox scanner.
     state.vod.spawn(shutdown.clone());
 
-    // Cluster: node registry (heartbeat + reaper) and the internal listener.
-    let registry = state.cluster.spawn_registry(
-        hub.clone(),
-        tracker.clone(),
-        state.webrtc.clone(),
-        shutdown.clone(),
-    );
+    // Cluster: node registry (heartbeat, stream ownership, reapers), directory refresh,
+    // NOTIFY bus and the internal listener.
+    let registry = state
+        .cluster
+        .spawn_registry(state.webrtc.clone(), shutdown.clone());
+    let refresh = state.cluster.spawn_refresh();
+    let bus_tasks = cluster::bus::spawn(&state);
     let internal = if config.cluster.enabled {
         Some(
             cluster::http::serve_internal(
-                state.cluster.clone(),
+                state.clone(),
                 &config.cluster.internal_bind,
                 config.cluster.internal_secret.clone(),
                 shutdown.clone(),
@@ -260,11 +260,18 @@ async fn run(config: Config) -> anyhow::Result<()> {
     };
 
     // RTMP ingest.
-    let rtmp = RtmpServer::bind(config.clone(), db.clone(), hub.clone(), tracker.clone()).await?;
+    let rtmp = RtmpServer::bind(
+        config.clone(),
+        db.clone(),
+        hub.clone(),
+        tracker.clone(),
+        state.cluster.clone(),
+    )
+    .await?;
     let rtmp_task = tokio::spawn(rtmp.run(shutdown.child_token()));
 
     // HTTP.
-    let app = Router::new()
+    let mut app = Router::new()
         .merge(api::router(&state))
         .merge(egress::router())
         .merge(packager::router())
@@ -272,7 +279,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .merge(vod::router())
         .merge(cluster::http::health_router())
         .merge(web::router(&state))
-        .fallback(|| async { ApiError::not_found("not found").into_response() })
+        .fallback(|| async { ApiError::not_found("not found").into_response() });
+    if config.cluster.enabled {
+        app = cluster::http::with_node_header(app, state.cluster.node_id());
+    }
+    let app = app
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
     let http_addr = config.http_bind_addr()?;
@@ -312,7 +323,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
     }
     state.recorder.shutdown().await;
     state.vod.shutdown(Duration::from_secs(5)).await;
-    for task in [registry, internal].into_iter().flatten() {
+    for task in [registry, refresh, internal]
+        .into_iter()
+        .flatten()
+        .chain(bus_tasks)
+    {
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
     }
     state.cluster.deregister().await;

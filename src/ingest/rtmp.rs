@@ -23,6 +23,11 @@
 //! dead TCP connection not yet detected) is replaced when a new publish with the same
 //! key arrives, so OBS reconnects are not rejected as "already live".
 //!
+//! Cluster mode: `on_publish` claims the stream in `live_streams` before
+//! `Hub::publish_start` (the live owner on another node is kicked first, see
+//! [`ClusterNode::claim_publish`]); a relay of the same name is stopped; the row is
+//! released when the publisher leaves. Single node: no claim.
+//!
 //! RTMP playback (`play`) is rejected: playback goes through HTTP-FLV/WS-FLV/HLS/DASH.
 
 use std::collections::HashMap;
@@ -44,10 +49,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::cluster::{ClaimError, ClusterNode};
 use crate::config::Config;
 use crate::db::{self, Db};
 use crate::hub::packet::on_metadata_body;
-use crate::hub::{Hub, LiveStream, MediaPacket, PublishInfo};
+use crate::hub::{Hub, LiveStream, MediaPacket, PublishInfo, StreamOrigin};
 use crate::metrics::ViewerTracker;
 
 /// A live publisher silent for longer than this can be replaced by a new publish.
@@ -81,6 +87,8 @@ pub struct RtmpIngest {
     db: Db,
     hub: Arc<Hub>,
     tracker: Arc<ViewerTracker>,
+    /// Stream ownership in cluster mode (no-op on a single node).
+    cluster: Arc<ClusterNode>,
     registry: Arc<StreamRegistry>,
     /// Active publishers by rtmp-rs session id.
     publishers: Mutex<HashMap<u64, Arc<Publisher>>>,
@@ -120,6 +128,9 @@ impl RtmpIngest {
         }
         let stream = &p.stream;
         self.hub.publish_end_stream(stream);
+        self.cluster
+            .release_publish(&stream.name, stream.claim_id.as_deref())
+            .await;
         let peak = self.tracker.take_peak(&stream.name);
         let info = stream.info();
         tracing::info!(
@@ -231,7 +242,7 @@ impl RtmpHandler for RtmpIngest {
             tracing::info!(broadcast = %name, app = %ctx.app, expected = %self.config.rtmp.app, "publisher uses a different RTMP app name; accepting anyway");
         }
 
-        if let Some(existing) = self.hub.get(&name) {
+        if let Some(existing) = self.hub.get(&name).filter(|s| s.origin.is_local()) {
             let idle = existing.idle_ms();
             if idle < STALE_PUBLISHER_MS {
                 tracing::warn!(broadcast = %name, %peer, "publish rejected: broadcast already live");
@@ -239,6 +250,24 @@ impl RtmpHandler for RtmpIngest {
             }
             tracing::warn!(broadcast = %name, %peer, idle_ms = idle, "replacing stale publisher");
             self.take_over(&existing).await;
+        }
+
+        // Cluster mode: take ownership (kicks the publisher of another node).
+        let claim_id = match self.cluster.claim_publish(&name).await {
+            Ok(id) => id,
+            Err(ClaimError::Draining) => {
+                tracing::warn!(broadcast = %name, %peer, "publish rejected: this node is draining");
+                return AuthResult::Reject("server is draining".into());
+            }
+            Err(e) => {
+                tracing::warn!(broadcast = %name, %peer, error = %e, "publish rejected");
+                return AuthResult::Reject("broadcast already live".into());
+            }
+        };
+        // A relay of this name (the stream was published on another node until now):
+        // the claim stopped it; make sure it is gone before publishing.
+        if let Some(relay) = self.hub.get(&name).filter(|s| s.is_relay()) {
+            self.hub.publish_end_stream(&relay);
         }
 
         let started_at = Utc::now();
@@ -261,11 +290,16 @@ impl RtmpHandler for RtmpIngest {
             publisher_addr: Some(peer),
             stream_session_id: stream_session_id.clone(),
             kick: self.connection_token(ctx.session_id),
+            origin: StreamOrigin::Local,
+            claim_id: claim_id.clone(),
         };
         let stream = match self.hub.publish_start(&name, info) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(broadcast = %name, %peer, error = %e, "publish rejected");
+                self.cluster
+                    .release_publish(&name, claim_id.as_deref())
+                    .await;
                 if let Some(id) = stream_session_id {
                     let end = db::stream_sessions::StreamSessionEnd {
                         ended_at: Utc::now(),
@@ -276,6 +310,7 @@ impl RtmpHandler for RtmpIngest {
                 return AuthResult::Reject("broadcast already live".into());
             }
         };
+        self.cluster.announce_start(&name);
         self.tracker.reset_peak(&name);
         let publisher = Arc::new(Publisher {
             session_id: ctx.session_id,
@@ -362,6 +397,7 @@ impl RtmpServer {
         db: Db,
         hub: Arc<Hub>,
         tracker: Arc<ViewerTracker>,
+        cluster: Arc<ClusterNode>,
     ) -> anyhow::Result<Self> {
         let addr = config.rtmp_bind_addr()?;
         let listener = TcpListener::bind(addr)
@@ -375,6 +411,7 @@ impl RtmpServer {
             db,
             hub,
             tracker,
+            cluster,
             registry: Arc::new(StreamRegistry::new()),
             publishers: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),

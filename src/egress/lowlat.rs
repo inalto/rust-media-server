@@ -105,7 +105,7 @@ pub(crate) async fn resolve(
             ApiError::not_found(format!("{} is disabled on this server", proto.label())).into(),
         );
     }
-    let pkg = state.packager.get(name);
+    let mut pkg = state.packager.get(name);
     let (enable_hls, enable_dash) = match pkg.as_ref().and_then(|p| p.cached_flags()) {
         Some(flags) => flags,
         None => {
@@ -129,11 +129,35 @@ pub(crate) async fn resolve(
         ))
         .into());
     }
+    // Cluster mode: nothing packaged here (or only the lingering end of an earlier
+    // relay) while another node publishes the stream: relay it and package locally
+    // (docs/CLUSTER.md §3.5, strategy A: the load balancer keeps a viewer on one node).
+    if pkg.as_ref().is_none_or(|p| p.is_ended())
+        && state.cluster.directory.remote_owner(name).is_some()
+        && state.live_stream(name).await.is_some()
+    {
+        pkg = wait_for_package(state, name).await.or(pkg);
+    }
     let pkg = pkg.ok_or_else(|| ApiError::not_found("stream offline"))?;
     if let Some(reason) = pkg.unsupported_reason() {
         return Err(EgressError::Unsupported(reason));
     }
     Ok(pkg)
+}
+
+/// The live package of `name` once the packager picked up a just-started (relayed)
+/// stream (bounded wait).
+async fn wait_for_package(state: &AppState, name: &str) -> Option<Arc<StreamPackage>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(p) = state.packager.get(name).filter(|p| !p.is_ended()) {
+            return Some(p);
+        }
+        if tokio::time::Instant::now() >= deadline || state.shutdown.is_cancelled() {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Register a request-based viewer session.

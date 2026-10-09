@@ -17,7 +17,8 @@
 //!   vanished (crash recovery).
 //!
 //! Auto-record: on `HubEvent::StreamStarted` (and for streams already live when the
-//! manager starts) a recording starts when the broadcast has `record = true`. A manual
+//! manager starts) a recording starts when the broadcast has `record = true`; in
+//! cluster mode only on the owner node (relayed streams are never recorded). A manual
 //! stop only ends the current file: auto-record is evaluated once per live period.
 //!
 //! Crash safety: at startup rows left in `recording`/`processing` are finalized (the
@@ -65,6 +66,9 @@ pub enum RecorderError {
     NotFound,
     #[error("recording is still in progress or being processed")]
     Busy,
+    /// Cluster mode: only the owner node records (this node only relays the stream).
+    #[error("the stream is published on node {0}: recordings are made by that node")]
+    Remote(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -143,6 +147,9 @@ impl RecorderManager {
     /// Start a manual recording of the live broadcast `name`.
     pub async fn start_manual(&self, name: &str) -> Result<RecordingInfo, RecorderError> {
         let stream = self.shared.hub.get(name).ok_or(RecorderError::NotLive)?;
+        if let Some(node) = stream.origin.remote_node() {
+            return Err(RecorderError::Remote(node.to_string()));
+        }
         self.shared.start(stream).await
     }
 
@@ -300,7 +307,7 @@ impl Shared {
     }
 
     fn emit(&self, name: &str) {
-        self.hub.emit(HubEvent::BroadcastUpdated {
+        self.hub.emit_shared(HubEvent::BroadcastUpdated {
             name: name.to_string(),
         });
     }
@@ -361,7 +368,8 @@ impl Shared {
 
     fn spawn_auto(self: Arc<Self>, name: String) {
         tokio::spawn(async move {
-            let Some(stream) = self.hub.get(&name) else {
+            // Relays never record: the owner node does (docs/CLUSTER.md §3.7).
+            let Some(stream) = self.hub.get(&name).filter(|s| s.origin.is_local()) else {
                 return;
             };
             if !self.mark_auto_checked(&stream) {
@@ -384,6 +392,9 @@ impl Shared {
 
     /// Start recording `stream` (manual or automatic).
     async fn start(self: &Arc<Self>, stream: Arc<LiveStream>) -> Result<Recording, RecorderError> {
+        if let Some(node) = stream.origin.remote_node() {
+            return Err(RecorderError::Remote(node.to_string()));
+        }
         let name = stream.name.clone();
         let mut rec = Recording {
             id: uuid::Uuid::new_v4().to_string(),

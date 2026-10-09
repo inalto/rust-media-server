@@ -43,6 +43,7 @@ impl From<RecorderError> for ApiError {
             RecorderError::NotLive
             | RecorderError::AlreadyRecording
             | RecorderError::NotRecording
+            | RecorderError::Remote(_)
             | RecorderError::Busy => ApiError::conflict(e.to_string()),
             RecorderError::NotFound => ApiError::not_found(e.to_string()),
             RecorderError::Other(err) => ApiError::Internal(format!("{err:#}")),
@@ -142,16 +143,14 @@ async fn download(
     let rec = db::recordings::get(&state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("recording not found"))?;
-    let path = state
-        .recorder
-        .file_path(&rec)
-        .filter(|p| p.is_file())
-        .ok_or_else(|| ApiError::not_found("recording file not found"))?;
-    let resp = match ServeFile::new(&path).oneshot(req).await {
-        Ok(r) => r,
-        Err(never) => match never {},
+    let mut resp = match state.recorder.file_path(&rec).filter(|p| p.is_file()) {
+        Some(path) => match ServeFile::new(&path).oneshot(req).await {
+            Ok(r) => r.map(Body::new),
+            Err(never) => match never {},
+        },
+        // Cluster mode without shared storage: the node that wrote it serves it.
+        None => remote_file(&state, &rec, req.headers()).await?,
     };
-    let mut resp = resp.map(Body::new);
     if resp.status().is_success() {
         let disposition = format!(
             "{}; filename=\"{}\"",
@@ -168,6 +167,40 @@ async fn download(
         );
     }
     Ok(resp)
+}
+
+/// The recording file from the node that wrote it (`GET /internal/files/recordings/…`
+/// on that node, Range forwarded). 404 on a single node or when it is this node.
+async fn remote_file(
+    state: &AppState,
+    rec: &Recording,
+    headers: &axum::http::HeaderMap,
+) -> ApiResult<Response> {
+    let not_found = || ApiError::not_found("recording file not found");
+    if !state.cluster.enabled() {
+        return Err(not_found());
+    }
+    let node = db::recordings::node_of(&state.db, &rec.id)
+        .await?
+        .filter(|n| n != state.cluster.node_id())
+        .ok_or_else(not_found)?;
+    let base = state.cluster.node_url(&node).await.ok_or_else(|| {
+        ApiError::unavailable(format!(
+            "the recording is stored on node {node}, which is not reachable"
+        ))
+    })?;
+    let resp = state
+        .cluster
+        .client()
+        .file(&base, "recordings", &rec.path, headers)
+        .await
+        .map_err(|e| {
+            ApiError::unavailable(format!("cannot fetch the recording from node {node}: {e}"))
+        })?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(not_found());
+    }
+    Ok(crate::cluster::http::proxied_file_response(resp))
 }
 
 #[cfg(test)]
