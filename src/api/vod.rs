@@ -12,14 +12,16 @@
 //! - `GET /vod/{id}/embed` → [`VodEmbedInfo`]
 //! - `GET /vod/{id}/source` → the original file (attachment, Range)
 //!
-//! Public (`/api/v1/public`, CORS `*`): `GET /public/vod` → ready videos,
+//! Public (`/api/v1/public`, CORS `*`): `GET /public/vod` → ready **public** videos,
 //! `GET /public/vod/{id}` → [`PublicVod`] (any status, so the player can say "processing").
+//! A private video (phase 8A) needs `?token=&expires=` (signed URL, `storage::sign`):
+//! 401 without a valid one, otherwise its playback URLs carry the token.
 
 use axum::body::{Body, Bytes};
 use axum::extract::multipart::{Field, MultipartRejection};
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -107,6 +109,8 @@ pub struct VodView {
     pub source_available: bool,
     /// Current HLS/DASH sessions of this video.
     pub viewers_now: u32,
+    /// Path of the original in its bucket (encodings of bucket files, phase 8A).
+    pub object_path: Option<String>,
 }
 
 pub fn vod_view(state: &AppState, base: &BaseUrl, item: VodItem) -> VodView {
@@ -126,6 +130,7 @@ pub fn vod_view(state: &AppState, base: &BaseUrl, item: VodItem) -> VodView {
         poster_url,
         source_available,
         viewers_now,
+        object_path: item.bucket_id.as_ref().map(|_| item.source_path.clone()),
         item,
     }
 }
@@ -523,6 +528,8 @@ async fn upload(
 struct PatchBody {
     title: Option<String>,
     description: Option<String>,
+    /// `public` | `private` (phase 8A).
+    visibility: Option<String>,
 }
 
 async fn patch(
@@ -538,9 +545,26 @@ async fn patch(
         .as_deref()
         .map(clean_description)
         .transpose()?;
-    let updated = repo::update_meta(&state.db, &item.id, title, description)
+    let visibility = body
+        .visibility
+        .as_deref()
+        .map(|v| crate::storage::parse_visibility("visibility", v))
+        .transpose()?;
+    // Signed URLs use the signing key of the bucket: the admin library stays public.
+    if visibility.as_deref() == Some(repo::VISIBILITY_PRIVATE) && item.bucket_id.is_none() {
+        return Err(ApiError::invalid(
+            "visibility",
+            "only encodings of bucket files can be private",
+        ));
+    }
+    let mut updated = repo::update_meta(&state.db, &item.id, title, description)
         .await?
         .ok_or_else(|| ApiError::not_found("video not found"))?;
+    if let Some(v) = visibility {
+        updated = repo::set_visibility(&state.db, &item.id, &v)
+            .await?
+            .ok_or_else(|| ApiError::not_found("video not found"))?;
+    }
     state.vod.changed(&updated.id);
     let base = BaseUrl::from_request(&state.config, &headers);
     Ok(Json(vod_view(&state, &base, updated)))
@@ -580,6 +604,10 @@ async fn delete(
     state.vod.remove_files(&item.id).await;
     tracing::info!(id = %item.id, title = %item.title, "video on demand deleted");
     state.vod.changed(&item.id);
+    // An encoding of a bucket file: the original stays, the counters drop its output.
+    if let Some(bucket) = &item.bucket_id {
+        crate::storage::recount(&state, bucket).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -707,25 +735,56 @@ fn revision_url(url: &str, item: &VodItem) -> String {
     }
 }
 
+/// The signed token of a request for a private item: valid `?token=&expires=` → its
+/// query string; otherwise 401.
+pub async fn require_signed(state: &AppState, item: &VodItem, uri: &Uri) -> ApiResult<String> {
+    let key = state
+        .vod
+        .playback_access(&item.id)
+        .await?
+        .and_then(|a| a.signing_key);
+    let now = chrono::Utc::now().timestamp();
+    match (
+        crate::storage::sign::SignedToken::from_query(uri.query()),
+        key,
+    ) {
+        (Some(t), Some(key))
+            if crate::storage::sign::verify(&key, &item.id, &t.token, t.expires, now) =>
+        {
+            Ok(t.query())
+        }
+        _ => Err(ApiError::TokenRequired(
+            "this video is private: a valid signed link (token, expires) is required".into(),
+        )),
+    }
+}
+
 async fn public_info(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> ApiResult<Json<PublicVod>> {
     let item = load(&state, &id).await?;
+    let signed = if item.is_private() {
+        require_signed(&state, &item, &uri).await?
+    } else {
+        String::new()
+    };
     let (language, theme) = db::settings::ui_prefs(&state.db).await?;
     let base = BaseUrl::from_request(&state.config, &headers);
     let urls = VodUrls::new(&base, &item.id);
     let ready = item.is_ready();
+    let url = |u: &str| crate::storage::sign::append_query(&revision_url(u, &item), &signed);
     Ok(Json(PublicVod {
         poster_url: state
             .vod
             .poster_path(&item.id)
             .is_file()
-            .then(|| revision_url(&urls.poster, &item)),
+            .then(|| url(&urls.poster)),
         sources: PublicVodSources {
-            hls: ready.then(|| revision_url(&urls.hls, &item)),
-            dash: ready.then(|| revision_url(&urls.dash, &item)),
+            hls: ready.then(|| url(&urls.hls)),
+            dash: ready.then(|| url(&urls.dash)),
         },
         renditions: item.renditions.iter().map(PublicRendition::from).collect(),
         id: item.id,
@@ -745,6 +804,8 @@ async fn public_list(
 ) -> ApiResult<Json<Vec<PublicVodSummary>>> {
     let base = BaseUrl::from_request(&state.config, &headers);
     let mut items = repo::list(&state.db, Some(repo::STATUS_READY)).await?;
+    // The catalogue lists public videos only.
+    items.retain(|i| !i.is_private());
     // Most recently published first.
     items.sort_by(|a, b| {
         b.ready_at

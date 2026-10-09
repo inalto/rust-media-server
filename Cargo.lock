@@ -2271,12 +2271,15 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "clap",
  "futures",
  "hex",
+ "hmac 0.13.0",
  "mime_guess",
+ "percent-encoding",
  "rand 0.10.3",
  "reqwest",
  "rtc",
@@ -2296,6 +2299,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "uuid",
 ]
 

@@ -25,7 +25,7 @@ use rust_media_server::packager::{self, PackagerManager};
 use rust_media_server::recorder::RecorderManager;
 use rust_media_server::state::{AppState, AppStateParts};
 use rust_media_server::webrtc::WebRtcManager;
-use rust_media_server::{api, cluster, egress, vod, web};
+use rust_media_server::{api, cluster, egress, storage, vod, web};
 
 /// rust-media-server: RTMP ingest, HTTP-FLV / WS-FLV / LL-HLS / LL-DASH egress.
 #[derive(Debug, Parser)]
@@ -154,6 +154,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         config.waiting_dir(),
         config.recordings_dir(),
         config.vod_dir(),
+        config.storage_root(),
     ] {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -277,6 +278,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .merge(packager::router())
         .merge(WebRtcManager::router())
         .merge(vod::router())
+        .merge(storage::api::router(&state))
         .merge(cluster::http::health_router())
         .merge(web::router(&state))
         .fallback(|| async { ApiError::not_found("not found").into_response() });
