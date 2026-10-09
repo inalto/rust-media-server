@@ -122,15 +122,23 @@ async fn keep_lease(
         }
         match repo::renew_lease(mgr.db(), id).await {
             Ok(true) => {}
-            Ok(false) => {
-                // Deleted (the delete handler cancels the job) or taken over by another
-                // node after the lease expired: stop working on it.
-                if repo::get(mgr.db(), id).await.ok().flatten().is_some() {
+            Ok(false) => match repo::get(mgr.db(), id).await {
+                // Re-queued after the lease expired, or claimed by another node since:
+                // stop working on it and leave its files alone.
+                Ok(Some(item))
+                    if item.status == repo::STATUS_QUEUED
+                        || item.status == repo::STATUS_PROCESSING =>
+                {
                     tracing::warn!(id = %id, "VOD job lost its lease; cancelling");
                     lost.cancel();
+                    cancel.cancel();
                 }
-                cancel.cancel();
-            }
+                // `ready`/`failed`: this job is finishing (renewal raced the final update).
+                Ok(Some(_)) => {}
+                // Deleted (the delete handler cancels the job too).
+                Ok(None) => cancel.cancel(),
+                Err(e) => tracing::warn!(id = %id, error = %e, "cannot read the VOD job"),
+            },
             Err(e) => tracing::warn!(id = %id, error = %e, "cannot renew the VOD job lease"),
         }
     }

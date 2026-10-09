@@ -306,10 +306,13 @@ pub async fn run(mgr: Arc<VodManager>, shutdown: CancellationToken) {
                     false
                 });
         if leader != Some(holds) {
-            if holds {
-                tracing::info!(task = "vod-inbox", "this node scans the VOD inbox");
-            } else {
-                tracing::info!(task = "vod-inbox", "another node scans the VOD inbox");
+            // Leadership changes only matter (and are only logged) in cluster mode.
+            if mgr.db().pg().is_some() {
+                if holds {
+                    tracing::info!(task = "vod-inbox", "this node scans the VOD inbox");
+                } else {
+                    tracing::info!(task = "vod-inbox", "another node scans the VOD inbox");
+                }
             }
             leader = Some(holds);
         }

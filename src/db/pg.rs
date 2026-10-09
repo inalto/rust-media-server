@@ -102,12 +102,22 @@ pub async fn migrate(pool: &PgPool) -> DbResult<()> {
         .bind(MIGRATION_LOCK_KEY)
         .execute(&mut *tx)
         .await?;
-    raw_sql(
-        "CREATE TABLE IF NOT EXISTS rms_schema_migrations (\
-         version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    // Checked first (instead of `CREATE TABLE IF NOT EXISTS`) to avoid a NOTICE in the
+    // log of every node start.
+    let exists: bool = sqlx_core::query::query::<Postgres>(
+        "SELECT to_regclass('rms_schema_migrations') IS NOT NULL",
     )
-    .execute(&mut *tx)
-    .await?;
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get(0)?;
+    if !exists {
+        raw_sql(
+            "CREATE TABLE rms_schema_migrations (\
+             version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
     let current: i32 = sqlx_core::query::query::<Postgres>(
         "SELECT COALESCE(MAX(version), 0) FROM rms_schema_migrations",
     )
