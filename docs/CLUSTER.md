@@ -372,7 +372,7 @@ Latenza reale del relay FLV (cold start e regime); durata del failover con `node
 | WHEP `307` (nodo senza WebRTC → altro nodo, cross-origin) | Chrome rimanda il `POST` con il corpo, preflight CORS ok, riproduzione dal nodo di destinazione; `DELETE` sullo stesso nodo (Location risolta su `res.url`) |
 | `DELETE` di una sessione WHEP inviato all'altro nodo | inoltrato via `/internal/whep/delete`, `200`, sessione chiusa |
 | Fine publish → relay chiuso e `offline` su entrambi i nodi | 0,45 s |
-| Stessa chiave pubblicata sull'altro nodo (kick interno, presa in carico) | 0,48 s (kick → claim 0,25 s con passo 250 ms, ora 100 ms) |
+| Stessa chiave pubblicata sull'altro nodo (kick interno, presa in carico) | 0,29 s (kick → claim 0,1 s; vecchio publisher scollegato, il nodo precedente ora fa relay) |
 | `kill -9` dell'owner (`node_ttl` 10 s, heartbeat 2 s) / container (`node_ttl` 15 s, heartbeat 5 s) | `offline` dopo 10,0 s / 14,3 s; ripubblicando passa al nodo vivo in 0,2 s |
 | Arresto ordinato del container owner (`podman stop`) | `offline` via HAProxy in 2,4 s |
 | Spettatori: un FLV sul nodo 1 + uno sul nodo 2 | serie, summary, overview e vista: `total = 2` su entrambi i nodi |
