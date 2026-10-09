@@ -135,6 +135,12 @@ description, visibility); `max_buckets` reached → 409.
   create dialog with scopes and permission rows (bucket select, prefix, access), expiry; list with prefix,
   scopes, last used, revoke. Account page: usage/quota, limits.
 - i18n keys in both dictionaries; colours via tokens; 390 px layouts.
+- As built (8B): routes use the bucket **name** (`#/buckets/<name>/<path…>`; admin `#/users/<username>/buckets/<name>/<path…>`);
+  the admin opens a user's buckets with the admin principal (account routes with `?user=`, the storage API with the
+  admin cookie) instead of "as the user"; a login with a key lacking the `account` scope is refused (and logged out);
+  the key edit dialog changes name, permissions and expiry (scopes are chosen at creation); uploads run one at a
+  time from a queue that survives folder navigation; the admin "Video on demand" library shows owner/bucket chips
+  and signs its preview of private items through `/account/buckets/{id}/sign?user=`. Details: ARCHITECTURE.md §23.
 
 ## 7. Phases
 
