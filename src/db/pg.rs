@@ -26,7 +26,7 @@ use super::{DbResult, PgPool};
 pub const MIGRATION_LOCK_KEY: i64 = 0x0072_6d73_5f6d_6967;
 
 /// `(version, SQL)` in order. Append new versions; never edit an applied one.
-pub const MIGRATIONS: &[(i32, &str)] = &[(1, SCHEMA_V1)];
+pub const MIGRATIONS: &[(i32, &str)] = &[(1, SCHEMA_V1), (2, SCHEMA_V2)];
 
 /// Latest PostgreSQL schema version.
 pub fn schema_version() -> i32 {
@@ -91,6 +91,12 @@ CREATE TABLE live_streams (
 CREATE TABLE singleton_tasks (
   name TEXT COLLATE "C" PRIMARY KEY, leased_by TEXT NOT NULL DEFAULT '',
   leased_until TIMESTAMPTZ NOT NULL DEFAULT '-infinity');
+"#;
+
+/// Phase 7C-2: the other nodes' live viewers are read every 2 s from the latest samples
+/// (`ts_epoch >= now - window`, all broadcasts): index it.
+const SCHEMA_V2: &str = r#"
+CREATE INDEX idx_samples_epoch ON viewer_samples(ts_epoch);
 "#;
 
 /// Apply the pending [`MIGRATIONS`] in one transaction under

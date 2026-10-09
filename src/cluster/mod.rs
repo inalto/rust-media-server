@@ -53,8 +53,8 @@ use relay::{RelayInfo, Relays};
 
 /// Claim attempts (one every [`CLAIM_RETRY`]) after kicking the live owner: about 3 s
 /// for the owner to drop its publisher and release the row.
-const CLAIM_ATTEMPTS: u32 = 12;
-const CLAIM_RETRY: Duration = Duration::from_millis(250);
+const CLAIM_ATTEMPTS: u32 = 30;
+const CLAIM_RETRY: Duration = Duration::from_millis(100);
 /// A `live_streams` row of this node without a local stream is released once it is
 /// this old (a publish between claim and `Hub::publish_start` is younger).
 const LEAKED_ROW_AGE: chrono::TimeDelta = chrono::TimeDelta::seconds(10);
