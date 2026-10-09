@@ -90,6 +90,8 @@ const ICONS = {
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>',
   moon: '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>',
   themeSystem: '<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/>',
+  layers: '<path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/>',
+  inbox: '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
 };
 
 /** Inline SVG icon (decorative: aria-hidden). */
@@ -196,6 +198,13 @@ export async function api(path, { method = 'GET', body, signal } = {}) {
 
 // Server error messages (English) → user-facing text in the UI language.
 const ERROR_TRANSLATIONS = [
+  [/video not found/i, () => t('error.vodNotFound')],
+  [/video on demand is disabled/i, () => t('error.vodDisabled')],
+  [/video on demand needs ffmpeg/i, () => t('error.vodNoFfmpeg')],
+  [/unknown ladder/i, () => t('error.vodUnknownLadder')],
+  [/already being transcoded|is being transcoded/i, () => t('error.vodBusy')],
+  [/source file is no longer available/i, () => t('error.vodNoSource')],
+  [/unsupported file type: upload a video .*wmv/i, () => t('error.vodUnsupportedType')],
   [/broadcast not found/i, () => t('error.broadcastNotFound')],
   [/already exists/i, () => t('error.alreadyExists')],
   [/title must not be empty/i, () => t('error.titleRequired')],
@@ -231,11 +240,12 @@ export function describeError(err) {
 }
 
 /**
- * Upload `file` as multipart field "file" with progress (XMLHttpRequest).
- * Returns {promise, abort}. Callbacks: onProgress(loaded, total), onSent() when the
- * last byte left the browser (server-side processing starts).
+ * Upload `file` as multipart field "file" with progress (XMLHttpRequest); `fields` are
+ * extra text fields sent before the file. Returns {promise, abort}. Callbacks:
+ * onProgress(loaded, total), onSent() when the last byte left the browser (server-side
+ * processing starts).
  */
-export function uploadFile(path, file, { onProgress, onSent } = {}) {
+export function uploadFile(path, file, { onProgress, onSent, fields } = {}) {
   const xhr = new XMLHttpRequest();
   const promise = new Promise((resolve, reject) => {
     xhr.open('POST', '/api/v1' + path);
@@ -256,6 +266,7 @@ export function uploadFile(path, file, { onProgress, onSent } = {}) {
     xhr.addEventListener('error', () => reject(new ApiError(0, 'network error')));
     xhr.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
     const form = new FormData();
+    for (const [k, v] of Object.entries(fields || {})) if (v != null && v !== '') form.append(k, v);
     form.append('file', file, file.name);
     xhr.send(form);
   });

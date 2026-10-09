@@ -10,6 +10,7 @@ pub mod public;
 pub mod recordings;
 pub mod settings;
 pub mod system;
+pub mod vod;
 pub mod waiting;
 
 use axum::Router;
@@ -38,11 +39,14 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(settings::routes(state))
         .merge(system::routes())
         .merge(events::routes())
+        .merge(vod::routes(state))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_admin,
         ));
-    let public = public::routes().layer(CorsLayer::permissive());
+    let public = public::routes()
+        .merge(vod::public_routes())
+        .layer(CorsLayer::permissive());
     Router::new().nest("/api/v1", admin.merge(auth::routes()).merge(public))
 }
 

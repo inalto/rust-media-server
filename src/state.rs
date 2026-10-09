@@ -15,6 +15,7 @@ use crate::hub::{Hub, HubEvent};
 use crate::metrics::ViewerTracker;
 use crate::packager::PackagerManager;
 use crate::recorder::RecorderManager;
+use crate::vod::VodManager;
 use crate::webrtc::WebRtcManager;
 
 #[derive(Clone)]
@@ -29,6 +30,9 @@ pub struct Inner {
     pub recorder: Arc<RecorderManager>,
     /// WebRTC (WHEP) egress.
     pub webrtc: Arc<WebRtcManager>,
+    /// Video on demand (built here from the config, the DB and the resolved ffmpeg;
+    /// `main.rs` spawns its tasks).
+    pub vod: Arc<VodManager>,
     /// Monotonic process start (uptime).
     pub started_at: Instant,
     pub started_at_utc: DateTime<Utc>,
@@ -60,6 +64,12 @@ impl AppState {
     pub fn new(p: AppStateParts) -> Self {
         let ffmpeg = p.config.ffmpeg_path();
         let events = p.hub.events();
+        let vod = VodManager::new(
+            p.config.clone(),
+            p.db.clone(),
+            events.clone(),
+            ffmpeg.clone(),
+        );
         AppState(Arc::new(Inner {
             config: p.config,
             db: p.db,
@@ -68,6 +78,7 @@ impl AppState {
             packager: p.packager,
             recorder: p.recorder,
             webrtc: p.webrtc,
+            vod,
             started_at: Instant::now(),
             started_at_utc: Utc::now(),
             events,

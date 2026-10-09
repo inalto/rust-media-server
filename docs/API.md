@@ -5,7 +5,7 @@ Events streams, the public player API, the playback endpoints (HTTP-FLV, WS-FLV,
 WebRTC via WHEP) and the HTML pages. It is derived from the code (`src/api/*.rs`, `src/egress/*.rs`,
 `src/packager/*.rs`, `src/webrtc/*.rs`, `src/web/mod.rs`, `src/main.rs`); where it and
 [ARCHITECTURE.md](ARCHITECTURE.md) §8 differ, this file describes the behaviour of the code (see also
-ARCHITECTURE.md §13, §14, §16 and §17).
+ARCHITECTURE.md §13, §14, §16, §17, §18 and §19).
 
 Conventions used below:
 
@@ -24,7 +24,8 @@ Conventions used below:
 2. [Errors](#2-errors)
 3. [Data types](#3-data-types)
 4. [Admin API](#4-admin-api): [Broadcasts](#41-broadcasts) - [Recording](#42-recording) - [Metrics](#43-metrics) -
-   [Waiting video and settings](#44-waiting-video-and-settings) - [System](#45-system) - [Events (SSE)](#46-events-sse)
+   [Waiting video and settings](#44-waiting-video-and-settings) - [System](#45-system) - [Events (SSE)](#46-events-sse) -
+   [Video on demand](#47-video-on-demand)
 5. [Public player API](#5-public-player-api)
 6. [Playback endpoints](#6-playback-endpoints)
 7. [Pages](#7-pages)
@@ -327,6 +328,74 @@ One row of the `recordings` table.
   "ffmpeg_available": true,
   "ui_language": "it",
   "ui_theme": "system"
+}
+```
+
+### VodView
+
+A video on demand item (`GET /api/v1/vod`, SSE `vod`). `id` is a UUID (lowercase, hyphenated; the API
+also accepts it in upper case).
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | UUID |
+| `title`, `description` | string | title ≤ 200 characters (default: the file name without extension, `_` → space), description ≤ 5000 |
+| `source_path` | string | original file relative to `data/vod/` (`<id>/source.<ext>`) |
+| `source_name` | string | original file name (download name) |
+| `source_size` | integer | bytes |
+| `source_duration_secs` | number \| null | from ffprobe |
+| `source_width`, `source_height` | integer \| null | *display* size (sample aspect ratio applied, rotation metadata honoured) |
+| `source_codec` | string \| null | e.g. `h264`, `hevc`, `prores` |
+| `origin` | `"upload"` \| `"inbox"` | dashboard/API upload or inbox folder |
+| `status` | `"queued"` \| `"processing"` \| `"ready"` \| `"failed"` | |
+| `progress` | integer | 0-99 while `processing`, 100 when `ready` |
+| `ladder` | string | ladder used (or to be used) for the transcode |
+| `renditions` | array | renditions actually produced (empty until `ready`): `{name, width, height, video_kbps, audio_kbps, bandwidth}`; `video_kbps` 0 = constant quality (CRF 23); `bandwidth` = measured peak bit rate (video + audio, bit/s), the HLS `BANDWIDTH` |
+| `error` | string \| null | ffmpeg's error (tail of stderr) when `failed` |
+| `created_at`, `updated_at`, `ready_at` | timestamp | `ready_at` is null until ready |
+| `plays` | integer | playback sessions started (see [6.6](#66-video-on-demand)) |
+| `urls` | object | `hls` (`/vod/{id}/hls/master.m3u8`), `dash` (`/vod/{id}/dash/manifest.mpd`), `poster` (`/vod/{id}/poster.jpg`), `embed` (`/embed/vod/{id}`), `watch` (`/watch/{id}`), absolute |
+| `poster_url` | string \| null | `urls.poster` when the poster exists |
+| `source_available` | boolean | the original is still stored (download, re-transcode); false after a transcode with `vod.keep_source = false` |
+| `viewers_now` | integer | current HLS + DASH sessions of this video |
+
+```json
+{
+  "id": "4fb48570-aaa4-45ed-8bd6-46f2e62f794d",
+  "title": "Test 1080p",
+  "description": "Mira di prova 30 s",
+  "source_path": "4fb48570-aaa4-45ed-8bd6-46f2e62f794d/source.mp4",
+  "source_name": "src1080.mp4",
+  "source_size": 20729831,
+  "source_duration_secs": 30.0,
+  "source_width": 1920,
+  "source_height": 1080,
+  "source_codec": "h264",
+  "origin": "upload",
+  "status": "ready",
+  "progress": 100,
+  "ladder": "standard",
+  "renditions": [
+    {"name": "1080p", "width": 1920, "height": 1080, "video_kbps": 5000, "audio_kbps": 160, "bandwidth": 5252266},
+    {"name": "720p", "width": 1280, "height": 720, "video_kbps": 2800, "audio_kbps": 128, "bandwidth": 3009751},
+    {"name": "480p", "width": 854, "height": 480, "video_kbps": 1400, "audio_kbps": 96, "bandwidth": 1565627},
+    {"name": "360p", "width": 640, "height": 360, "video_kbps": 800, "audio_kbps": 96, "bandwidth": 939985}
+  ],
+  "error": null,
+  "created_at": "2026-10-09T16:59:54.023Z",
+  "updated_at": "2026-10-09T17:01:39.219Z",
+  "ready_at": "2026-10-09T17:01:39.219Z",
+  "plays": 4,
+  "urls": {
+    "hls": "http://127.0.0.1:8080/vod/4fb48570-aaa4-45ed-8bd6-46f2e62f794d/hls/master.m3u8",
+    "dash": "http://127.0.0.1:8080/vod/4fb48570-aaa4-45ed-8bd6-46f2e62f794d/dash/manifest.mpd",
+    "poster": "http://127.0.0.1:8080/vod/4fb48570-aaa4-45ed-8bd6-46f2e62f794d/poster.jpg",
+    "embed": "http://127.0.0.1:8080/embed/vod/4fb48570-aaa4-45ed-8bd6-46f2e62f794d",
+    "watch": "http://127.0.0.1:8080/watch/4fb48570-aaa4-45ed-8bd6-46f2e62f794d"
+  },
+  "poster_url": "http://127.0.0.1:8080/vod/4fb48570-aaa4-45ed-8bd6-46f2e62f794d/poster.jpg",
+  "source_available": true,
+  "viewers_now": 0
 }
 ```
 
@@ -697,6 +766,15 @@ Upload of the global default video (same pipeline and limits as above, stored un
     "publishers": 1,
     "audio": true,
     "error": null
+  },
+  "vod": {
+    "enabled": true,
+    "available": true,
+    "inbox_dir": "./data/vod/inbox",
+    "jobs_running": 1,
+    "queued": 2,
+    "max_parallel_jobs": 1,
+    "encoder": "libx264"
   }
 }
 ```
@@ -709,6 +787,10 @@ not be bound (`error` says why); `candidates` are the ICE host candidates given 
 (`webrtc.public_ip`, else the IPv4 addresses of the local interfaces, with `udp_port`); `sessions` counts
 WHEP sessions (connecting or connected); `publishers` the broadcasts with a running WebRTC publisher;
 `audio` is false without ffmpeg (sessions are then video-only).
+
+`vod`: `enabled` is `vod.enabled`; `available` is false when disabled or when ffmpeg/ffprobe are missing
+(no uploads, no inbox, no transcoding; existing videos stay playable); `inbox_dir` the watched folder;
+`jobs_running` the transcodes running in this process; `queued` the items waiting (database).
 
 ### 4.6 Events (SSE)
 
@@ -726,6 +808,8 @@ Admin Server-Sent Events stream (`Content-Type: text/event-stream`, `Cache-Contr
 | `viewers` | `{"name": "evento-2026", "counts": ViewerCounts}` | the viewer counts of a broadcast changed |
 | `broadcast_deleted` | `{"name": "evento-2026"}` | a broadcast was deleted |
 | `settings` | `{"ui_language": "en", "ui_theme": "system", "default_waiting_text": "The live stream will start shortly"}` | after a `PATCH /api/v1/settings` that set `ui_language`, `ui_theme` and/or `default_waiting_text` (effective values) |
+| `vod` | a full [VodView](#vodview) | a video on demand item was created (upload, inbox), changed status, progressed (≥ 1 %, at most every 0.5 s), got its poster, was edited or re-queued, or counted a play |
+| `vod_deleted` | `{"id": "4fb48570-…"}` | a video on demand item was deleted |
 
 ```
 event: viewers
@@ -735,7 +819,103 @@ event: stream
 data: {"name":"evento-2026","status":"live"}
 ```
 
-Events are not replayed: after a reconnect, re-read `GET /api/v1/broadcasts`.
+Events are not replayed: after a reconnect, re-read `GET /api/v1/broadcasts` (and `GET /api/v1/vod`).
+The viewer counts of a video on demand also arrive as `viewers` events with `name` = `vod:<id>`.
+
+### 4.7 Video on demand
+
+Uploaded (or inbox) videos are transcoded by ffmpeg in **one pass** into every rendition of a *ladder*
+(`[vod]` in the configuration, ARCHITECTURE.md §19) and packaged as CMAF (fMP4) segments served both as
+HLS and as DASH. Needs ffmpeg and ffprobe; with `vod.enabled = false` or without them, uploads and
+re-transcodes answer `503` (listing, editing, deleting and playback still work).
+
+#### `GET /api/v1/vod`
+
+- Query: `status` = `queued` | `processing` | `ready` | `failed` (optional; anything else → `400`).
+- Response `200`: `[VodView]`, newest first.
+
+#### `POST /api/v1/vod`
+
+Multipart form (streamed to `data/upload-tmp/`, never buffered in memory):
+
+| Field | Required | Notes |
+|---|---|---|
+| `file` | yes | the video. Accepted extensions: `mp4`, `mov`, `m4v`, `mkv`, `webm`, `avi`, `mts`, `m2ts`, `ts`, `mxf`, `flv`, `mpg`, `mpeg`, `wmv` (else the MIME type: `video/mp4`, `video/quicktime`, `video/x-matroska`, `video/webm`, `video/x-msvideo`, `video/mp2t`, `application/mxf`, `video/x-flv`, `video/mpeg`, `video/x-ms-wmv`, ...). Only the first `file` field is used |
+| `title` | no | default: the file name without extension, `_` → space |
+| `description` | no | ≤ 5000 characters |
+| `ladder` | no | a configured ladder (default `vod.default_ladder`); sent *before* `file`, an unknown ladder is rejected before the upload is received |
+
+The file is probed with ffprobe, moved to `data/vod/<id>/source.<ext>` and queued.
+
+- Response `201`: the [VodView](#vodview) (`status: "queued"`).
+- Errors: `400` missing `file`, empty file, unknown ladder, title/description too long or a text field
+  over 64 KiB; `413` larger than `server.max_upload_mb` MiB; `415` unsupported type; `422` ffprobe cannot
+  read the file or it has no video stream (`could not process the video: ...`); `503` VOD disabled or
+  ffmpeg/ffprobe missing.
+
+#### `GET /api/v1/vod/ladders`
+
+The ladders of the configuration (read-only) and the VOD limits:
+
+```json
+{
+  "enabled": true,
+  "available": true,
+  "default_ladder": "standard",
+  "ladders": [
+    {"name": "standard", "description": "1080p → 360p, per desktop e mobile", "renditions": [
+      {"name": "1080p", "height": 1080, "video_kbps": 5000, "audio_kbps": 160},
+      {"name": "720p", "height": 720, "video_kbps": 2800, "audio_kbps": 128},
+      {"name": "480p", "height": 480, "video_kbps": 1400, "audio_kbps": 96},
+      {"name": "360p", "height": 360, "video_kbps": 800, "audio_kbps": 96}]},
+    {"name": "mobile", "description": "720p e 360p, leggero per le reti mobili", "renditions": ["..."]},
+    {"name": "single", "description": "Una sola qualità, alla risoluzione originale (CRF 23)", "renditions": [
+      {"name": "source", "height": 0, "video_kbps": 0, "audio_kbps": 128}]}
+  ],
+  "inbox_dir": "./data/vod/inbox",
+  "segment_duration": 4.0,
+  "encoder": "libx264",
+  "keep_source": true,
+  "max_upload_mb": 1024,
+  "extensions": ["mp4", "mov", "m4v", "mkv", "webm", "avi", "mts", "m2ts", "ts", "mxf", "flv", "mpg", "mpeg", "wmv"]
+}
+```
+
+`height` is the short side of the output (the height of a landscape video, the width of a portrait one);
+`0` = the source size; `video_kbps` `0` = constant quality (CRF 23).
+
+#### `GET /api/v1/vod/{id}`
+
+- Response `200`: [VodView](#vodview); `404 video not found` for an unknown or malformed id.
+
+#### `PATCH /api/v1/vod/{id}`
+
+- Body: `{"title"?: string, "description"?: string}` (trimmed; empty title → `400`).
+- Response `200`: the updated [VodView](#vodview).
+
+#### `DELETE /api/v1/vod/{id}`
+
+- Query: `force=1` (also `true`, `yes`).
+- Response `204`: row, source, poster and renditions removed (`data/vod/<id>/`). `409` while the video
+  is `processing` unless `force` is given, which cancels the job (ffmpeg is killed) first.
+
+#### `POST /api/v1/vod/{id}/retranscode`
+
+- Body (optional, JSON): `{"ladder"?: string}` (default: the item's ladder).
+- Removes the current output (renditions and poster) and re-queues the item. Also the way to retry a
+  `failed` item.
+- Response `200`: the [VodView](#vodview) (`status: "queued"`). `400` unknown ladder; `409` already
+  `processing`, or the original was deleted (`vod.keep_source = false`); `503` VOD unavailable.
+
+#### `GET /api/v1/vod/{id}/embed`
+
+- Response `200`: `{iframe, urls, snippets: {hlsjs, dashjs}}`: the `<iframe>` of `/embed/vod/{id}`,
+  the [VodView](#vodview) `urls`, and ready-to-paste hls.js (`startLevel: -1`,
+  `capLevelToPlayerSize: true`, native HLS fallback) and dash.js examples.
+
+#### `GET /api/v1/vod/{id}/source`
+
+- The original file (`Content-Disposition: attachment`, `Range` supported). `404` when it was removed.
 
 ---
 
@@ -808,6 +988,42 @@ Server-Sent Events with the status of one broadcast (`Content-Type: text/event-s
 event: status
 data: {"status":"live"}
 ```
+
+#### `GET /api/v1/public/vod`
+
+The ready videos on demand, most recently published first (used by the `/vod` catalogue page):
+
+```json
+[{"id": "4fb48570-aaa4-45ed-8bd6-46f2e62f794d", "title": "Test 1080p", "description": "Mira di prova 30 s",
+  "duration_secs": 30.0, "poster_url": "http://127.0.0.1:8080/vod/4fb48570-…/poster.jpg",
+  "watch_url": "http://127.0.0.1:8080/watch/4fb48570-…", "ready_at": "2026-10-09T17:01:39.219Z"}]
+```
+
+#### `GET /api/v1/public/vod/{id}`
+
+Player info of one video, in **any** status (the player shows "processing" until it is ready); `404
+video not found` for unknown ids.
+
+```json
+{
+  "id": "4fb48570-aaa4-45ed-8bd6-46f2e62f794d",
+  "title": "Test 1080p",
+  "description": "Mira di prova 30 s",
+  "status": "ready",
+  "progress": 100,
+  "duration_secs": 30.0,
+  "poster_url": "http://127.0.0.1:8080/vod/4fb48570-…/poster.jpg",
+  "sources": {
+    "hls": "http://127.0.0.1:8080/vod/4fb48570-…/hls/master.m3u8",
+    "dash": "http://127.0.0.1:8080/vod/4fb48570-…/dash/manifest.mpd"
+  },
+  "renditions": [{"name": "1080p", "width": 1920, "height": 1080, "bandwidth": 5252266}, "..."],
+  "ui_language": "it",
+  "ui_theme": "system"
+}
+```
+
+`sources.*` are `null` until `status` is `ready`; `error` details are never exposed.
 
 ---
 
@@ -1081,13 +1297,67 @@ await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
 
 ---
 
+### 6.6 Video on demand
+
+| Route | Content |
+|---|---|
+| `GET /vod/{id}/hls/master.m3u8` | HLS master playlist (`application/vnd.apple.mpegurl`, `Cache-Control: public, max-age=60`) |
+| `GET /vod/{id}/hls/media_<n>.m3u8` | HLS media playlists (same headers) |
+| `GET /vod/{id}/dash/manifest.mpd` | static DASH MPD (`application/dash+xml`, `public, max-age=60`) |
+| `GET /vod/{id}/{hls,dash}/init-<n>.m4s` | CMAF init segment of representation `n` (`video/mp4`) |
+| `GET /vod/{id}/{hls,dash}/chunk-<n>-<k>.m4s` | media segment `k` (`video/iso.segment`) |
+| `GET /vod/{id}/poster.jpg` | poster (frame at 10 % of the duration, ≤ 1280 px wide; `public, max-age=60`) |
+
+All public, CORS `*`, `Range` supported (HEAD too). Both prefixes serve the same files
+(`data/vod/<id>/abr/`), so the relative URLs inside the manifests resolve under the prefix of the
+manifest. Segments and init segments are referenced with a `?v=<revision>` query (new at every
+transcode) and served with `Cache-Control: public, max-age=31536000, immutable`. The master and the MPD
+answer `404 video not ready` / `404 video not found` unless the item is `ready`; other unknown files
+are `404`.
+
+- **HLS**: version 7, `#EXT-X-INDEPENDENT-SEGMENTS`, one `#EXT-X-MEDIA` audio group per audio bitrate
+  (`aud160`, `aud128`, ...), one `#EXT-X-STREAM-INF` per rendition with `BANDWIDTH` (measured peak segment
+  bit rate, video + its audio), `AVERAGE-BANDWIDTH`, `RESOLUTION`, `FRAME-RATE`, `CODECS`
+  (`avc1.640029,mp4a.40.2`: High profile from 720p, Main below; level 4.1 or higher when needed) and
+  `AUDIO`; the largest rendition up to 720p is listed first (native players start with it). Media
+  playlists: `#EXT-X-PLAYLIST-TYPE:VOD`, `#EXT-X-MAP`, `EXTINF` = `vod.segment_duration` (default 4 s;
+  every segment starts with a keyframe), `#EXT-X-ENDLIST`.
+- **DASH**: `type="static"`, one video adaptation set (all renditions) and one audio adaptation set
+  (one representation per distinct audio bitrate), `SegmentTemplate` with `$Number%05d$`.
+
+Every request touches the viewer tracker under the name `vod:<id>` (protocol `hls` / `dash`; sessions
+expire after `metrics.session_timeout_secs`): that is `viewers_now`. A master/MPD request that opens a
+new session increments `plays`. VOD sessions are not written to the live metrics tables.
+
+```text
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud160",NAME="AAC 160 kbit/s",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="media_4.m3u8?v=5f4db239"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud128",NAME="AAC 128 kbit/s",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="media_5.m3u8?v=5f4db239"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud96",NAME="AAC 96 kbit/s",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="media_6.m3u8?v=5f4db239"
+#EXT-X-STREAM-INF:BANDWIDTH=3009751,AVERAGE-BANDWIDTH=2928487,RESOLUTION=1280x720,FRAME-RATE=30.000,CODECS="avc1.640029,mp4a.40.2",AUDIO="aud128"
+media_1.m3u8?v=5f4db239
+#EXT-X-STREAM-INF:BANDWIDTH=5252266,AVERAGE-BANDWIDTH=5162686,RESOLUTION=1920x1080,FRAME-RATE=30.000,CODECS="avc1.640029,mp4a.40.2",AUDIO="aud160"
+media_0.m3u8?v=5f4db239
+#EXT-X-STREAM-INF:BANDWIDTH=1565627,AVERAGE-BANDWIDTH=1497718,RESOLUTION=854x480,FRAME-RATE=30.000,CODECS="avc1.4d4029,mp4a.40.2",AUDIO="aud96"
+media_2.m3u8?v=5f4db239
+#EXT-X-STREAM-INF:BANDWIDTH=939985,AVERAGE-BANDWIDTH=896886,RESOLUTION=640x360,FRAME-RATE=30.000,CODECS="avc1.4d4029,mp4a.40.2",AUDIO="aud96"
+media_3.m3u8?v=5f4db239
+```
+
+---
+
 ## 7. Pages
 
 | Route | Description |
 |---|---|
-| `GET /` | the dashboard SPA (`text/html`, `Cache-Control: no-cache`, Italian or English UI per `ui_language`, which also sets `<html lang>`; `<html data-theme>` from `ui_theme`, overridden before the first paint by this browser's toggle choice (`localStorage` `rms.theme`); hash routes `#/`, `#/b/{name}`, `#/settings`). Shows the login view when the API answers 401 |
+| `GET /` | the dashboard SPA (`text/html`, `Cache-Control: no-cache`, Italian or English UI per `ui_language`, which also sets `<html lang>`; `<html data-theme>` from `ui_theme`, overridden before the first paint by this browser's toggle choice (`localStorage` `rms.theme`); hash routes `#/`, `#/b/{name}`, `#/vod`, `#/settings`). Shows the login view when the API answers 401 |
 | `GET /embed/{name}` | player page for iframes |
 | `GET /player/{name}` | the same player as a full page, with the title above it |
+| `GET /embed/vod/{id}` | video on demand player for iframes |
+| `GET /watch/{id}` | the same VOD player as a full page, with title, description and a link to `/vod` |
+| `GET /vod` | public catalogue of the ready videos on demand (links to `/watch/{id}`; `?lang=`, `?theme=` as the player pages) |
 | `GET /static/{file}` | assets embedded in the binary |
 | `GET /waiting/{path}` | files of `data/waiting/` (waiting videos and posters) |
 | `GET /favicon.ico` | `204 No Content` (the icon is `/static/favicon.svg`) |
@@ -1139,6 +1409,33 @@ hls.js 1.7.3 (`lowLatencyMode`, `liveSyncDuration: 1.5`, `liveMaxLatencyDuration
 `peerConnection` (WebRTC only), `theme` (resolved: `light` / `dark`), `setSource(src)` and `reload()`
 for debugging.
 
+### `/embed/vod/{id}` and `/watch/{id}`
+
+Both serve `vod.html` (`data-kind="vod"`, `data-mode="embed"` or `"watch"`); `player.js` then runs its
+VOD mode (`vod-player.js`). A malformed id is a plain-text `404`; an unknown well-formed id gets the page,
+which shows "Video non trovato" ("Video not found"). The page reads
+[`/api/v1/public/vod/{id}`](#get-apiv1publicvodid): while the video is `queued`/`processing` it shows a
+"processing" card with the progress (polled every 5 s) and starts by itself when it is ready.
+
+| Parameter | Values | Default | Effect |
+|---|---|---|---|
+| `autoplay` | `1` / `0` | `0` | start playing at once (otherwise the poster is shown until the viewer presses play) |
+| `muted` | `1` / `0` | = `autoplay` | start muted; with `autoplay=1&muted=0` a blocked autoplay is retried muted with an "Attiva audio" button |
+| `controls` | `1` / `0` | `1` | native video controls (without them a play button is shown) |
+| `t` | seconds | `0` | start position |
+| `src` | `auto`, `hls`, `dash` | `auto` | `auto`/`hls`: native HLS on iOS/Safari, else hls.js, falling back to dash.js; `dash`: dash.js only |
+| `lang` | `it` / `en` | `ui_language` | as the live player |
+| `theme` | `system` / `light` / `dark` | `ui_theme` | as the live player |
+
+hls.js 1.7.3 runs with `startLevel: -1` and `capLevelToPlayerSize: true` (adaptive bitrate); dash.js
+5.2.1 with its default ABR. A quality button over the video lists *Auto* and every rendition
+(`hls.levels` / dash.js video representations, labelled by the short side, e.g. `720p`, with the bit
+rate); choosing one pins it (`hls.currentLevel` / `setRepresentationForTypeById` with automatic switching
+off), *Auto* restores ABR. Native HLS has no quality API: the button is hidden. `window.rmsPlayer`
+exposes `kind: "vod"`, `status`, `source`, `engine` (`hls.js`, `native`, `dash.js`), `hls`, `dash`
+(the library instances), `levels`, `currentLevel`, `autoLevel`, `setLevel(i)` (`-1` = Auto), `info`,
+`language`, `theme`, `options`, `reload()`.
+
 ### `/waiting/{path}`
 
 Static file server over `data/waiting/` (with `Range` support, MIME type from the extension): waiting
@@ -1152,7 +1449,8 @@ Only the top-level files below exist (no sub-paths); unknown names return a plai
 carry `Cache-Control: no-cache` and a content-hash `ETag`; `If-None-Match` is honoured (`304`).
 
 `index.html`, `app.js`, `core.js`, `detail.js`, `metrics.js`, `mock.js`, `style.css` (dashboard);
-`embed.html`, `player.js` (ES module), `player.css` (player); `i18n.js` (Italian/English texts and
+`embed.html`, `player.js` (ES module), `player.css` (player); `vod.js` (dashboard VOD section),
+`vod.html`, `vod-player.js` (VOD player), `catalog.html`, `catalog.js` (public catalogue); `i18n.js` (Italian/English texts and
 formatting, shared by the dashboard and the player); `theme.js` (dark/light theme resolution, shared);
 `favicon.svg`.
 
@@ -1212,6 +1510,21 @@ curl -s $B/api/v1/public/ui                                     # {"language":"e
 curl -s -H "$H" -H "$J" -X PATCH -d '{"ui_theme":"light"}' $B/api/v1/settings | jq .ui_theme   # "light"
 curl -s -o /dev/null -w '%{http_code}\n' -H "$H" -H "$J" -X PATCH -d '{"ui_theme":"blue"}' $B/api/v1/settings   # 400
 curl -s -H "$H" $B/api/v1/system | jq
+
+# --- video on demand
+curl -s -H "$H" $B/api/v1/vod/ladders | jq '.ladders[].name'
+curl -s -H "$H" -F file=@evento.mp4 -F ladder=standard -F "title=Evento 2026" $B/api/v1/vod | jq '{id, status}'   # 201
+VOD=$(curl -s -H "$H" "$B/api/v1/vod?status=queued" | jq -r '.[0].id')
+curl -s -H "$H" $B/api/v1/vod/$VOD | jq '{status, progress, renditions}'
+curl -s -H "$H" -H "$J" -X PATCH -d '{"description":"Replica"}' $B/api/v1/vod/$VOD | jq .description
+curl -s -H "$H" -H "$J" -X POST -d '{"ladder":"mobile"}' $B/api/v1/vod/$VOD/retranscode | jq .status   # "queued"
+curl -s -H "$H" $B/api/v1/vod/$VOD/embed | jq -r .iframe
+curl -s -H "$H" -OJ $B/api/v1/vod/$VOD/source                # original file
+cp evento.mp4 ./data/vod/inbox/mobile/                       # inbox: imported with the "mobile" ladder
+curl -s $B/api/v1/public/vod | jq '.[].title'                 # ready videos, no token
+curl -s "$B/vod/$VOD/hls/master.m3u8"
+ffprobe "$B/vod/$VOD/dash/manifest.mpd"
+curl -s -H "$H" -X DELETE "$B/api/v1/vod/$VOD?force=1" -w '%{http_code}\n'   # 204
 
 # --- events (SSE); -N disables curl's output buffering
 curl -N -H "$H" $B/api/v1/events

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="it" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <script>(function () { try { var v = (new URLSearchParams(location.search).get('theme') || '').trim().toLowerCase(); if (v === 'system' || v === 'light' || v === 'dark') document.documentElement.setAttribute('data-theme', v); } catch (e) { /* keep the server's */ } })();</script>
+  <title>rms</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/player.css">
+</head>
+<!-- Video on demand player, served at /embed/vod/{id} (data-mode="embed", for iframes) and
+     /watch/{id} (data-mode="watch", full page with title and description). player.js
+     runs its VOD mode (vod-player.js) because of data-kind="vod". Query: autoplay,
+     muted, controls, t=<seconds>, src=auto|hls|dash, lang=it|en, theme=system|light|dark.
+     Texts are Italian fallbacks resolved by player.js (data-i18n*, i18n.js). -->
+<body data-kind="vod" data-mode="embed" data-id="{{ID}}">
+  <div class="page">
+    <header class="player-header">
+      <h1 id="title"></h1>
+    </header>
+    <div id="stage" class="stage" data-state="loading">
+      <video id="video" playsinline webkit-playsinline preload="metadata"></video>
+      <div id="notice" class="waiting notice" hidden>
+        <div class="waiting-card">
+          <h2 id="notice-title" class="waiting-title"></h2>
+          <p id="notice-text" class="waiting-text"></p>
+          <div id="notice-progress" class="notice-progress" hidden>
+            <progress max="100" value="0" aria-label="Avanzamento" data-i18n-aria-label="vodplayer.progressLabel"></progress>
+            <span></span>
+          </div>
+          <button id="notice-retry" type="button" class="pill" data-i18n="vodplayer.retry" hidden>Riprova</button>
+        </div>
+      </div>
+      <div id="spinner" class="spinner" role="status" aria-label="Caricamento del video" data-i18n-aria-label="vodplayer.loading" hidden></div>
+      <div class="actions">
+        <button id="play" type="button" class="pill" hidden>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><path d="M7 4.5v15l12-7.5z"/></svg>
+          <span data-i18n="player.play">Riproduci</span>
+        </button>
+        <button id="unmute" type="button" class="pill" hidden>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M11 5 6 9H2v6h4l5 4zM23 9l-6 6M17 9l6 6"/></svg>
+          <span data-i18n="player.unmute">Attiva audio</span>
+        </button>
+        <div class="quality">
+          <button id="quality-btn" type="button" class="pill" aria-haspopup="menu" aria-expanded="false" aria-controls="quality-menu" hidden>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>
+            <span id="quality-label" data-i18n="vodplayer.qualityAuto">Auto</span>
+          </button>
+          <div id="quality-menu" class="menu" role="menu" aria-label="Qualità" data-i18n-aria-label="vodplayer.quality" hidden></div>
+        </div>
+      </div>
+      <p id="sr-status" class="sr-only" aria-live="polite"></p>
+    </div>
+    <section class="watch-info">
+      <p id="description" class="watch-description" hidden></p>
+      <a id="catalog-link" class="watch-link" href="/vod" data-i18n="vodplayer.allVideos">Tutti i video</a>
+    </section>
+  </div>
+  <script type="module" src="/static/player.js"></script>
+</body>
+</html>

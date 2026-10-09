@@ -17,7 +17,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
-use axum::extract::multipart::MultipartRejection;
+use axum::extract::multipart::{Field, MultipartRejection};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -134,7 +134,7 @@ fn io_error(context: &str, e: std::io::Error) -> UploadError {
     UploadError::Api(ApiError::internal(format!("{context}: {e}")))
 }
 
-fn multipart_error(e: axum::extract::multipart::MultipartError) -> UploadError {
+pub(crate) fn multipart_error(e: axum::extract::multipart::MultipartError) -> UploadError {
     if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
         UploadError::Api(ApiError::PayloadTooLarge(
             "file is larger than the upload limit".into(),
@@ -229,16 +229,16 @@ pub async fn remove_video_files(state: &AppState, rel: &str) {
 // ---------------------------------------------------------------------------
 
 /// Temp file removed on drop unless [`TempFile::disarm`]ed.
-struct TempFile {
-    path: PathBuf,
+pub(crate) struct TempFile {
+    pub(crate) path: PathBuf,
     armed: bool,
 }
 
 impl TempFile {
-    fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self { path, armed: true }
     }
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -273,6 +273,58 @@ async fn sweep_stale_temp_files(dir: &FsPath) {
     }
 }
 
+/// `data/upload-tmp/` (created; leftovers older than a day removed): where uploads are
+/// streamed before being moved into place (waiting videos, video on demand).
+pub(crate) async fn upload_tmp_dir(state: &AppState) -> Result<PathBuf, UploadError> {
+    let tmp_dir = state.config.server.data_dir.join(TMP_SUBDIR);
+    tokio::fs::create_dir_all(&tmp_dir)
+        .await
+        .map_err(|e| io_error("creating upload directory", e))?;
+    sweep_stale_temp_files(&tmp_dir).await;
+    Ok(tmp_dir)
+}
+
+/// Stream a multipart file field to `<tmp_dir>/.upload-<uuid>.<ext>` (never buffered in
+/// memory). 413 over `max_upload_mb` MiB, 400 for an empty file; the temp file is
+/// removed on any error (and when the returned guard is dropped armed).
+pub(crate) async fn save_field(
+    field: &mut Field<'_>,
+    tmp_dir: &FsPath,
+    ext: &str,
+    max_upload_mb: u64,
+) -> Result<(TempFile, u64), UploadError> {
+    let limit = max_upload_mb.saturating_mul(MIB);
+    let tmp = TempFile::new(tmp_dir.join(format!(
+        "{TMP_PREFIX}{}.{ext}",
+        uuid::Uuid::new_v4().simple()
+    )));
+    let mut out = tokio::fs::File::create(&tmp.path)
+        .await
+        .map_err(|e| io_error("creating temp file", e))?;
+    let mut written: u64 = 0;
+    while let Some(chunk) = field.chunk().await.map_err(multipart_error)? {
+        written += chunk.len() as u64;
+        if written > limit {
+            return Err(UploadError::Api(ApiError::PayloadTooLarge(format!(
+                "file is larger than the upload limit ({max_upload_mb} MB)"
+            ))));
+        }
+        out.write_all(&chunk)
+            .await
+            .map_err(|e| io_error("writing temp file", e))?;
+    }
+    out.flush()
+        .await
+        .map_err(|e| io_error("writing temp file", e))?;
+    drop(out);
+    if written == 0 {
+        return Err(UploadError::Api(ApiError::bad_request(
+            "the uploaded file is empty",
+        )));
+    }
+    Ok((tmp, written))
+}
+
 /// Receive the multipart `file` field and store it as a waiting video under
 /// `data/waiting/<subdir>/`. Returns the new path relative to `data/waiting/`.
 pub(crate) async fn receive_waiting_video(
@@ -280,13 +332,8 @@ pub(crate) async fn receive_waiting_video(
     mut multipart: Multipart,
     subdir: &str,
 ) -> Result<String, UploadError> {
-    let limit = state.config.server.max_upload_mb.saturating_mul(MIB);
     let waiting_dir = state.config.waiting_dir();
-    let tmp_dir = state.config.server.data_dir.join(TMP_SUBDIR);
-    tokio::fs::create_dir_all(&tmp_dir)
-        .await
-        .map_err(|e| io_error("creating upload directory", e))?;
-    sweep_stale_temp_files(&tmp_dir).await;
+    let tmp_dir = upload_tmp_dir(state).await?;
 
     while let Some(mut field) = multipart.next_field().await.map_err(multipart_error)? {
         if field.name() != Some("file") {
@@ -298,35 +345,8 @@ pub(crate) async fn receive_waiting_video(
             state.ffmpeg.is_some(),
         )?;
         let original = field.file_name().unwrap_or("").to_string();
-        let mut tmp = TempFile::new(tmp_dir.join(format!(
-            "{TMP_PREFIX}{}.{ext}",
-            uuid::Uuid::new_v4().simple()
-        )));
-        let mut out = tokio::fs::File::create(&tmp.path)
-            .await
-            .map_err(|e| io_error("creating temp file", e))?;
-        let mut written: u64 = 0;
-        while let Some(chunk) = field.chunk().await.map_err(multipart_error)? {
-            written += chunk.len() as u64;
-            if written > limit {
-                return Err(UploadError::Api(ApiError::PayloadTooLarge(format!(
-                    "file is larger than the upload limit ({} MB)",
-                    state.config.server.max_upload_mb
-                ))));
-            }
-            out.write_all(&chunk)
-                .await
-                .map_err(|e| io_error("writing temp file", e))?;
-        }
-        out.flush()
-            .await
-            .map_err(|e| io_error("writing temp file", e))?;
-        drop(out);
-        if written == 0 {
-            return Err(UploadError::Api(ApiError::bad_request(
-                "the uploaded file is empty",
-            )));
-        }
+        let (mut tmp, written) =
+            save_field(&mut field, &tmp_dir, ext, state.config.server.max_upload_mb).await?;
         tracing::info!(file = %original, bytes = written, "waiting video received");
 
         let dest_dir = waiting_dir.join(subdir);

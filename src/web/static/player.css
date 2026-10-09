@@ -1,4 +1,5 @@
-/* rms embeddable player (/embed/{name} in iframes, /player/{name} full page).
+/* rms embeddable player (/embed/{name} in iframes, /player/{name} full page), video on
+ * demand player (/embed/vod/{id}, /watch/{id}) and public video catalogue (/vod).
  *
  * Dark and light themes as in style.css (ARCHITECTURE.md §18): <html data-theme> holds
  * the choice (`?theme=` or the `ui_theme` setting); `:root` is the dark palette, the
@@ -38,6 +39,20 @@
   --on-accent: #fff;
   --spinner-track: rgba(255, 255, 255, .25);
   --spinner-head: #fff;
+  --menu-bg: rgba(17, 22, 32, .96);
+  --menu-text: #fff;
+  --menu-muted: #a9b1c2;
+  --menu-hover: rgba(255, 255, 255, .1);
+  --menu-border: rgba(255, 255, 255, .14);
+  --menu-shadow: 0 10px 30px rgba(0, 0, 0, .5);
+  --menu-check: #8db4ff;
+  --progress-track: rgba(255, 255, 255, .18);
+  --card-bg: #121722;
+  --card-border: #263042;
+  --card-border-hover: #4a5a78;
+  --muted-text: #a9b1c2;
+  --thumb-bg: #1f283a;
+  --link: #8db4ff;
 }
 
 /* Light theme: explicit choice... */
@@ -71,6 +86,20 @@
   --on-accent: #fff;
   --spinner-track: rgba(255, 255, 255, .25);
   --spinner-head: #fff;
+  --menu-bg: rgba(255, 255, 255, .98);
+  --menu-text: #0f172a;
+  --menu-muted: #475569;
+  --menu-hover: rgba(15, 23, 42, .06);
+  --menu-border: rgba(15, 23, 42, .12);
+  --menu-shadow: 0 10px 30px rgba(15, 23, 42, .18);
+  --menu-check: #2563eb;
+  --progress-track: rgba(15, 23, 42, .12);
+  --card-bg: #fff;
+  --card-border: #d5dce6;
+  --card-border-hover: #7c8799;
+  --muted-text: #475569;
+  --thumb-bg: #e4e9f0;
+  --link: #1d4ed8;
 }
 
 /* ...or `system` with a light OS preference. Same values as above. */
@@ -105,6 +134,20 @@
     --on-accent: #fff;
     --spinner-track: rgba(255, 255, 255, .25);
     --spinner-head: #fff;
+    --menu-bg: rgba(255, 255, 255, .98);
+    --menu-text: #0f172a;
+    --menu-muted: #475569;
+    --menu-hover: rgba(15, 23, 42, .06);
+    --menu-border: rgba(15, 23, 42, .12);
+    --menu-shadow: 0 10px 30px rgba(15, 23, 42, .18);
+    --menu-check: #2563eb;
+    --progress-track: rgba(15, 23, 42, .12);
+    --card-bg: #fff;
+    --card-border: #d5dce6;
+    --card-border-hover: #7c8799;
+    --muted-text: #475569;
+    --thumb-bg: #e4e9f0;
+    --link: #1d4ed8;
   }
 }
 
@@ -170,4 +213,58 @@ body[data-mode="player"] .stage { height: auto; aspect-ratio: 16 / 9; border-rad
 }
 @media (prefers-reduced-motion: reduce) {
   .waiting::before, .pulse-badge .dot, .spinner { animation: none; }
+}
+
+/* ------------------------------------------------------------ video on demand */
+/* /watch/{id}: like /player/{name}, plus the description below the stage. */
+html:has(body[data-mode="watch"]), html:has(body[data-mode="catalog"]) { background: var(--root-bg); }
+body[data-mode="watch"], body[data-mode="catalog"] { background: var(--page-bg); height: auto; min-height: 100%; }
+body[data-mode="watch"] .page { height: auto; max-width: 1280px; margin: 0 auto; padding: 16px; }
+body[data-mode="watch"] .player-header { display: block; padding: 4px 0 14px; }
+body[data-mode="watch"] .player-header h1 { margin: 0; font-size: clamp(18px, 3vw, 26px); font-weight: 700; overflow-wrap: anywhere; }
+body[data-mode="watch"] .stage { height: auto; aspect-ratio: 16 / 9; border-radius: 12px; box-shadow: var(--stage-shadow); }
+.watch-info { display: none; }
+body[data-mode="watch"] .watch-info { display: flex; flex-direction: column; gap: 14px; padding: 16px 2px 8px; }
+.watch-description { margin: 0; font-size: 15px; line-height: 1.55; white-space: pre-line; overflow-wrap: anywhere; }
+.watch-link { align-self: flex-start; color: var(--link); font-weight: 600; text-decoration: none; }
+.watch-link:hover { text-decoration: underline; }
+.watch-link:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
+
+/* "Processing" / "not found" card over the stage (same look as the waiting screen). */
+.stage[data-state="queued"], .stage[data-state="processing"], .stage[data-state="failed"], .stage[data-state="error"] { background: var(--stage-waiting-bg); }
+.notice-progress { display: flex; flex-direction: column; align-items: center; gap: 6px; width: min(320px, 80%); }
+.notice-progress progress { width: 100%; height: 8px; appearance: none; -webkit-appearance: none; border: 0; border-radius: 4px; background: var(--progress-track); overflow: hidden; accent-color: var(--accent); }
+.notice-progress progress::-webkit-progress-bar { background: var(--progress-track); border-radius: 4px; }
+.notice-progress progress::-webkit-progress-value { background: var(--accent); border-radius: 4px; transition: width .3s; }
+.notice-progress progress::-moz-progress-bar { background: var(--accent); border-radius: 4px; }
+.notice-progress span { font-size: 14px; color: var(--waiting-text); font-variant-numeric: tabular-nums; }
+
+/* Quality menu (overlay pill, top right). */
+.quality { position: relative; }
+.menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 5; display: flex; flex-direction: column; min-width: 180px; max-height: min(60vh, 280px); overflow-y: auto; padding: 4px; border-radius: 10px; background: var(--menu-bg); color: var(--menu-text); border: 1px solid var(--menu-border); box-shadow: var(--menu-shadow); }
+.menu-item { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 14px; width: 100%; min-height: 34px; padding: 6px 10px 6px 30px; border: 0; border-radius: 6px; background: transparent; color: inherit; font: 600 13px/1.2 inherit; font-family: inherit; text-align: left; cursor: pointer; }
+.menu-item:hover, .menu-item:focus-visible { background: var(--menu-hover); outline: none; }
+.menu-item:focus-visible { box-shadow: inset 0 0 0 2px var(--focus); }
+.menu-item[aria-checked="true"]::before { content: ""; position: absolute; left: 11px; top: 50%; width: 9px; height: 5px; border-left: 2px solid var(--menu-check); border-bottom: 2px solid var(--menu-check); transform: translateY(-70%) rotate(-45deg); }
+.menu-sub { font-size: 12px; font-weight: 500; color: var(--menu-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* Public catalogue (/vod). */
+.catalog { max-width: 1240px; margin: 0 auto; padding: 28px 16px 48px; }
+.catalog-head h1 { margin: 0 0 4px; font-size: clamp(22px, 4vw, 30px); font-weight: 750; }
+.catalog-lead { margin: 0 0 22px; color: var(--muted-text); }
+.catalog-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 18px; }
+.catalog-card { display: flex; flex-direction: column; gap: 6px; padding: 10px; border: 1px solid var(--card-border); border-radius: 12px; background: var(--card-bg); color: var(--text); text-decoration: none; transition: border-color .15s; min-width: 0; }
+.catalog-card:hover { border-color: var(--card-border-hover); }
+.catalog-card:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.catalog-thumb { position: relative; aspect-ratio: 16 / 9; border-radius: 8px; overflow: hidden; background: var(--thumb-bg); }
+.catalog-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.catalog-duration { position: absolute; right: 6px; bottom: 6px; padding: 2px 6px; border-radius: 4px; background: var(--latency-bg); color: var(--overlay-text); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.catalog-title { margin: 4px 2px 0; font-size: 15px; font-weight: 650; line-height: 1.3; overflow-wrap: anywhere; }
+.catalog-meta { margin: 0 2px; font-size: 12.5px; color: var(--muted-text); min-height: 1em; }
+.catalog-empty { margin: 0; padding: 48px 16px; text-align: center; color: var(--muted-text); border: 1px dashed var(--card-border); border-radius: 12px; }
+.catalog-empty h2 { margin: 0 0 6px; font-size: 18px; color: var(--text); }
+@media (max-width: 420px) {
+  .catalog { padding: 20px 16px 40px; }
+  .catalog-grid { grid-template-columns: minmax(0, 1fr); }
+  .menu { min-width: 150px; }
 }

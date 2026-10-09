@@ -25,7 +25,7 @@ use rust_media_server::packager::{self, PackagerManager};
 use rust_media_server::recorder::RecorderManager;
 use rust_media_server::state::{AppState, AppStateParts};
 use rust_media_server::webrtc::WebRtcManager;
-use rust_media_server::{api, egress, web};
+use rust_media_server::{api, egress, vod, web};
 
 /// rust-media-server: RTMP ingest, HTTP-FLV / WS-FLV / LL-HLS / LL-DASH egress.
 #[derive(Debug, Parser)]
@@ -153,6 +153,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         config.data_dir().to_path_buf(),
         config.waiting_dir(),
         config.recordings_dir(),
+        config.vod_dir(),
     ] {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -215,6 +216,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
         admin_token,
         shutdown: shutdown.clone(),
     });
+    // Video on demand: re-queue interrupted jobs, job runner, inbox scanner.
+    state.vod.spawn(shutdown.clone());
 
     // RTMP ingest.
     let rtmp = RtmpServer::bind(config.clone(), db.clone(), hub.clone(), tracker.clone()).await?;
@@ -226,6 +229,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .merge(egress::router())
         .merge(packager::router())
         .merge(WebRtcManager::router())
+        .merge(vod::router())
         .merge(web::router(&state))
         .fallback(|| async { ApiError::not_found("not found").into_response() })
         .layer(TraceLayer::new_for_http())
@@ -266,6 +270,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         tracing::warn!("RTMP ingest did not stop in time");
     }
     state.recorder.shutdown().await;
+    state.vod.shutdown(Duration::from_secs(5)).await;
     tracing::info!("bye");
     Ok(())
 }

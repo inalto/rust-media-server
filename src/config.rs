@@ -22,6 +22,7 @@ pub struct Config {
     pub ffmpeg: FfmpegConfig,
     pub log: LogConfig,
     pub webrtc: WebRtcConfig,
+    pub vod: VodConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -182,6 +183,231 @@ impl Default for WebRtcConfig {
     }
 }
 
+/// Video on demand (`src/vod/`): uploaded or inbox files transcoded in one ffmpeg pass to a
+/// multi-bitrate CMAF ladder served as HLS and DASH.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct VodConfig {
+    /// `false` stops uploads, the inbox scanner and the transcoding jobs (existing videos
+    /// stay playable).
+    pub enabled: bool,
+    /// Watched folder (files dropped there are imported). Empty = `<data_dir>/vod/inbox`.
+    /// Sub-folders named after a ladder (`inbox/mobile/`) select that ladder.
+    pub inbox_dir: String,
+    pub scan_interval_secs: u64,
+    /// Concurrent transcoding jobs (each is one ffmpeg process encoding every rendition).
+    pub max_parallel_jobs: usize,
+    /// Segment duration and keyframe interval (s).
+    pub segment_duration: f64,
+    /// ffmpeg video encoder: `libx264` (default), `h264_nvenc`, `h264_qsv`, `h264_vaapi`...
+    pub encoder: String,
+    /// Extra output-side ffmpeg arguments for the encoder (split on whitespace).
+    pub encoder_args: String,
+    /// Extra input-side ffmpeg arguments, before `-i` (e.g. `-hwaccel cuda`, `-vaapi_device /dev/dri/renderD128`).
+    pub hwaccel_args: String,
+    /// Encoder preset (`veryfast` for libx264/qsv, `p4` for nvenc); empty = no `-preset`.
+    pub preset: String,
+    /// Ladder used when none is chosen (upload without `ladder`, files in the inbox root).
+    pub default_ladder: String,
+    /// Keep the original file after a successful transcode (needed to re-transcode and to
+    /// download it).
+    pub keep_source: bool,
+    pub ladders: Vec<VodLadder>,
+}
+
+/// A named set of renditions (multi-bitrate ladder).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VodLadder {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub renditions: Vec<VodRendition>,
+}
+
+/// One rendition of a ladder. `height` is the size of the short side (the height of a
+/// landscape video, the width of a portrait one); `0` = the source size. `video_kbps` `0`
+/// = constant quality (CRF 23) instead of a target bitrate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VodRendition {
+    pub name: String,
+    pub height: u32,
+    pub video_kbps: u32,
+    pub audio_kbps: u32,
+}
+
+impl VodRendition {
+    fn new(name: &str, height: u32, video_kbps: u32, audio_kbps: u32) -> Self {
+        Self {
+            name: name.into(),
+            height,
+            video_kbps,
+            audio_kbps,
+        }
+    }
+}
+
+impl VodConfig {
+    /// The built-in ladders (also in `config.example.toml`).
+    pub fn default_ladders() -> Vec<VodLadder> {
+        vec![
+            VodLadder {
+                name: "standard".into(),
+                description: "1080p → 360p, per desktop e mobile".into(),
+                renditions: vec![
+                    VodRendition::new("1080p", 1080, 5000, 160),
+                    VodRendition::new("720p", 720, 2800, 128),
+                    VodRendition::new("480p", 480, 1400, 96),
+                    VodRendition::new("360p", 360, 800, 96),
+                ],
+            },
+            VodLadder {
+                name: "mobile".into(),
+                description: "720p e 360p, leggero per le reti mobili".into(),
+                renditions: vec![
+                    VodRendition::new("720p", 720, 2200, 128),
+                    VodRendition::new("360p", 360, 700, 64),
+                ],
+            },
+            VodLadder {
+                name: "single".into(),
+                description: "Una sola qualità, alla risoluzione originale (CRF 23)".into(),
+                renditions: vec![VodRendition::new("source", 0, 0, 128)],
+            },
+        ]
+    }
+
+    /// Ladder by name.
+    pub fn ladder(&self, name: &str) -> Option<&VodLadder> {
+        self.ladders.iter().find(|l| l.name == name)
+    }
+
+    /// Inbox folder: `inbox_dir`, or `<data_dir>/vod/inbox` when empty.
+    pub fn inbox_path(&self, data_dir: &Path) -> PathBuf {
+        if self.inbox_dir.trim().is_empty() {
+            data_dir.join("vod").join("inbox")
+        } else {
+            PathBuf::from(self.inbox_dir.trim())
+        }
+    }
+
+    /// Startup validation: clear messages naming the offending key.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let safe = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 32
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                && !s.starts_with('.')
+        };
+        if self.scan_interval_secs == 0 {
+            bail!("vod.scan_interval_secs must be at least 1");
+        }
+        if !(1..=16).contains(&self.max_parallel_jobs) {
+            bail!("vod.max_parallel_jobs must be between 1 and 16");
+        }
+        if !(self.segment_duration.is_finite() && (1.0..=20.0).contains(&self.segment_duration)) {
+            bail!("vod.segment_duration must be between 1 and 20 seconds");
+        }
+        if self.encoder.trim().is_empty() {
+            bail!("vod.encoder must not be empty (e.g. \"libx264\")");
+        }
+        if self.ladders.is_empty() {
+            bail!("vod.ladders: at least one ladder is required");
+        }
+        let mut names = std::collections::HashSet::new();
+        for l in &self.ladders {
+            if !safe(&l.name) || l.name.starts_with('_') {
+                bail!(
+                    "vod.ladders: invalid ladder name {:?} (letters, digits, '-', '_', '.', max 32, not starting with '_' or '.'; it is also the inbox sub-folder name)",
+                    l.name
+                );
+            }
+            if !names.insert(l.name.as_str()) {
+                bail!("vod.ladders: duplicate ladder name {:?}", l.name);
+            }
+            if l.renditions.is_empty() {
+                bail!("vod.ladders.{}: at least one rendition is required", l.name);
+            }
+            let mut rnames = std::collections::HashSet::new();
+            let mut prev: Option<u32> = None;
+            for r in &l.renditions {
+                if !safe(&r.name) {
+                    bail!(
+                        "vod.ladders.{}: invalid rendition name {:?}",
+                        l.name,
+                        r.name
+                    );
+                }
+                if !rnames.insert(r.name.as_str()) {
+                    bail!(
+                        "vod.ladders.{}: duplicate rendition name {:?}",
+                        l.name,
+                        r.name
+                    );
+                }
+                if r.height != 0 && !(16..=8640).contains(&r.height) {
+                    bail!(
+                        "vod.ladders.{}.{}: height must be 0 (source size) or between 16 and 8640",
+                        l.name,
+                        r.name
+                    );
+                }
+                // Sorted from the largest to the smallest; 0 (source size) can only be first.
+                let size = if r.height == 0 { u32::MAX } else { r.height };
+                if let Some(p) = prev
+                    && size >= p
+                {
+                    bail!(
+                        "vod.ladders.{}: renditions must be sorted by height, largest first (height 0 = source size, only as the first one)",
+                        l.name
+                    );
+                }
+                prev = Some(size);
+                if r.video_kbps != 0 && !(50..=200_000).contains(&r.video_kbps) {
+                    bail!(
+                        "vod.ladders.{}.{}: video_kbps must be 0 (constant quality) or between 50 and 200000",
+                        l.name,
+                        r.name
+                    );
+                }
+                if !(16..=512).contains(&r.audio_kbps) {
+                    bail!(
+                        "vod.ladders.{}.{}: audio_kbps must be between 16 and 512",
+                        l.name,
+                        r.name
+                    );
+                }
+            }
+        }
+        if self.ladder(&self.default_ladder).is_none() {
+            bail!(
+                "vod.default_ladder {:?} is not one of the configured ladders",
+                self.default_ladder
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Default for VodConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            inbox_dir: String::new(),
+            scan_interval_secs: 10,
+            max_parallel_jobs: 1,
+            segment_duration: 4.0,
+            encoder: "libx264".into(),
+            encoder_args: String::new(),
+            hwaccel_args: String::new(),
+            preset: "veryfast".into(),
+            default_ladder: "standard".into(),
+            keep_source: true,
+            ladders: Self::default_ladders(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct FfmpegConfig {
@@ -281,6 +507,9 @@ impl Config {
             .filter(|ip| !ip.is_empty())
             .collect();
         self.webrtc.stun_server = self.webrtc.stun_server.trim().to_string();
+        self.vod.encoder = self.vod.encoder.trim().to_string();
+        self.vod.preset = self.vod.preset.trim().to_string();
+        self.vod.default_ladder = self.vod.default_ladder.trim().to_string();
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -312,6 +541,7 @@ impl Config {
         if !(6..=510).contains(&self.webrtc.audio_bitrate_kbps) {
             bail!("webrtc.audio_bitrate_kbps must be between 6 and 510");
         }
+        self.vod.validate()?;
         Ok(())
     }
 
@@ -348,6 +578,16 @@ impl Config {
 
     pub fn recordings_dir(&self) -> PathBuf {
         self.server.data_dir.join("recordings")
+    }
+
+    /// `<data_dir>/vod`: one sub-directory per video on demand.
+    pub fn vod_dir(&self) -> PathBuf {
+        self.server.data_dir.join("vod")
+    }
+
+    /// The VOD inbox folder (see [`VodConfig::inbox_path`]).
+    pub fn vod_inbox_dir(&self) -> PathBuf {
+        self.vod.inbox_path(&self.server.data_dir)
     }
 
     pub fn admin_token_path(&self) -> PathBuf {
@@ -445,6 +685,9 @@ pub fn apply_env_overrides(
             toml::Value::Boolean(_) => toml::Value::Boolean(
                 parse_bool(&value)
                     .with_context(|| format!("{name}: expected a boolean, got {value:?}"))?,
+            ),
+            toml::Value::Array(items) if items.iter().any(|v| v.is_table()) => bail!(
+                "{name}: lists of tables (e.g. vod.ladders) can only be set in the config file"
             ),
             // Lists of strings (e.g. `RMS_WEBRTC_PUBLIC_IP=203.0.113.7,198.51.100.2`).
             toml::Value::Array(_) => toml::Value::Array(
@@ -620,6 +863,93 @@ mod tests {
             &mut warnings,
         );
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn vod_defaults_and_ladder_validation() {
+        let c = Config::default();
+        assert!(c.vod.enabled);
+        assert_eq!(c.vod.default_ladder, "standard");
+        assert_eq!(c.vod.segment_duration, 4.0);
+        assert_eq!(c.vod.encoder, "libx264");
+        let names: Vec<&str> = c.vod.ladders.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["standard", "mobile", "single"]);
+        assert_eq!(c.vod.ladder("standard").unwrap().renditions.len(), 4);
+        assert!(c.validate().is_ok());
+        assert_eq!(
+            c.vod_inbox_dir(),
+            PathBuf::from("./data").join("vod").join("inbox")
+        );
+        let mut custom = c.clone();
+        custom.vod.inbox_dir = " /srv/inbox ".into();
+        assert_eq!(custom.vod_inbox_dir(), PathBuf::from("/srv/inbox"));
+
+        let invalid = |f: &dyn Fn(&mut VodConfig)| {
+            let mut v = VodConfig::default();
+            f(&mut v);
+            v.validate().unwrap_err().to_string()
+        };
+        assert!(invalid(&|v| v.ladders.clear()).contains("at least one ladder"));
+        assert!(invalid(&|v| v.default_ladder = "nope".into()).contains("default_ladder"));
+        assert!(
+            invalid(&|v| {
+                let dup = v.ladders[1].clone();
+                v.ladders.push(dup);
+            })
+            .contains("duplicate ladder name")
+        );
+        assert!(invalid(&|v| v.ladders[0].name = "a b".into()).contains("invalid ladder name"));
+        assert!(invalid(&|v| v.ladders[0].name = "_failed".into()).contains("invalid ladder"));
+        assert!(
+            invalid(&|v| v.ladders[0].renditions.swap(0, 1)).contains("sorted by height"),
+            "heights must be sorted"
+        );
+        assert!(
+            invalid(&|v| v.ladders[0].renditions[1].height = 1080).contains("sorted by height"),
+            "equal heights"
+        );
+        assert!(
+            invalid(&|v| v.ladders[0].renditions[2].height = 0).contains("sorted by height"),
+            "0 = source size only first"
+        );
+        assert!(
+            invalid(&|v| v.ladders[0].renditions[3].name = "720p".into())
+                .contains("duplicate rendition")
+        );
+        assert!(invalid(&|v| v.ladders[1].renditions.clear()).contains("at least one rendition"));
+        assert!(invalid(&|v| v.ladders[0].renditions[0].audio_kbps = 0).contains("audio_kbps"));
+        assert!(invalid(&|v| v.ladders[0].renditions[0].video_kbps = 10).contains("video_kbps"));
+        assert!(invalid(&|v| v.segment_duration = 0.5).contains("segment_duration"));
+        assert!(invalid(&|v| v.max_parallel_jobs = 0).contains("max_parallel_jobs"));
+        assert!(invalid(&|v| v.encoder = " ".into()).contains("encoder"));
+
+        // A TOML ladder replaces the built-in list; descriptions are optional.
+        let c = Config::from_toml_str(
+            "[vod]\ndefault_ladder = \"hd\"\n[[vod.ladders]]\nname = \"hd\"\nrenditions = [ { name = \"720p\", height = 720, video_kbps = 3000, audio_kbps = 128 } ]\n",
+        )
+        .unwrap();
+        assert_eq!(c.vod.ladders.len(), 1);
+        assert_eq!(c.vod.ladders[0].description, "");
+        assert!(c.validate().is_ok());
+        // Lists of tables cannot come from the environment.
+        let mut warnings = Vec::new();
+        let r = apply_env_overrides(
+            Config::default(),
+            vars(&[("RMS_VOD_LADDERS", "x")]),
+            &mut warnings,
+        );
+        assert!(r.unwrap_err().to_string().contains("config file"));
+        let c = apply_env_overrides(
+            Config::default(),
+            vars(&[
+                ("RMS_VOD_ENCODER", "h264_nvenc"),
+                ("RMS_VOD_MAX_PARALLEL_JOBS", "2"),
+            ]),
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(c.vod.encoder, "h264_nvenc");
+        assert_eq!(c.vod.max_parallel_jobs, 2);
     }
 
     #[test]

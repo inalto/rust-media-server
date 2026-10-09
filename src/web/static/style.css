@@ -75,6 +75,8 @@
   --series-dash: #d55181;
   --series-webrtc: #008300;
   --shadow: 0 10px 30px rgba(0, 0, 0, .35);
+  --thumb-overlay-bg: rgba(0, 0, 0, .78);
+  --thumb-overlay-text: #fff;
 }
 
 /* Light theme: explicit choice... */
@@ -136,6 +138,8 @@
   --series-dash: #d55181;
   --series-webrtc: #008300;
   --shadow: 0 10px 30px rgba(15, 23, 42, .12);
+  --thumb-overlay-bg: rgba(0, 0, 0, .78);
+  --thumb-overlay-text: #fff;
 }
 
 /* ...or `system` (no explicit choice) with a light OS preference. Same values as above. */
@@ -198,6 +202,8 @@
     --series-dash: #d55181;
     --series-webrtc: #008300;
     --shadow: 0 10px 30px rgba(15, 23, 42, .12);
+    --thumb-overlay-bg: rgba(0, 0, 0, .78);
+    --thumb-overlay-text: #fff;
   }
 }
 
@@ -248,6 +254,7 @@ main:focus { outline: none; }
 .nav a { color: var(--text-2); text-decoration: none; padding: 6px 12px; border-radius: 999px; font-weight: 550; }
 .nav a:hover { color: var(--text); background: var(--surface-2); }
 .nav a[aria-current="page"] { color: var(--text); background: var(--surface-3); }
+.nav-short { display: none; }
 .topbar-end { margin-left: auto; display: flex; align-items: center; gap: 10px; }
 .conn { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
 .conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
@@ -495,6 +502,62 @@ progress { width: 100%; height: 10px; appearance: none; -webkit-appearance: none
 progress::-webkit-progress-bar { background: var(--bg); border-radius: 6px; }
 progress::-webkit-progress-value { background: var(--accent); border-radius: 6px; transition: width .2s; }
 progress::-moz-progress-bar { background: var(--accent); border-radius: 6px; }
+
+/* --------------------------------------------------------------- video on demand */
+.vod-drop { align-items: center; justify-content: center; text-align: center; padding: 22px 14px; min-height: 150px; }
+.vod-drop-text { display: flex; flex-direction: column; align-items: center; gap: 6px; color: var(--text-2); }
+.vod-drop-text .icon { color: var(--accent-text); }
+.vod-drop .dropzone-row { justify-content: center; }
+.upload-queue { list-style: none; margin: 16px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.upload-queue:empty { display: none; }
+.upload-item { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); min-width: 0; }
+.upload-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.upload-name { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-head .hint { white-space: nowrap; }
+.upload-head .btn { margin-left: auto; }
+.upload-status.ok { color: var(--ok-text); }
+.vod-list { display: flex; flex-direction: column; gap: 10px; }
+.vod-item { display: grid; grid-template-columns: 176px minmax(0, 1fr) auto; gap: 16px; align-items: start; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); }
+.vod-item[data-status="processing"] { border-color: var(--warn-border); }
+.vod-item[data-status="failed"] { border-color: var(--danger-border); }
+.vod-thumb { position: relative; aspect-ratio: 16 / 9; border-radius: 6px; overflow: hidden; background: var(--video-bg); }
+.vod-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.vod-thumb-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); background: var(--surface-3); }
+.vod-duration { position: absolute; right: 5px; bottom: 5px; padding: 1px 6px; border-radius: 4px; background: var(--thumb-overlay-bg); color: var(--thumb-overlay-text); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.vod-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.vod-title { margin: 0; font-size: 16px; }
+.vod-title-btn { padding: 0; border: 0; background: none; color: var(--text); font: inherit; font-weight: 650; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.vod-title-btn:hover { color: var(--accent-text-hover); text-decoration: underline; }
+.vod-desc { color: var(--text-2); font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vod-meta, .vod-renditions { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.vod-status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 2px 0; }
+.vod-status progress { width: 160px; max-width: 100%; }
+.vod-pct { color: var(--text-2); font-size: 13px; font-variant-numeric: tabular-nums; }
+.vod-error { color: var(--danger-text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; min-width: 0; }
+.vod-error-text { white-space: pre-wrap; max-height: 160px; color: var(--danger-text); }
+.vod-side { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+.vod-stats { display: flex; gap: 14px; color: var(--text-2); font-size: 13px; font-variant-numeric: tabular-nums; }
+.vod-stat { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.vod-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.embed-opts input.start-input { width: 96px; }
+.ladders { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.ladder-card { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); min-width: 0; }
+.ladder-card h3 { margin: 0; color: var(--text); display: flex; align-items: center; gap: 8px; }
+code { overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  .vod-item { grid-template-columns: 120px minmax(0, 1fr); }
+  .vod-side { grid-column: 1 / -1; flex-direction: row; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+}
+@media (max-width: 600px) {
+  /* Top bar: brand and tools on the first row, the three sections on the second. */
+  .nav { order: 3; flex: 1 1 100%; overflow-x: auto; scrollbar-width: none; }
+  .nav a { white-space: nowrap; }
+  .nav-long { display: none; }
+  .nav-short { display: inline; }
+  .vod-item { grid-template-columns: 96px minmax(0, 1fr); gap: 10px; padding: 10px; }
+  .vod-desc { white-space: normal; }
+  .vod-actions { justify-content: flex-start; }
+}
 
 /* --------------------------------------------------------------- dialogs, toasts */
 dialog.modal {

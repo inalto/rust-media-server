@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="it" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <script>(function () { try { var v = (new URLSearchParams(location.search).get('theme') || '').trim().toLowerCase(); if (v === 'system' || v === 'light' || v === 'dark') document.documentElement.setAttribute('data-theme', v); } catch (e) { /* keep the server's */ } })();</script>
+  <title data-i18n="catalog.docTitle">Video on demand</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/player.css">
+</head>
+<!-- Public catalogue of the ready videos on demand (GET /vod): links to /watch/{id}.
+     Query: lang=it|en, theme=system|light|dark (as the player pages). -->
+<body data-mode="catalog">
+  <main class="catalog">
+    <header class="catalog-head">
+      <h1 data-i18n="catalog.title">Video</h1>
+      <p id="catalog-count" class="catalog-lead" data-i18n="catalog.lead">Tutti i video disponibili</p>
+    </header>
+    <div id="catalog-grid" class="catalog-grid" role="list" aria-busy="true"></div>
+    <div id="catalog-empty" class="catalog-empty" hidden>
+      <h2 data-i18n="catalog.empty">Nessun video disponibile</h2>
+      <p data-i18n="catalog.emptyText">Torna a trovarci più tardi.</p>
+    </div>
+    <p id="catalog-error" class="catalog-empty" role="alert" hidden></p>
+  </main>
+  <script type="module" src="/static/catalog.js"></script>
+</body>
+</html>

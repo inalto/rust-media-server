@@ -53,5 +53,46 @@ audio_bitrate_kbps = 96    # AAC -> Opus transcode (needs ffmpeg; without it ses
 idle_stop_secs = 30        # stop the per-broadcast WebRTC publisher after this long without viewers
 stun_server = ""           # optional, e.g. "stun.l.google.com:19302", advertised in the WHEP Link header
 
+[vod]                      # video on demand: upload or inbox -> one ffmpeg pass -> multi-bitrate CMAF (HLS + DASH)
+enabled = true             # false = no uploads, no inbox, no transcoding (existing videos stay playable)
+inbox_dir = ""             # watched folder; empty = <data_dir>/vod/inbox. Files in inbox/<ladder>/ use that ladder
+scan_interval_secs = 10    # a file is imported once its size and mtime stay unchanged for two scans
+max_parallel_jobs = 1      # concurrent ffmpeg transcodes (each encodes every rendition of its ladder)
+segment_duration = 4.0     # seconds; also the keyframe interval
+encoder = "libx264"        # or a hardware encoder: "h264_nvenc" (NVIDIA), "h264_qsv" (Intel), "h264_vaapi" (Intel/AMD on Linux)
+encoder_args = ""          # extra output-side ffmpeg arguments, e.g. "-tune film" (x264) or "-rc vbr -multipass qres" (nvenc)
+hwaccel_args = ""          # extra input-side arguments before -i, e.g. "-hwaccel cuda" or "-vaapi_device /dev/dri/renderD128"
+preset = "veryfast"        # encoder preset; nvenc: "p4"; qsv: "veryfast"; vaapi: "" (none)
+default_ladder = "standard"
+keep_source = true         # keep the original after transcoding (needed to re-transcode or download it)
+
+# Ladders: renditions from the largest to the smallest. `height` is the short side (the width
+# of a portrait video); 0 = the source size. `video_kbps` 0 = constant quality (CRF 23).
+# Renditions taller than the source are skipped (never upscale); at least one is kept.
+[[vod.ladders]]
+name = "standard"
+description = "1080p → 360p, per desktop e mobile"
+renditions = [
+  { name = "1080p", height = 1080, video_kbps = 5000, audio_kbps = 160 },
+  { name = "720p",  height = 720,  video_kbps = 2800, audio_kbps = 128 },
+  { name = "480p",  height = 480,  video_kbps = 1400, audio_kbps = 96 },
+  { name = "360p",  height = 360,  video_kbps = 800,  audio_kbps = 96 },
+]
+
+[[vod.ladders]]
+name = "mobile"
+description = "720p e 360p, leggero per le reti mobili"
+renditions = [
+  { name = "720p", height = 720, video_kbps = 2200, audio_kbps = 128 },
+  { name = "360p", height = 360, video_kbps = 700,  audio_kbps = 64 },
+]
+
+[[vod.ladders]]
+name = "single"
+description = "Una sola qualità, alla risoluzione originale (CRF 23)"
+renditions = [
+  { name = "source", height = 0, video_kbps = 0, audio_kbps = 128 },   # height 0 = keep source size, kbps 0 = CRF 23
+]
+
 [log]
 level = "info"             # RUST_LOG overrides

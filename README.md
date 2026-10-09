@@ -12,7 +12,8 @@ pronti da incollare e un video d'attesa quando la diretta non c'è.
 - Registrazione: automatica (flag) o manuale; FLV nativo → MP4 via ffmpeg
 - Metriche: spettatori simultanei per protocollo campionati su SQLite, grafici Chart.js, picco/sessioni/durata media
 - Video d'attesa per diretta o globale, mostrato dal player quando la diretta è offline o **in pausa**
-- Zero dipendenze esterne a runtime sul server: SQLite incorporato; `ffmpeg` opzionale (remux MP4, normalizzazione video d'attesa, audio Opus per WebRTC). I browser caricano hls.js, mpegts.js, dash.js (jsDelivr) e Chart.js (cdnjs) da CDN; il client WebRTC non usa librerie
+- **Video on demand** con qualità adattiva (ABR): caricamento dalla dashboard o cartella *inbox*, codifica in un solo passaggio ffmpeg in più qualità (ladder configurabili), pubblicazione in HLS e DASH (CMAF), player con selettore di qualità, pagina pubblica e catalogo
+- Zero dipendenze esterne a runtime sul server: SQLite incorporato; `ffmpeg` opzionale (remux MP4, normalizzazione video d'attesa, audio Opus per WebRTC; indispensabile, con `ffprobe`, per il video on demand). I browser caricano hls.js, mpegts.js, dash.js (jsDelivr) e Chart.js (cdnjs) da CDN; il client WebRTC non usa librerie
 
 Architettura e contratto API: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (inglese).
 Standard di streaming a bassa latenza e raccomandazioni: [docs/PROTOCOLS.md](docs/PROTOCOLS.md).
@@ -73,6 +74,17 @@ Chiavi principali:
 | `webrtc.audio_bitrate_kbps` | `96` | bitrate Opus: l'AAC di OBS viene transcodificato in Opus con ffmpeg (senza ffmpeg le sessioni WebRTC sono solo video) |
 | `webrtc.idle_stop_secs` | `30` | ferma il publisher WebRTC di una diretta dopo questi secondi senza spettatori WebRTC |
 | `webrtc.stun_server` | vuoto | server STUN opzionale annunciato ai client nell'header `Link` (es. `stun.l.google.com:19302`) |
+| `vod.enabled` | `true` | video on demand: caricamenti, cartella inbox e codifiche (con `false` i video esistenti restano riproducibili) |
+| `vod.inbox_dir` | vuoto | cartella osservata; vuoto = `data/vod/inbox`. I file in `inbox/<ladder>/` usano quella ladder |
+| `vod.scan_interval_secs` | `10` | intervallo di scansione dell'inbox: un file viene importato quando dimensione e data restano uguali per due scansioni |
+| `vod.max_parallel_jobs` | `1` | codifiche contemporanee (ognuna produce tutte le qualità della sua ladder) |
+| `vod.segment_duration` | `4.0` | durata dei segmenti HLS/DASH e intervallo tra keyframe (s) |
+| `vod.encoder` | `libx264` | encoder H.264 di ffmpeg; anche `h264_nvenc` (NVIDIA), `h264_qsv` (Intel), `h264_vaapi` (Linux Intel/AMD) |
+| `vod.encoder_args` / `vod.hwaccel_args` | vuoto | argomenti ffmpeg aggiuntivi dopo l'encoder / prima di `-i` (es. `-hwaccel cuda`, `-vaapi_device /dev/dri/renderD128`) |
+| `vod.preset` | `veryfast` | preset dell'encoder (`p4` per NVENC, vuoto per VAAPI) |
+| `vod.default_ladder` | `standard` | ladder usata quando non se ne sceglie una |
+| `vod.keep_source` | `true` | conserva il file originale (serve per ricodificare e per scaricarlo) |
+| `vod.ladders` | `standard`, `mobile`, `single` | elenco delle ladder `[[vod.ladders]]`: vedi [Video on demand](#video-on-demand) |
 
 **Lingua dell'interfaccia.** Dashboard e player sono in italiano (predefinito) o in inglese: si sceglie
 nella dashboard in *Impostazioni → Lingua e tema* (oppure `PATCH /api/v1/settings {"ui_language":"en"}`), vale
@@ -129,6 +141,71 @@ Esempio di embed:
         allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>
 ```
 
+## Video on demand
+
+Oltre alle dirette, rms pubblica **video on demand** con qualità adattiva (ABR): ogni video viene
+codificato da ffmpeg **in un solo passaggio** in più qualità (una *ladder*) e impacchettato in segmenti
+CMAF (fMP4) serviti sia in **HLS** sia in **DASH**. Il player sceglie da solo la qualità in base alla banda
+e alla dimensione della finestra; lo spettatore può fissarne una dal menu *Qualità*. Serve ffmpeg con
+`ffprobe` sul server.
+
+**Caricamento.** Nella dashboard, sezione *Video on demand*: trascina uno o più file (MP4, MOV, M4V, MKV,
+WebM, AVI, MTS/M2TS, TS, MXF, FLV, MPG, WMV; fino a `server.max_upload_mb` MB ciascuno), scegli la ladder e
+segui caricamento e codifica in tempo reale. Lo stesso via API:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" -F file=@evento.mp4 -F ladder=standard -F "title=Evento 2026" \
+     http://127.0.0.1:8080/api/v1/vod
+```
+
+**Cartella inbox.** I file copiati in `data/vod/inbox/` (o in `vod.inbox_dir`) vengono importati da soli
+appena la copia è finita (dimensione e data invariate per due scansioni; i nomi che iniziano con `.` e
+quelli `.part`, `.tmp`, `.crdownload`, `.filepart` vengono ignorati). Il titolo deriva dal nome del file
+(`Il_mio_video.mp4` → «Il mio video»). Per scegliere la ladder basta la sottocartella con il suo nome:
+`inbox/mobile/clip.mp4` usa la ladder `mobile` (le sottocartelle vengono create all'avvio). I file non
+validi finiscono in `inbox/_failed/` con accanto un `<nome>.error.txt` che spiega il motivo.
+
+**Ladder.** Si configurano in `config.toml` (`[[vod.ladders]]`, vedi `config.example.toml`); la dashboard
+le mostra in *Impostazioni → Ladder VOD*. Predefinite:
+
+| Ladder | Qualità |
+|---|---|
+| `standard` | 1080p 5 Mbit/s · 720p 2,8 Mbit/s · 480p 1,4 Mbit/s · 360p 800 kbit/s (audio AAC 160/128/96/96 kbit/s) |
+| `mobile` | 720p 2,2 Mbit/s · 360p 700 kbit/s (audio 128/64 kbit/s) |
+| `single` | una sola qualità alla risoluzione originale, qualità costante (CRF 23), audio 128 kbit/s |
+
+Le qualità più grandi del video originale vengono saltate (mai ingrandire; ne resta sempre almeno una);
+`height` indica il lato corto, quindi un video verticale 1080×1920 diventa «1080p» a 1080×1920. Keyframe
+ogni `segment_duration` secondi, H.264 High da 720p in su (Main sotto), AAC 48 kHz stereo (il mono resta
+mono). Una qualità per riga: `{ name, height, video_kbps, audio_kbps }` (`height = 0` = dimensione
+originale, `video_kbps = 0` = qualità costante).
+
+**URL di un video** (`<id>` è l'identificativo mostrato nella dashboard):
+
+| Cosa | URL |
+|---|---|
+| HLS | `http://<host>:8080/vod/<id>/hls/master.m3u8` |
+| DASH | `http://<host>:8080/vod/<id>/dash/manifest.mpd` |
+| Immagine di anteprima | `http://<host>:8080/vod/<id>/poster.jpg` |
+| Player per iframe | `http://<host>:8080/embed/vod/<id>` |
+| Pagina del video | `http://<host>:8080/watch/<id>` (titolo e descrizione) |
+| Catalogo pubblico | `http://<host>:8080/vod` (tutti i video pronti) |
+
+**Embed.** Nella dashboard, *Link ed embed* su un video: codice `<iframe>` con le opzioni (avvio
+automatico, audio, controlli, lingua, tema, punto di partenza) ed esempi per hls.js e dash.js. Parametri
+del player VOD: `?autoplay=1|0&muted=1|0&controls=1|0&t=<secondi>&src=auto|hls|dash&lang=it|en&theme=system|light|dark`
+(default: niente avvio automatico, l'anteprima resta visibile finché non si preme play).
+
+```html
+<iframe src="https://stream.example.com/embed/vod/4fb48570-aaa4-45ed-8bd6-46f2e62f794d?t=30"
+        width="960" height="540" frameborder="0"
+        allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>
+```
+
+Altre azioni: rinomina e descrizione, **ricodifica** con un'altra ladder (anche per riprovare un video in
+errore), download dell'originale, eliminazione (anche durante la codifica, che viene interrotta). Il
+contatore *riproduzioni* conta le sessioni di visione avviate; *spettatori ora* quelle attive.
+
 ## Test senza OBS
 
 ```bash
@@ -181,6 +258,7 @@ src/webrtc/        WHEP: porta UDP condivisa, sessioni WebRTC (rtc), H.264 → R
 src/packager/      muxer CMAF, store, playlist HLS, MPD DASH
 src/recorder/      registrazione FLV → MP4 src/metrics/    tracker spettatori, campionatore
 src/api/           REST + SSE (axum)       src/web/        dashboard e player (statici incorporati)
+src/vod/           video on demand: probe, ladder, ffmpeg in un passaggio, playlist HLS/MPD, job, inbox, playback
 src/db/            SQLite (rusqlite)       docs/           architettura, protocolli, API
 ```
 
@@ -188,7 +266,8 @@ src/db/            SQLite (rusqlite)       docs/           architettura, protoco
 
 - Il packager LL-HLS/LL-DASH impacchetta solo **H.264 + AAC**; HEVC/AV1 (Enhanced RTMP) passano solo via HTTP-FLV/WS-FLV.
 - WebRTC: solo video H.264 senza B-frame (HEVC/AV1 → `415`, il player usa un'altra sorgente); solo IPv4; nessun TURN né trickle ICE; un nuovo spettatore parte dal keyframe successivo; senza ffmpeg niente audio.
-- Nessun transcoding/ABR: la qualità è quella inviata da OBS (consigliati 2–6 Mbit/s CBR, keyframe 2 s).
+- Dirette senza transcoding/ABR: la qualità è quella inviata da OBS (consigliati 2–6 Mbit/s CBR, keyframe 2 s). L'ABR c'è per i video on demand.
+- Video on demand: solo encoder H.264 (gli encoder hardware NVENC/QSV/VAAPI sono previsti ma non verificati in questo ambiente); niente anteprime sulla barra di avanzamento né sottotitoli; più istanze possono condividere `data/vod` e il database (le codifiche vengono prese in carico in modo atomico), ma un riavvio rimette in coda anche le codifiche di un'altra istanza.
 - Safari nativo e HTTP/2 non sono stati verificati in questo ambiente (vedi `docs/ARCHITECTURE.md` §15).
 - Prossimi passi previsti: ingest SRT/WHIP, token per gli spettatori, TURN/IPv6 per WebRTC.
 
