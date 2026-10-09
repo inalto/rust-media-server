@@ -21,7 +21,9 @@
 //   also sends {type: 'rms-theme', theme} messages (same origin only).
 // - Debug handle: window.rmsPlayer = { status, source, engine, latency, peerConnection, language, theme, setSource(), reload() }.
 // - VOD mode: pages with <body data-kind="vod"> (/embed/vod/{id}, /watch/{id}, vod.html)
-//   run the video on demand player of vod-player.js instead (ARCHITECTURE.md §19).
+//   run the video on demand player of vod-player.js instead (ARCHITECTURE.md §19); it
+//   forwards the page's token=&expires= (signed URLs of private videos, docs/ACCOUNTS.md
+//   §5) to the info, manifest, segment and poster requests. Live streams have no tokens.
 // ES module (loaded with type="module") only to import the shared translations and theme.
 import { t, setLanguage, getLanguage, normalizeLanguage, translateDom, formatNumber, isBuiltinWaitingText } from './i18n.js';
 import { initTheme, normalizeTheme, setServerTheme, setThemeOverride, resolvedTheme } from './theme.js';
