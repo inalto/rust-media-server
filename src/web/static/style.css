@@ -795,3 +795,8 @@ dialog.modal::backdrop { background: var(--backdrop); backdrop-filter: blur(2px)
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+/* Ladder cards: keep rendition tables inside the card on narrow widths */
+.ladder-card .table-wrap, .ladder-card table { min-width: 0; }
+.ladder-card .table-wrap { overflow-x: auto; }
+.ladder-card table { width: 100%; font-size: .92em; }
