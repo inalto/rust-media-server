@@ -617,12 +617,13 @@ export function flagFields(values = {}) {
     item('record', 'Registra automaticamente', 'La registrazione parte da sola quando arriva il segnale da OBS.', false),
     item('enable_flv', 'HTTP-FLV e WebSocket-FLV', 'Latenza 1–2 s: la scelta predefinita del player su desktop e Android.', true),
     item('enable_hls', 'LL-HLS', 'Necessario per iPhone/iPad e Safari; adatto alle CDN.', true),
-    item('enable_dash', 'LL-DASH', 'Alternativa standard per i player basati su MSE.', true));
+    item('enable_dash', 'LL-DASH', 'Alternativa standard per i player basati su MSE.', true),
+    item('enable_webrtc', 'WebRTC (WHEP)', 'Latenza sotto il secondo; il server deve avere la porta UDP WebRTC raggiungibile.', true));
 }
 
 export function readFlags(form) {
   const v = (k) => !!(form.elements[k] && form.elements[k].checked);
-  return { record: v('record'), enable_flv: v('enable_flv'), enable_hls: v('enable_hls'), enable_dash: v('enable_dash') };
+  return { record: v('record'), enable_flv: v('enable_flv'), enable_hls: v('enable_hls'), enable_dash: v('enable_dash'), enable_webrtc: v('enable_webrtc') };
 }
 
 /** Labelled text input / textarea. */
