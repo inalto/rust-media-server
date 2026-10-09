@@ -7,6 +7,10 @@
 //! - `/embed/{name}` player page for iframes, `/player/{name}` full-page player
 //!   (same `embed.html`, `data-mode` differs; ES module `player.js` + `i18n.js` +
 //!   `theme.js`).
+//! - `/embed/vod/{id}` video on demand player for iframes, `/watch/{id}` full page with
+//!   title and description (same `vod.html`; `player.js` runs its VOD mode,
+//!   `vod-player.js`), `/vod` public catalogue of the ready videos (`catalog.html` +
+//!   `catalog.js`). ARCHITECTURE.md §19.
 //! - `/static/*` assets embedded in the binary with `include_str!`.
 //! - `/waiting/*` files from `data/waiting/` (waiting videos and posters).
 //!
@@ -97,6 +101,31 @@ const ASSETS: &[(&str, &str, &str)] = &[
         "text/css; charset=utf-8",
         include_str!("static/player.css"),
     ),
+    (
+        "vod.html",
+        "text/html; charset=utf-8",
+        include_str!("static/vod.html"),
+    ),
+    (
+        "vod-player.js",
+        "text/javascript; charset=utf-8",
+        include_str!("static/vod-player.js"),
+    ),
+    (
+        "catalog.html",
+        "text/html; charset=utf-8",
+        include_str!("static/catalog.html"),
+    ),
+    (
+        "catalog.js",
+        "text/javascript; charset=utf-8",
+        include_str!("static/catalog.js"),
+    ),
+    (
+        "vod.js",
+        "text/javascript; charset=utf-8",
+        include_str!("static/vod.js"),
+    ),
 ];
 
 pub fn router(state: &AppState) -> Router<AppState> {
@@ -107,6 +136,9 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/static/{*path}", get(static_asset))
         .route("/embed/{name}", get(embed_page))
         .route("/player/{name}", get(player_page))
+        .route("/embed/vod/{id}", get(vod_embed_page))
+        .route("/watch/{id}", get(vod_watch_page))
+        .route("/vod", get(catalog_page))
         .nest_service("/waiting", waiting)
         .layer(CorsLayer::permissive())
 }
@@ -203,15 +235,7 @@ async fn player_html(state: &AppState, name: &str, mode: &str, query: PlayerQuer
     if !is_valid_name(name) {
         return (StatusCode::NOT_FOUND, "broadcast not found").into_response();
     }
-    let (setting_lang, setting_theme) = ui_prefs(state).await;
-    let lang = query
-        .lang
-        .and_then(|l| UiLanguage::parse(&l.trim().to_ascii_lowercase()))
-        .unwrap_or(setting_lang);
-    let theme = query
-        .theme
-        .and_then(|t| UiTheme::parse(&t.trim().to_ascii_lowercase()))
-        .unwrap_or(setting_theme);
+    let (lang, theme) = page_prefs(state, query).await;
     let template = asset("embed.html").map(|(_, b)| b).unwrap_or_default();
     // `name` is a validated slug: safe to inline.
     let body = with_prefs(template, lang, theme)
@@ -239,6 +263,58 @@ async fn player_page(
     player_html(&state, &name, "player", player_query(&uri)).await
 }
 
+/// `<html lang data-theme>` from `?lang=` / `?theme=`, else the settings.
+async fn page_prefs(state: &AppState, query: PlayerQuery) -> (UiLanguage, UiTheme) {
+    let (setting_lang, setting_theme) = ui_prefs(state).await;
+    let lang = query
+        .lang
+        .and_then(|l| UiLanguage::parse(&l.trim().to_ascii_lowercase()))
+        .unwrap_or(setting_lang);
+    let theme = query
+        .theme
+        .and_then(|t| UiTheme::parse(&t.trim().to_ascii_lowercase()))
+        .unwrap_or(setting_theme);
+    (lang, theme)
+}
+
+/// VOD player page (`vod.html`): `mode` is `embed` or `watch`. Unknown ids still get the
+/// page (the player shows "not found"), malformed ones a 404.
+async fn vod_html(state: &AppState, id: &str, mode: &str, query: PlayerQuery) -> Response {
+    let Some(id) = crate::vod::parse_id(id) else {
+        return (StatusCode::NOT_FOUND, "video not found").into_response();
+    };
+    let (lang, theme) = page_prefs(state, query).await;
+    let template = asset("vod.html").map(|(_, b)| b).unwrap_or_default();
+    // `id` is a canonical UUID: safe to inline.
+    let body = with_prefs(template, lang, theme)
+        .replace("data-mode=\"embed\"", &format!("data-mode=\"{mode}\""))
+        .replace("{{ID}}", &id);
+    html_response(body)
+}
+
+async fn vod_embed_page(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    uri: Uri,
+) -> Response {
+    vod_html(&state, &id, "embed", player_query(&uri)).await
+}
+
+async fn vod_watch_page(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    uri: Uri,
+) -> Response {
+    vod_html(&state, &id, "watch", player_query(&uri)).await
+}
+
+/// `GET /vod`: public catalogue page.
+async fn catalog_page(State(state): State<AppState>, uri: Uri) -> Response {
+    let (lang, theme) = page_prefs(&state, player_query(&uri)).await;
+    let template = asset("catalog.html").map(|(_, b)| b).unwrap_or_default();
+    html_response(with_prefs(template, lang, theme))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -261,6 +337,11 @@ mod tests {
         ("metrics.js", include_str!("static/metrics.js")),
         ("mock.js", include_str!("static/mock.js")),
         ("player.js", include_str!("static/player.js")),
+        ("vod.html", include_str!("static/vod.html")),
+        ("vod-player.js", include_str!("static/vod-player.js")),
+        ("catalog.html", include_str!("static/catalog.html")),
+        ("catalog.js", include_str!("static/catalog.js")),
+        ("vod.js", include_str!("static/vod.js")),
     ];
 
     /// `export const <lang> = { ... };` of i18n.js: one `'key': 'text',` per line.
@@ -450,7 +531,7 @@ mod tests {
             v[..v.find('"').unwrap()].to_string()
         };
         // Every template starts with the tag the server rewrites.
-        for page in ["index.html", "embed.html"] {
+        for page in ["index.html", "embed.html", "vod.html", "catalog.html"] {
             assert!(asset(page).unwrap().1.contains(HTML_TAG), "{page}");
         }
         let (st, body) = page(&state, "/").await;
@@ -501,6 +582,8 @@ mod tests {
         for (page_name, needle) in [
             ("index.html", "localStorage.getItem('rms.theme')"),
             ("embed.html", "get('theme')"),
+            ("vod.html", "get('theme')"),
+            ("catalog.html", "get('theme')"),
         ] {
             let html = asset(page_name).unwrap().1;
             assert!(
@@ -753,6 +836,69 @@ mod tests {
             ["#fff", "rgba(", "white"]
         );
         assert!(colour_literals("var(--accent) #app-x").is_empty());
+    }
+
+    #[tokio::test]
+    async fn vod_pages() {
+        let (state, dir) = test_state(false).await;
+        let attr = |body: &str, name: &str| {
+            let tag = &body[body.find("<html lang=\"").unwrap()..];
+            let tag = &tag[..tag.find('>').unwrap()];
+            let key = format!(" {name}=\"");
+            let v = &tag[tag.find(&key).unwrap() + key.len()..];
+            v[..v.find('"').unwrap()].to_string()
+        };
+        let id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let (st, body) = page(&state, &format!("/embed/vod/{id}")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(body.contains(&format!("data-id=\"{id}\"")), "{body}");
+        assert!(body.contains("data-kind=\"vod\" data-mode=\"embed\""));
+        assert!(body.contains(r#"<script type="module" src="/static/player.js">"#));
+        // Ids are canonicalized (upper case accepted); garbage is a 404.
+        let (st, body) = page(
+            &state,
+            &format!("/watch/{}?lang=en&theme=dark", id.to_uppercase()),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(
+            body.contains(&format!("data-id=\"{id}\"")) && body.contains("data-mode=\"watch\"")
+        );
+        assert_eq!(
+            (attr(&body, "lang"), attr(&body, "data-theme")),
+            ("en".into(), "dark".into())
+        );
+        let (st, _) = page(&state, "/watch/not-a-uuid").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _) = page(&state, "/embed/vod/%3Cscript%3E").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        // Catalogue follows the settings and ?lang= / ?theme=.
+        settings::set(&state.db, settings::UI_LANGUAGE, "en")
+            .await
+            .unwrap();
+        let (st, body) = page(&state, "/vod").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(attr(&body, "lang"), "en");
+        assert!(body.contains("/static/catalog.js"));
+        let body = page(&state, "/vod?lang=it&theme=light").await.1;
+        assert_eq!(
+            (attr(&body, "lang"), attr(&body, "data-theme")),
+            ("it".into(), "light".into())
+        );
+        // The VOD modules are served; player.js dispatches to the VOD mode.
+        for js in ["vod-player.js", "catalog.js", "vod.js"] {
+            let (st, _) = page(&state, &format!("/static/{js}")).await;
+            assert_eq!(st, StatusCode::OK, "{js}");
+        }
+        let player = asset("player.js").unwrap().1;
+        assert!(player.contains("import { startVodPlayer } from './vod-player.js'"));
+        assert!(
+            asset("vod-player.js")
+                .unwrap()
+                .1
+                .contains("capLevelToPlayerSize: true")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

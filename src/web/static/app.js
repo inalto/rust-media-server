@@ -1,6 +1,7 @@
 // rms dashboard — entry point: UI language, login, hash router, admin SSE (live
 // updates with reconnect/backoff and polling fallback), broadcast list, "new broadcast"
-// dialog and the settings page. The broadcast detail lives in detail.js.
+// dialog and the settings page. The broadcast detail lives in detail.js, the video on
+// demand section (#/vod) in vod.js.
 //
 // Language: <html lang> (set by the server) at startup, then GET /api/v1/public/ui
 // before the login view, then GET /settings after login; the admin SSE `settings`
@@ -18,6 +19,7 @@ import {
   fmtInt, fmtDuration, fmtSince, statusBadge, totalViewers, PROTOCOLS, confirmDialog,
 } from './core.js';
 import { mountDetail } from './detail.js';
+import { mountVod, vodSettingsPanel, vodSystemLine } from './vod.js';
 import { t, tn, setLanguage, getLanguage, onLanguageChange, translateDom } from './i18n.js';
 import {
   initTheme, getThemeChoice, getThemeOverride, getServerTheme, setServerTheme, setThemeOverride,
@@ -166,6 +168,9 @@ function connectSSE() {
   es.addEventListener('broadcast', (ev) => { const b = parse(ev); if (b && b.name) store.upsert(b); });
   es.addEventListener('broadcast_deleted', (ev) => { const d = parse(ev); if (d && d.name) store.remove(d.name); });
   es.addEventListener('viewers', (ev) => { const d = parse(ev); if (d && d.name) store.setViewers(d.name, d.counts); });
+  // Video on demand items (vod.js keeps its own list).
+  es.addEventListener('vod', (ev) => { const v = parse(ev); if (v && v.id) bus.emit('vod', v); });
+  es.addEventListener('vod_deleted', (ev) => { const d = parse(ev); if (d && d.id) bus.emit('vod_deleted', d.id); });
   es.addEventListener('stream', (ev) => {
     const d = parse(ev);
     if (!d || !d.name) return;
@@ -232,6 +237,9 @@ function route() {
   } else if (hash.startsWith('#/settings')) {
     setNav('settings');
     unmount = mountSettings(app);
+  } else if (hash.startsWith('#/vod')) {
+    setNav('vod');
+    unmount = mountVod(app);
   } else {
     setNav('list');
     unmount = mountList(app);
@@ -582,6 +590,7 @@ function mountSettings(root) {
           [t('common.liveNow'), fmtInt(s.hub && s.hub.live_streams)],
           [t('system.webrtc'), rtcLine],
           [t('system.iceAddresses'), (rtc.candidates && rtc.candidates.length) ? rtc.candidates.join(', ') : '—'],
+          [t('system.vod'), vodSystemLine(s.vod)],
         ]));
     } catch (e) {
       if (!(e instanceof ApiError && e.status === 401)) setChildren(systemBox, h('p', { class: 'error' }, describeError(e)));
@@ -621,6 +630,7 @@ function mountSettings(root) {
       h('p', { class: 'hint lead' }, t('settings.waitingLead')),
       h('div', { class: 'grid-2' }, videoBox, h('div', { class: 'stack' }, upload, textForm))),
     section('set-overview', 'users', t('settings.overview'), overviewBox),
+    vodSettingsPanel(),
     section('set-system', 'server', t('settings.system'), systemBox)));
 
   (async () => {

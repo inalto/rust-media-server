@@ -20,12 +20,20 @@
 //   the server; `system` follows prefers-color-scheme). The dashboard's preview iframe
 //   also sends {type: 'rms-theme', theme} messages (same origin only).
 // - Debug handle: window.rmsPlayer = { status, source, engine, latency, peerConnection, language, theme, setSource(), reload() }.
+// - VOD mode: pages with <body data-kind="vod"> (/embed/vod/{id}, /watch/{id}, vod.html)
+//   run the video on demand player of vod-player.js instead (ARCHITECTURE.md §19).
 // ES module (loaded with type="module") only to import the shared translations and theme.
 import { t, setLanguage, getLanguage, normalizeLanguage, translateDom, formatNumber, isBuiltinWaitingText } from './i18n.js';
 import { initTheme, normalizeTheme, setServerTheme, setThemeOverride, resolvedTheme } from './theme.js';
+import { startVodPlayer } from './vod-player.js';
 
 (function () {
   'use strict';
+
+  if (document.body.dataset.kind === 'vod') {
+    startVodPlayer();
+    return;
+  }
 
   var LIBS = {
     mpegts: { url: 'https://cdn.jsdelivr.net/npm/mpegts.js@1.8.2/dist/mpegts.js', global: 'mpegts' },
