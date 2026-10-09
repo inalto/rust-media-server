@@ -40,5 +40,5 @@ ENV RMS_SERVER_DATA_DIR=/data \
     RMS_WEBRTC_UDP_PORT=8443 \
     RUST_LOG=info
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8080/api/v1/public/ui >/dev/null || exit 1
+  CMD curl -fsS http://127.0.0.1:8080/healthz >/dev/null || exit 1
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/rms"]

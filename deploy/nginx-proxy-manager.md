@@ -13,12 +13,12 @@ Browser ───8443/udp──────────────> rms:8443   
 ```toml
 [server]
 public_url = "https://stream.example.com"   # link ed embed della dashboard
-trust_proxy = true                           # IP spettatori da X-Forwarded-For / X-Real-IP
+trust_proxy = true                           # IP spettatori da X-Real-IP (o ultimo X-Forwarded-For)
 [webrtc]
 public_ip = ["203.0.113.10"]                 # IP pubblico dell'host che riceve 8443/udp
 ```
 
-Equivalenti ambiente: `RMS_SERVER_PUBLIC_URL`, `RMS_SERVER_TRUST_PROXY=true`, `RMS_WEBRTC_PUBLIC_IP`. **Limite noto:** con `trust_proxy` rms legge il *primo* elemento di `X-Forwarded-For`, ma il Proxy Host di NPM invia `$proxy_add_x_forwarded_for`, cioè *accoda* all'header già presente nella richiesta del client [2]: un client può falsificare il proprio IP nelle metriche (verifica al punto 8 del §8). L'effetto è limitato alle statistiche; la correzione giusta sta in rms (usare `X-Real-IP`, che NPM imposta a `$remote_addr`, o l'ultimo hop).
+Equivalenti ambiente: `RMS_SERVER_PUBLIC_URL`, `RMS_SERVER_TRUST_PROXY=true`, `RMS_WEBRTC_PUBLIC_IP`. Con `trust_proxy` rms usa `X-Real-IP`, che NPM imposta a `$remote_addr`, e in sua assenza l'**ultimo** elemento di `X-Forwarded-For`: il Proxy Host di NPM invia `$proxy_add_x_forwarded_for`, cioè *accoda* all'header già presente nella richiesta del client [2], quindi solo l'ultimo hop è affidabile (fino alla fase 7C-1 rms leggeva il primo ed era falsificabile; verifica al punto 8 del §8).
 
 ## 2. NPM e rms sulla stessa rete (Docker/Podman Compose)
 
@@ -114,7 +114,8 @@ Il testo viene inserito a livello **server**, prima di `location /` [2]; vale in
 ```bash
 H=https://stream.example.com; T=$(cat data/admin_token)         # token amministratore; serve una diretta "prova" attiva
 # 1. HTTP/2 e intestazioni
-curl -sI --http2 $H/api/v1/public/ui | head -3                    # HTTP/2 200; x-served-by presente
+curl -sI --http2 $H/healthz | head -3                             # HTTP/2 200; x-served-by presente
+curl -s $H/healthz                                                 # {"node_id":…,"db":true,…}
 # 2. HTTP-FLV in streaming: primo byte subito, non a raffiche
 curl -sN -m 5 -o /dev/null -w 'ttfb=%{time_starttransfer}s\n' $H/live/prova.flv     # < 1 s
 curl -sN -m 5 $H/live/prova.flv | head -c 3; echo                  # FLV
@@ -133,7 +134,7 @@ curl -si -X OPTIONS $H/whep/prova | head -6                        # 204, Allow:
 # 8. IP reale e falsificabilità di X-Forwarded-For
 curl -s -H "Authorization: Bearer $T" $H/api/v1/broadcasts/prova/sessions          # ip = il vostro IP pubblico
 curl -sN -m 6 -o /dev/null -H 'X-Forwarded-For: 198.51.100.9' $H/live/prova.flv & sleep 2    # sessione FLV aperta
-curl -s -H "Authorization: Bearer $T" $H/api/v1/broadcasts/prova/sessions          # se compare 198.51.100.9: spoofing (§1)
+curl -s -H "Authorization: Bearer $T" $H/api/v1/broadcasts/prova/sessions          # deve restare il vostro IP (198.51.100.9 = spoofing, §1)
 wait
 ```
 

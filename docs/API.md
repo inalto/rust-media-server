@@ -46,6 +46,9 @@ The admin token is resolved once at startup, in this order:
    `<data_dir>/admin_token` with mode `0600`, and printed once in the log at WARN level
    (`generated a new admin token: ...`).
 
+In cluster mode (`cluster.enabled = true`) only step 1 applies: the token must be configured and
+identical on every node (startup fails otherwise; the per-node file is neither read nor generated).
+
 There is a single shared token (no users, no expiry). It is compared in constant time.
 
 ### Bearer header or cookie
@@ -88,6 +91,8 @@ login view and the panel.
 | `/api/v1/public/**` | none |
 | `/live/{name}.flv`, `/ws/live/{name}.flv`, `/hls/**`, `/dash/**`, `/whep/**` | none |
 | `/`, `/embed/{name}`, `/player/{name}`, `/static/*`, `/waiting/*`, `/favicon.ico` | none |
+| `/healthz` | none ([4.5](#45-system)) |
+| `/internal/**` (cluster mode, separate listener `cluster.internal_bind`) | `Authorization: Bearer <cluster.internal_secret>` |
 | everything else under `/api/v1` (broadcasts, recordings incl. downloads, metrics, settings, system, events) | admin token, else `401` |
 
 ### CORS
@@ -608,8 +613,9 @@ Currently connected viewers, oldest first.
 
 `protocol` is one of `flv`, `ws_flv`, `hls`, `dash`, `webrtc`. For `flv`/`ws_flv` the `id` is a random
 32-hex id; for `hls`/`dash` it is `sha256(ip|user_agent|name|protocol)` in hex (64 characters). The IP
-honours `X-Forwarded-For` / `X-Real-IP` only when `server.trust_proxy = true`. `user_agent` is cut at
-512 characters.
+honours the proxy headers only when `server.trust_proxy = true`: `X-Real-IP` first, else the **last**
+`X-Forwarded-For` element (the one added by the trusted proxy; the earlier ones come from the client),
+else the socket address. `user_agent` is cut at 512 characters.
 
 #### `GET /api/v1/broadcasts/{name}/metrics`
 
@@ -627,7 +633,8 @@ integer in `1..=86400`.
 Bucket size: the smallest of `5, 10, 30, 60, 300, 900, 3600, 7200, 21600, 86400` seconds that is at
 least `max(step, metrics.sample_interval_secs)` and yields at most 600 points (the largest if none
 does). Buckets are aligned to the Unix epoch; each point holds the **maximum** of every column over
-the samples of its bucket. The series is *dense*: buckets without samples (stream offline) are
+the samples of its bucket (in cluster mode: the maximum per node, then the sum over the nodes). The
+series is *dense*: buckets without samples (stream offline) are
 returned as zeros, no point lies after "now", and the bucket containing "now" is omitted until it has a
 sample.
 
@@ -672,6 +679,8 @@ sample.
 - `current` and `live_since` describe "now" (`live_since` is `null` when the broadcast is not live).
 - `peak` is the highest sampled total in the range, or `null` when there is nothing to report; when
   "now" falls inside the range the live count is also considered (`at` = now if it is the maximum).
+  In cluster mode the samples of the nodes are added up per sampling slot (`metrics.sample_interval_secs`)
+  before taking the maximum (peak of the sum, not sum of the peaks).
 - `sessions_total` counts viewer sessions (all protocols) that overlap the range; `avg_watch_secs` is
   the average full duration of those sessions (open ones measured up to now), rounded to milliseconds.
 - `bytes_in` sums the bytes received during live periods overlapping the range, including the current one.
@@ -759,6 +768,7 @@ Upload of the global default video (same pipeline and limits as above, stored un
     "enabled": true,
     "available": true,
     "udp_port": 8443,
+    "public_port": 8443,
     "public_ip": [],
     "candidates": ["192.168.1.20:8443"],
     "ice_lite": true,
@@ -775,6 +785,19 @@ Upload of the global default video (same pipeline and limits as above, stored un
     "queued": 2,
     "max_parallel_jobs": 1,
     "encoder": "libx264"
+  },
+  "cluster": {
+    "enabled": true,
+    "node_id": "rms1",
+    "backend": "postgres",
+    "nodes": [
+      {"node_id": "rms1", "advertise_url": "http://rms1:8081", "whep_url": "https://stream.example.com/whep",
+       "version": "0.1.0", "started_at": "2026-10-09T18:00:01.204Z", "heartbeat": "2026-10-09T18:12:31.007Z",
+       "live_streams": 1, "viewers": 12, "draining": false, "alive": true},
+      {"node_id": "rms2", "advertise_url": "http://rms2:8081", "whep_url": null,
+       "version": "0.1.0", "started_at": "2026-10-09T18:00:03.950Z", "heartbeat": "2026-10-09T18:12:30.411Z",
+       "live_streams": 0, "viewers": 3, "draining": false, "alive": true}
+    ]
   }
 }
 ```
@@ -783,14 +806,41 @@ Upload of the global default video (same pipeline and limits as above, stored un
 `ffmpeg -version`). `public_url` is `server.public_url` as configured (empty = derived from `Host`).
 
 `webrtc`: `enabled` is `webrtc.enabled`; `available` is false when disabled or when the UDP port could
-not be bound (`error` says why); `candidates` are the ICE host candidates given to viewers
-(`webrtc.public_ip`, else the IPv4 addresses of the local interfaces, with `udp_port`); `sessions` counts
+not be bound (`error` says why); `udp_port` is the bound port and `public_port` the port advertised to
+viewers (`webrtc.public_port`, or `udp_port` when that is 0: set it when a NAT maps another public port
+to the node, e.g. several nodes behind one IP); `candidates` are the ICE host candidates given to viewers
+(`webrtc.public_ip`, else the IPv4 addresses of the local interfaces, with `public_port`); `sessions` counts
 WHEP sessions (connecting or connected); `publishers` the broadcasts with a running WebRTC publisher;
 `audio` is false without ffmpeg (sessions are then video-only).
 
 `vod`: `enabled` is `vod.enabled`; `available` is false when disabled or when ffmpeg/ffprobe are missing
 (no uploads, no inbox, no transcoding; existing videos stay playable); `inbox_dir` the watched folder;
 `jobs_running` the transcodes running in this process; `queued` the items waiting (database).
+
+`cluster` (preview, [CLUSTER.md](CLUSTER.md)): `enabled` is `cluster.enabled`; `node_id` this node
+(`cluster.node_id`, the host name by default); `backend` `"sqlite"` (single node) or `"postgres"`
+(cluster mode); `nodes` the rows of the node registry, sorted by `node_id` (always `[]` on a single
+node). Each node refreshes `heartbeat` (database clock), `live_streams`, `viewers` (live broadcasts,
+all protocols) and `draining` every `cluster.heartbeat_secs`; `alive` is false once the heartbeat is
+older than `cluster.node_ttl_secs`, and every node deletes such rows shortly after. `whep_url` is
+`<server.public_url>/whep` when WebRTC is available and `public_url` is set, else `null`.
+
+#### `GET /healthz`
+
+Public, no token, no CORS. Liveness probe for load balancers and container health checks
+(`Cache-Control: no-store`; `HEAD` works too).
+
+```json
+{"node_id": "rms1", "cluster": true, "db": true, "live_streams": 1, "version": "0.1.0", "draining": false}
+```
+
+| Status | When |
+|---|---|
+| `200` | serving, **also when the database is unreachable** (`"db": false`): the data plane keeps working and a database outage must not take every node out of the pool |
+| `503` | draining or shutting down (`"draining": true`): stop sending new requests here |
+
+`db` is the result of a `SELECT 1` bounded to 2 s; `live_streams` counts the streams published on
+this node.
 
 ### 4.6 Events (SSE)
 
@@ -1510,6 +1560,9 @@ curl -s $B/api/v1/public/ui                                     # {"language":"e
 curl -s -H "$H" -H "$J" -X PATCH -d '{"ui_theme":"light"}' $B/api/v1/settings | jq .ui_theme   # "light"
 curl -s -o /dev/null -w '%{http_code}\n' -H "$H" -H "$J" -X PATCH -d '{"ui_theme":"blue"}' $B/api/v1/settings   # 400
 curl -s -H "$H" $B/api/v1/system | jq
+curl -s -H "$H" $B/api/v1/system | jq .cluster                 # {"enabled":false,"node_id":"…","backend":"sqlite","nodes":[]}
+curl -s $B/healthz                                              # liveness, no token: 200 (503 while draining)
+curl -s -H "Authorization: Bearer $RMS_CLUSTER_INTERNAL_SECRET" http://rms1:8081/internal/ping   # cluster: internal listener
 
 # --- video on demand
 curl -s -H "$H" $B/api/v1/vod/ladders | jq '.ladders[].name'
