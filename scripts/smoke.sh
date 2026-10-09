@@ -19,7 +19,7 @@ command -v curl >/dev/null || { echo "curl is required" >&2; exit 2; }
 PASS=0; FAIL=0
 AUTH=(-H "Authorization: Bearer $TOKEN")
 NAME="smoke-$RANDOM$RANDOM"
-TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
+TMP="$(mktemp)"; VOD_DIR="$(mktemp -d)"; trap 'rm -f "$TMP"; rm -rf "$VOD_DIR"' EXIT
 
 # expect <description> <expected_status> <curl args...>; body saved in $TMP
 expect() {
@@ -170,6 +170,56 @@ contains "theme.js exports initTheme()" 'export function initTheme('
 expect "public SSE first event" 200 --max-time 2 "$BASE/api/v1/public/broadcasts/$NAME/events" || true
 expect "DELETE broadcast -> 204" 204 "${AUTH[@]}" -X DELETE "$BASE/api/v1/broadcasts/$NAME"
 expect "GET deleted -> 404" 404 "${AUTH[@]}" "$BASE/api/v1/broadcasts/$NAME"
+
+# Video on demand: ladders, catalogue, then (with ffmpeg here and on the server) upload a
+# tiny generated clip, wait until it is transcoded, check HLS/DASH/poster, delete it.
+expect "GET /vod/ladders" 200 "${AUTH[@]}" "$BASE/api/v1/vod/ladders"
+contains "ladders has the default ladder" '"default_ladder"'
+contains "ladders lists renditions" '"renditions"'
+VOD_AVAILABLE=0; grep -q '"available":true' "$TMP" && VOD_AVAILABLE=1
+expect "GET /vod (list)" 200 "${AUTH[@]}" "$BASE/api/v1/vod"
+expect "GET /vod?status=bogus -> 400" 400 "${AUTH[@]}" "$BASE/api/v1/vod?status=bogus"
+expect "GET /vod without token -> 401" 401 "$BASE/api/v1/vod"
+expect "public VOD catalogue API" 200 "$BASE/api/v1/public/vod"
+expect "public VOD catalogue page" 200 "$BASE/vod"
+expect "public info of an unknown video -> 404" 404 "$BASE/api/v1/public/vod/00000000-0000-4000-8000-000000000000"
+expect "VOD upload of a non-video -> 415" "$([[ $VOD_AVAILABLE == 1 ]] && echo 415 || echo 503)" "${AUTH[@]}" -F "file=@$0;type=text/x-shellscript" "$BASE/api/v1/vod"
+if [[ "$VOD_AVAILABLE" == 1 ]] && command -v ffmpeg >/dev/null; then
+  CLIP="$VOD_DIR/smoke_clip.mp4"
+  if ffmpeg -nostdin -v error -y -f lavfi -i testsrc2=size=320x180:rate=25 -f lavfi -i sine=frequency=440 \
+       -t 3 -c:v libx264 -pix_fmt yuv420p -c:a aac "$CLIP"; then
+    expect "VOD upload -> 201" 201 --max-time 60 "${AUTH[@]}" -F "file=@$CLIP;type=video/mp4" -F "title=Smoke VOD" -F "ladder=standard" "$BASE/api/v1/vod"
+    contains "upload is queued" '"status":"queued"'
+    VOD_ID="$(grep -o '"id":"[0-9a-f-]*"' "$TMP" | head -1 | cut -d'"' -f4)"
+    STATUS=""
+    for _ in $(seq 1 45); do
+      STATUS="$(curl -s --max-time 5 "${AUTH[@]}" "$BASE/api/v1/vod/$VOD_ID" | grep -o '"status":"[a-z]*"' | head -1 | cut -d'"' -f4)"
+      [[ "$STATUS" == ready || "$STATUS" == failed ]] && break
+      sleep 2
+    done
+    if [[ "$STATUS" == ready ]]; then PASS=$((PASS + 1)); echo "  ok   VOD transcoded (ready)"
+    else FAIL=$((FAIL + 1)); echo "  FAIL VOD not ready after 90 s (status: ${STATUS:-?})"; fi
+    expect "VOD HLS master" 200 "$BASE/vod/$VOD_ID/hls/master.m3u8"
+    contains "master has a variant" '#EXT-X-STREAM-INF'
+    contains "master has RESOLUTION/CODECS" 'CODECS="avc1'
+    expect "VOD DASH MPD" 200 "$BASE/vod/$VOD_ID/dash/manifest.mpd"
+    contains "MPD has a Representation" '<Representation'
+    expect "VOD poster" 200 "$BASE/vod/$VOD_ID/poster.jpg"
+    expect "VOD public info" 200 "$BASE/api/v1/public/vod/$VOD_ID"
+    contains "public info has sources" '"hls":"http'
+    expect "VOD embed page" 200 "$BASE/embed/vod/$VOD_ID"
+    contains "embed page is the VOD player" 'data-kind="vod"'
+    expect "VOD embed info" 200 "${AUTH[@]}" "$BASE/api/v1/vod/$VOD_ID/embed"
+    expect "VOD PATCH title" 200 "${AUTH[@]}" -X PATCH -H 'Content-Type: application/json' -d '{"title":"Smoke VOD 2"}' "$BASE/api/v1/vod/$VOD_ID"
+    expect "VOD DELETE -> 204" 204 "${AUTH[@]}" -X DELETE "$BASE/api/v1/vod/$VOD_ID?force=1"
+    expect "VOD deleted -> 404" 404 "${AUTH[@]}" "$BASE/api/v1/vod/$VOD_ID"
+    expect "VOD master after delete -> 404" 404 "$BASE/vod/$VOD_ID/hls/master.m3u8"
+  else
+    echo "  skip VOD upload (cannot generate a test clip with ffmpeg)"
+  fi
+else
+  echo "  skip VOD upload (ffmpeg missing here or VOD unavailable on the server)"
+fi
 
 echo "passed: $PASS  failed: $FAIL"
 [[ "$FAIL" -eq 0 ]]
