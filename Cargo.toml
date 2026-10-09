@@ -21,6 +21,7 @@ futures = "0.3.34"
 hex = "0.4.3"
 mime_guess = "2.0.5"
 rand = "0.10.3"
+rtc = "0.21.0"
 rtmp-rs = "0.6"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }

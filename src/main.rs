@@ -24,6 +24,7 @@ use rust_media_server::metrics::{self, ViewerTracker};
 use rust_media_server::packager::{self, PackagerManager};
 use rust_media_server::recorder::RecorderManager;
 use rust_media_server::state::{AppState, AppStateParts};
+use rust_media_server::webrtc::WebRtcManager;
 use rust_media_server::{api, egress, web};
 
 /// rust-media-server: RTMP ingest, HTTP-FLV / WS-FLV / LL-HLS / LL-DASH egress.
@@ -177,6 +178,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
     packager.spawn();
     let recorder = RecorderManager::new(config.clone(), db.clone(), hub.clone());
     recorder.spawn();
+    let webrtc = WebRtcManager::new(config.clone(), hub.clone(), tracker.clone());
+    webrtc.spawn(shutdown.clone());
 
     let state = AppState::new(AppStateParts {
         config: config.clone(),
@@ -185,6 +188,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         tracker: tracker.clone(),
         packager,
         recorder,
+        webrtc,
         admin_token,
         shutdown: shutdown.clone(),
     });
@@ -198,6 +202,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .merge(api::router(&state))
         .merge(egress::router())
         .merge(packager::router())
+        .merge(WebRtcManager::router())
         .merge(web::router(&state))
         .fallback(|| async { ApiError::not_found("not found").into_response() })
         .layer(TraceLayer::new_for_http())
