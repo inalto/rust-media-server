@@ -1,12 +1,15 @@
 # syntax=docker/dockerfile:1
 # rust-media-server (rms) — multi-stage image: Rust builder + static ffmpeg + slim runtime.
-# Build:  docker build -t rms:latest .      (or: podman build -t rms:latest .)
+# Build:  docker build -t rms:latest .
+#         podman build --format docker -t rms:latest .   (OCI format drops HEALTHCHECK; compose has its own)
 # Run:    docker run -d --name rms -p 8080:8080 -p 1935:1935 -p 8443:8443/udp -v rms-data:/data rms:latest
 
 FROM docker.io/library/rust:1-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# Strip debug info for a small image (the repo's release profile keeps line tables for local builds).
+ENV CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=true
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked && install -m755 target/release/rms /usr/local/bin/rms
