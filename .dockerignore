@@ -1,0 +1,10 @@
+target
+data
+.git
+.worktrees
+*.flv
+*.mp4
+docs
+deploy
+scripts
+README.md
