@@ -24,6 +24,27 @@ pub struct Config {
     pub webrtc: WebRtcConfig,
     pub vod: VodConfig,
     pub cluster: ClusterConfig,
+    pub storage: StorageConfig,
+}
+
+/// Bucket storage of the users (`PUT /storage/{bucket}/...`, docs/ACCOUNTS.md §3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// Largest file accepted by the storage API, MiB (413 above it).
+    pub max_object_mb: u64,
+    /// Directory of the bucket files (`<root>/<bucket id>/<path>`); empty =
+    /// `<data_dir>/buckets`. Shared by every node in cluster mode.
+    pub root: String,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            max_object_mb: 20480,
+            root: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -712,6 +733,7 @@ impl Config {
         c.internal_bind = c.internal_bind.trim().to_string();
         c.internal_secret = c.internal_secret.trim().to_string();
         c.whep_url = c.whep_url.trim().trim_end_matches('/').to_string();
+        self.storage.root = self.storage.root.trim().to_string();
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -745,6 +767,9 @@ impl Config {
         }
         self.vod.validate()?;
         self.cluster.validate(&self.server)?;
+        if self.storage.max_object_mb == 0 {
+            bail!("storage.max_object_mb must be positive");
+        }
         Ok(())
     }
 
@@ -791,6 +816,15 @@ impl Config {
     /// The VOD inbox folder (see [`VodConfig::inbox_path`]).
     pub fn vod_inbox_dir(&self) -> PathBuf {
         self.vod.inbox_path(&self.server.data_dir)
+    }
+
+    /// Root of the bucket files: `storage.root`, else `<data_dir>/buckets`.
+    pub fn storage_root(&self) -> PathBuf {
+        if self.storage.root.is_empty() {
+            self.server.data_dir.join("buckets")
+        } else {
+            PathBuf::from(&self.storage.root)
+        }
     }
 
     pub fn admin_token_path(&self) -> PathBuf {
@@ -938,6 +972,9 @@ mod tests {
     #[test]
     fn defaults_match_contract() {
         let c = Config::default();
+        assert_eq!(c.storage.max_object_mb, 20480);
+        assert_eq!(c.storage.root, "");
+        assert_eq!(c.storage_root(), PathBuf::from("./data/buckets"));
         assert_eq!(c.server.http_bind, "0.0.0.0:8080");
         assert_eq!(c.server.public_url, "");
         assert_eq!(c.server.data_dir, PathBuf::from("./data"));
@@ -1012,6 +1049,26 @@ mod tests {
         let text = include_str!("../config.example.toml");
         let c = Config::from_toml_str(text).unwrap();
         assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn storage_section() {
+        let c = Config::from_toml_str("[storage]\nmax_object_mb = 10\nroot = \"/srv/buckets\"\n")
+            .unwrap();
+        assert_eq!(c.storage.max_object_mb, 10);
+        assert_eq!(c.storage_root(), PathBuf::from("/srv/buckets"));
+        let mut w = Vec::new();
+        let c = apply_env_overrides(
+            Config::default(),
+            vars(&[("RMS_STORAGE_MAX_OBJECT_MB", "64")]),
+            &mut w,
+        )
+        .unwrap();
+        assert_eq!(c.storage.max_object_mb, 64);
+        assert!(w.is_empty());
+        let mut bad = Config::default();
+        bad.storage.max_object_mb = 0;
+        assert!(bad.validate().is_err());
     }
 
     #[test]
