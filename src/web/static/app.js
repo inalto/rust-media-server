@@ -519,7 +519,7 @@ function mountSettings(root) {
         h('div', { class: 'tiles' },
           h('div', { class: 'tile' }, h('span', { class: 'tile-label' }, t('common.liveNow')), h('span', { class: 'tile-value' }, fmtInt(o.live_broadcasts))),
           h('div', { class: 'tile' }, h('span', { class: 'tile-label' }, t('settings.totalViewers')), h('span', { class: 'tile-value' }, fmtInt(totalViewers(tot)))),
-          ...PROTOCOLS.filter((p) => p.key !== 'webrtc').map((p) => h('div', { class: 'tile' }, h('span', { class: 'tile-label' }, p.label), h('span', { class: 'tile-value' }, fmtInt(tot[p.key] || 0))))),
+          ...PROTOCOLS.map((p) => h('div', { class: 'tile' }, h('span', { class: 'tile-label' }, p.label), h('span', { class: 'tile-value' }, fmtInt(tot[p.key] || 0))))),
         (o.per_broadcast || []).length
           ? h('div', { class: 'table-wrap' }, h('table', null,
             h('thead', null, h('tr', null, h('th', { scope: 'col' }, t('common.broadcast')), h('th', { scope: 'col' }, t('common.status')), h('th', { scope: 'col', class: 'num' }, t('common.viewers')))),
