@@ -15,8 +15,14 @@ use crate::db::DbError;
 pub enum ApiError {
     #[error("{0}")]
     BadRequest(String),
+    /// 400 with the offending request field: `{"error": "...", "field": "..."}`.
+    #[error("{message}")]
+    Invalid { field: String, message: String },
     #[error("unauthorized")]
     Unauthorized,
+    /// 401 with a specific message (signed playback URLs).
+    #[error("{0}")]
+    TokenRequired(String),
     #[error("{0}")]
     Forbidden(String),
     #[error("{0}")]
@@ -25,6 +31,9 @@ pub enum ApiError {
     Conflict(String),
     #[error("{0}")]
     PayloadTooLarge(String),
+    /// 507: the user's storage quota would be exceeded.
+    #[error("{0}")]
+    InsufficientStorage(String),
     #[error("not implemented yet")]
     NotImplemented,
     #[error("{0}")]
@@ -36,6 +45,13 @@ pub enum ApiError {
 impl ApiError {
     pub fn bad_request(msg: impl Into<String>) -> Self {
         Self::BadRequest(msg.into())
+    }
+    /// 400 naming the invalid field.
+    pub fn invalid(field: impl Into<String>, msg: impl Into<String>) -> Self {
+        Self::Invalid {
+            field: field.into(),
+            message: msg.into(),
+        }
     }
     pub fn forbidden(msg: impl Into<String>) -> Self {
         Self::Forbidden(msg.into())
@@ -59,12 +75,13 @@ impl ApiError {
 
     pub fn status(&self) -> StatusCode {
         match self {
-            ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiError::BadRequest(_) | ApiError::Invalid { .. } => StatusCode::BAD_REQUEST,
+            ApiError::Unauthorized | ApiError::TokenRequired(_) => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ApiError::InsufficientStorage(_) => StatusCode::INSUFFICIENT_STORAGE,
             ApiError::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -82,10 +99,14 @@ impl IntoResponse for ApiError {
             }
             other => other.to_string(),
         };
-        let mut resp = (status, Json(json!({ "error": message }))).into_response();
+        let body = match &self {
+            ApiError::Invalid { field, .. } => json!({ "error": message, "field": field }),
+            _ => json!({ "error": message }),
+        };
+        let mut resp = (status, Json(body)).into_response();
         let headers = resp.headers_mut();
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        if status == StatusCode::UNAUTHORIZED {
+        if matches!(self, ApiError::Unauthorized) {
             headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         }
         resp

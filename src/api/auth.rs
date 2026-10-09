@@ -1,25 +1,32 @@
-//! Admin authentication (ARCHITECTURE.md §8).
+//! Authentication endpoints and the admin token (ARCHITECTURE.md §8, docs/ACCOUNTS.md §2).
 //!
 //! Admin endpoints accept `Authorization: Bearer <token>` or the `rms_token` cookie set
 //! by `POST /api/v1/auth/login {token}`. The token comes from `server.admin_token`
 //! (or `RMS_ADMIN_TOKEN`); when empty, it is read from `data/admin_token`, or generated
 //! at first start, stored there (mode 0600) and printed in the log.
+//!
+//! The login also accepts a user's API key (phase 8A): it then sets the `rms_key`
+//! cookie. Login and check answer `200 {role: "admin"}` or `200 {role: "user", user:
+//! {id, username, display_name}, scopes}`; the request middlewares live in
+//! [`super::principal`].
 
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::Json;
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::principal::{KEY_COOKIE, Principal, Resolved, UserPrincipal, resolve, resolve_key};
 use super::{ApiJson, BaseUrl};
 use crate::config::Config;
+use crate::db::{api_keys, users};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -132,26 +139,13 @@ pub fn extract_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-pub fn is_authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    extract_token(headers).is_some_and(|t| token_matches(&state.admin_token, &t))
-}
-
-/// Middleware guarding the admin API.
-pub async fn require_admin(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    if is_authorized(&state, req.headers()) {
-        next.run(req).await
-    } else {
-        ApiError::Unauthorized.into_response()
-    }
-}
-
 #[derive(Debug, Deserialize)]
 pub struct LoginBody {
     pub token: String,
 }
 
-fn cookie(value: &str, max_age: u64, secure: bool) -> HeaderValue {
-    let mut c = format!("{COOKIE_NAME}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}");
+fn cookie(name: &str, value: &str, max_age: u64, secure: bool) -> HeaderValue {
+    let mut c = format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}");
     if secure {
         c.push_str("; Secure");
     }
@@ -161,51 +155,141 @@ fn cookie(value: &str, max_age: u64, secure: bool) -> HeaderValue {
         .unwrap_or_else(|_| HeaderValue::from_static("rms_token=; Path=/; Max-Age=0"))
 }
 
-/// `POST /api/v1/auth/login {token}` → 204 + `Set-Cookie: rms_token=...`, 401 if wrong.
+/// The user of a [`WhoAmI`].
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WhoAmIUser {
+    pub id: String,
+    pub username: String,
+    pub display_name: String,
+}
+
+/// Body of `POST /auth/login` and `GET /auth/check`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WhoAmI {
+    /// `admin` | `user`
+    pub role: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<WhoAmIUser>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
+    /// Key id (user role).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+}
+
+impl WhoAmI {
+    fn of(p: &Principal) -> Self {
+        match p {
+            Principal::Admin => Self {
+                role: "admin",
+                user: None,
+                scopes: None,
+                key_id: None,
+            },
+            Principal::User(u) => Self::user(u),
+        }
+    }
+
+    fn user(u: &UserPrincipal) -> Self {
+        Self {
+            role: "user",
+            user: Some(WhoAmIUser {
+                id: u.user_id.clone(),
+                username: u.username.clone(),
+                display_name: u.display_name.clone(),
+            }),
+            scopes: Some(u.scopes.clone()),
+            key_id: Some(u.key_id.clone()),
+        }
+    }
+}
+
+fn no_store(mut resp: Response) -> Response {
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
+}
+
+/// `POST /api/v1/auth/login {token}`: the admin token → `200 {role:"admin"}` +
+/// `rms_token` cookie; an API key → `200 {role:"user", user, scopes}` + `rms_key` cookie
+/// (until the key expires, at most 30 days). The other cookie is cleared. 401 (after a
+/// 400 ms delay) when wrong, 403 for a suspended user.
 async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
     ApiJson(body): ApiJson<LoginBody>,
 ) -> Result<Response, ApiError> {
     let token = body.token.trim();
-    if !token_matches(&state.admin_token, token) {
-        // Slow down brute force attempts a little.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        tracing::warn!("failed admin login attempt");
-        return Err(ApiError::Unauthorized);
-    }
-    if token
-        .bytes()
-        .any(|b| !(b.is_ascii_graphic()) || b == b';' || b == b',')
-    {
-        return Err(ApiError::bad_request(
-            "token contains characters unsuitable for a cookie; use the Authorization header",
-        ));
-    }
     let secure = BaseUrl::from_request(&state.config, &headers).https;
-    let mut resp = StatusCode::NO_CONTENT.into_response();
-    resp.headers_mut().insert(
-        header::SET_COOKIE,
-        cookie(token, COOKIE_MAX_AGE_SECS, secure),
-    );
-    Ok(resp)
+    if token_matches(&state.admin_token, token) {
+        if token
+            .bytes()
+            .any(|b| !(b.is_ascii_graphic()) || b == b';' || b == b',')
+        {
+            return Err(ApiError::bad_request(
+                "token contains characters unsuitable for a cookie; use the Authorization header",
+            ));
+        }
+        let mut resp = no_store(Json(WhoAmI::of(&Principal::Admin)).into_response());
+        let h = resp.headers_mut();
+        h.append(
+            header::SET_COOKIE,
+            cookie(COOKIE_NAME, token, COOKIE_MAX_AGE_SECS, secure),
+        );
+        h.append(header::SET_COOKIE, cookie(KEY_COOKIE, "", 0, secure));
+        return Ok(resp);
+    }
+    if api_keys::looks_like_key(token) {
+        match resolve_key(&state, token).await {
+            Resolved::Principal(Principal::User(user)) => {
+                let max_age = match api_keys::get(&state.db, &user.user_id, &user.key_id).await {
+                    Ok(Some(k)) => k
+                        .expires_at
+                        .map(|t| (t - chrono::Utc::now()).num_seconds().max(0) as u64)
+                        .unwrap_or(COOKIE_MAX_AGE_SECS)
+                        .min(COOKIE_MAX_AGE_SECS),
+                    _ => COOKIE_MAX_AGE_SECS,
+                };
+                if let Err(e) = users::touch_login(&state.db, &user.user_id).await {
+                    tracing::warn!(error = %e, "cannot store the login time");
+                }
+                tracing::info!(user = %user.username, "user login");
+                let mut resp = no_store(Json(WhoAmI::user(&user)).into_response());
+                let h = resp.headers_mut();
+                h.append(
+                    header::SET_COOKIE,
+                    cookie(KEY_COOKIE, token, max_age, secure),
+                );
+                h.append(header::SET_COOKIE, cookie(COOKIE_NAME, "", 0, secure));
+                return Ok(resp);
+            }
+            Resolved::Suspended => return Err(ApiError::forbidden("the user is suspended")),
+            Resolved::Error(e) => return Err(e),
+            _ => {}
+        }
+    }
+    // Slow down brute force attempts a little.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    tracing::warn!("failed login attempt");
+    Err(ApiError::Unauthorized)
 }
 
-/// `POST /api/v1/auth/logout` → 204 and cookie cleared.
+/// `POST /api/v1/auth/logout` → 204 and both cookies cleared.
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let secure = BaseUrl::from_request(&state.config, &headers).https;
     let mut resp = StatusCode::NO_CONTENT.into_response();
-    resp.headers_mut()
-        .insert(header::SET_COOKIE, cookie("", 0, secure));
+    let h = resp.headers_mut();
+    h.append(header::SET_COOKIE, cookie(COOKIE_NAME, "", 0, secure));
+    h.append(header::SET_COOKIE, cookie(KEY_COOKIE, "", 0, secure));
     resp
 }
 
-/// `GET /api/v1/auth/check` → 204 if authenticated, 401 otherwise.
+/// `GET /api/v1/auth/check` → `200 WhoAmI` when authenticated (header or cookie), 401
+/// otherwise, 403 for a suspended user.
 async fn check(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if is_authorized(&state, &headers) {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        ApiError::Unauthorized.into_response()
+    match resolve(&state, &headers).await.into_result() {
+        Ok(p) => no_store(Json(WhoAmI::of(&p)).into_response()),
+        Err(e) => e.into_response(),
     }
 }
 

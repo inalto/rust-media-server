@@ -28,10 +28,10 @@ pub mod inbox;
 pub mod job;
 pub mod serve;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::{Notify, broadcast};
@@ -41,9 +41,39 @@ pub use serve::router;
 
 use crate::cluster::bus::{Notice, Outbox};
 use crate::config::Config;
-use crate::db::vod::{self as repo, VodItem};
+use crate::db::objects::BucketObject;
+use crate::db::vod::{self as repo, ORIGIN_STORAGE, VodItem};
 use crate::db::{Db, DbError};
 use crate::hub::HubEvent;
+
+/// How long [`VodManager::playback_access`] answers from memory (a visibility change or
+/// a key rotation made on another node takes effect within this delay).
+pub const ACCESS_CACHE_TTL: Duration = Duration::from_secs(5);
+/// Entries kept at most by the playback access cache (cleared when full).
+const ACCESS_CACHE_MAX: usize = 10_000;
+
+/// What the playback routes need to authorize a request for a video.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybackAccess {
+    /// `visibility = private`: a signed token is required.
+    pub private: bool,
+    /// Signing key of the bucket (encodings of bucket files).
+    pub signing_key: Option<String>,
+}
+
+/// Total size of the files below `path` (symlinks not followed, errors ignored).
+pub fn dir_size(path: &Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
 
 /// Container extensions accepted for video on demand (upload and inbox).
 pub const VOD_EXTENSIONS: &[&str] = &[
@@ -152,6 +182,10 @@ pub struct VodManager {
     wake: Notify,
     /// Running jobs: item id → cancellation token.
     jobs: Mutex<HashMap<String, CancellationToken>>,
+    /// Items being re-queued: the runner does not claim them meanwhile.
+    held: Mutex<HashSet<String>>,
+    /// Playback authorization data per item id (see [`ACCESS_CACHE_TTL`]).
+    access: Mutex<HashMap<String, (Instant, Option<PlaybackAccess>)>>,
 }
 
 impl VodManager {
@@ -174,6 +208,8 @@ impl VodManager {
             ffprobe,
             wake: Notify::new(),
             jobs: Mutex::new(HashMap::new()),
+            held: Mutex::new(HashSet::new()),
+            access: Mutex::new(HashMap::new()),
         })
     }
 
@@ -215,8 +251,19 @@ impl VodManager {
         self.item_dir(id).join("poster.jpg")
     }
 
-    /// Absolute path of the source file (`None` for an unsafe stored path).
+    /// Absolute path of the source file (`None` for an unsafe stored path): under
+    /// `data/vod/`, or in the bucket for an encoding of a bucket file (the original is
+    /// referenced in place).
     pub fn source_file(&self, item: &VodItem) -> Option<PathBuf> {
+        if let Some(bucket) = &item.bucket_id {
+            let rel = item.source_path.strip_prefix('/')?;
+            let safe = !rel.is_empty()
+                && crate::vod::parse_id(bucket).as_deref() == Some(bucket.as_str())
+                && Path::new(rel)
+                    .components()
+                    .all(|c| matches!(c, Component::Normal(_)));
+            return safe.then(|| self.config.storage_root().join(bucket).join(rel));
+        }
         let rel = Path::new(&item.source_path);
         let safe = !item.source_path.is_empty()
             && rel.components().all(|c| matches!(c, Component::Normal(_)));
@@ -226,6 +273,7 @@ impl VodManager {
     /// Emit `HubEvent::VodChanged` (admin SSE `vod` / `vod_deleted`); in cluster mode
     /// the other nodes get it through `rms_vod` (and wake their job runner).
     pub fn changed(&self, id: &str) {
+        self.invalidate_access(id);
         let event = HubEvent::VodChanged { id: id.to_string() };
         if let Some(notice) = Notice::for_event(&event) {
             self.outbox.send(notice);
@@ -256,6 +304,132 @@ impl VodManager {
 
     pub fn is_running(&self, id: &str) -> bool {
         self.lock_jobs().contains_key(id)
+    }
+
+    fn lock_held(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.held.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The item is being re-queued (the runner must not claim it yet).
+    pub fn is_held(&self, id: &str) -> bool {
+        self.lock_held().contains(id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Playback authorization (signed URLs, phase 8A)
+    // -----------------------------------------------------------------------
+
+    fn lock_access(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, (Instant, Option<PlaybackAccess>)>> {
+        self.access.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Visibility and signing key of item `id` (`None` = unknown item), cached for
+    /// [`ACCESS_CACHE_TTL`] (every segment request asks).
+    pub async fn playback_access(&self, id: &str) -> Result<Option<PlaybackAccess>, DbError> {
+        if let Some((at, v)) = self.lock_access().get(id)
+            && at.elapsed() < ACCESS_CACHE_TTL
+        {
+            return Ok(v.clone());
+        }
+        let v = repo::playback_access(&self.db, id)
+            .await?
+            .map(|(visibility, signing_key)| PlaybackAccess {
+                private: visibility == repo::VISIBILITY_PRIVATE,
+                signing_key,
+            });
+        let mut cache = self.lock_access();
+        if cache.len() >= ACCESS_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(id.to_string(), (Instant::now(), v.clone()));
+        Ok(v)
+    }
+
+    /// Forget the cached access of `id` (called by [`Self::changed`]).
+    pub fn invalidate_access(&self, id: &str) {
+        self.lock_access().remove(id);
+    }
+
+    /// Forget every cached access (signing key rotated, bucket deleted).
+    pub fn clear_access_cache(&self) {
+        self.lock_access().clear();
+    }
+
+    // -----------------------------------------------------------------------
+    // Encodings of bucket files (phase 8A)
+    // -----------------------------------------------------------------------
+
+    /// Queue the encoding of a bucket file: the item references the original in place
+    /// (`source_path` = object path, no copy); the title is the file name.
+    pub async fn create_storage_item(
+        &self,
+        user_id: &str,
+        bucket_id: &str,
+        object: &BucketObject,
+        ladder: &str,
+        visibility: &str,
+    ) -> Result<VodItem, DbError> {
+        let id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let name = object.name();
+        let title: String = name.chars().take(200).collect();
+        let title = if title.trim().is_empty() {
+            "Video".to_string()
+        } else {
+            title
+        };
+        let mut item = VodItem::new(&id, &title, &object.path, ladder, ORIGIN_STORAGE);
+        item.source_name = name.to_string();
+        item.source_size = object.size;
+        item.user_id = Some(user_id.to_string());
+        item.bucket_id = Some(bucket_id.to_string());
+        item.object_id = Some(object.id.clone());
+        item.visibility = visibility.to_string();
+        repo::insert(&self.db, &item).await?;
+        tracing::info!(id = %id, bucket = %bucket_id, path = %object.path, ladder = %ladder, "bucket file encoding queued");
+        self.changed(&id);
+        self.wake();
+        Ok(item)
+    }
+
+    /// Encode item `id` again with `ladder` (overwritten original, `?action=encode`),
+    /// whatever its status: a local job is cancelled first, the output removed, the row
+    /// re-queued (`source_size` = size of the new original). `None` when it is gone.
+    pub async fn reencode(
+        &self,
+        id: &str,
+        ladder: &str,
+        source_size: Option<u64>,
+    ) -> Result<Option<VodItem>, DbError> {
+        self.lock_held().insert(id.to_string());
+        if self.cancel(id) && !self.wait_stopped(id, Duration::from_secs(15)).await {
+            tracing::warn!(id = %id, "the VOD job did not stop in time");
+        }
+        self.clear_output(id).await;
+        let result = repo::requeue_any(&self.db, id, ladder, source_size).await;
+        self.lock_held().remove(id);
+        if matches!(result, Ok(Some(_))) {
+            tracing::info!(id = %id, ladder = %ladder, "video on demand re-queued");
+            self.changed(id);
+            self.wake();
+        }
+        result
+    }
+
+    /// Delete item `id` whatever its status: row first (a cancelled job finds nothing to
+    /// re-queue), then the job is cancelled and `data/vod/<id>/` removed.
+    pub async fn delete_item(&self, id: &str) -> Result<Option<VodItem>, DbError> {
+        let item = repo::delete(&self.db, id, true).await?;
+        if item.is_some() {
+            if self.cancel(id) && !self.wait_stopped(id, Duration::from_secs(15)).await {
+                tracing::warn!(id = %id, "the VOD job did not stop in time");
+            }
+            self.remove_files(id).await;
+            tracing::info!(id = %id, "video on demand deleted");
+            self.changed(id);
+        }
+        Ok(item)
     }
 
     pub fn jobs_running(&self) -> usize {

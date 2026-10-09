@@ -11,6 +11,12 @@
 //   representations); native HLS has no quality API, so the menu is hidden there.
 // - Query: autoplay=1|0 (0), muted=1|0 (= autoplay), controls=1|0 (1), t=<seconds> start
 //   position, src=auto|hls|dash, lang=it|en, theme=system|light|dark.
+// - Private videos (signed URLs, docs/ACCOUNTS.md §5): token=<t>&expires=<unix> of the page
+//   URL is passed to the info request and appended to every playback request (master/MPD,
+//   playlists, init and media segments, poster): hls.js re-opens its XHRs in xhrSetup,
+//   dash.js gets a request interceptor; native HLS relies on the server, which rewrites the
+//   playlists of private videos with the token. Without a valid token the info answers 401
+//   and the player shows the "private video" card.
 // - Debug handle: window.rmsPlayer = { kind: 'vod', status, source, engine, hls, dash,
 //   levels, currentLevel, setLevel(i), info, language, theme, options, reload() }.
 import { t, setLanguage, getLanguage, normalizeLanguage, translateDom, formatNumber } from './i18n.js';
@@ -35,6 +41,14 @@ export function startVodPlayer() {
     return !(v === '0' || v === 'false' || v === 'no' || v === 'off');
   };
   const normalizeSrc = (s) => { s = (s || 'auto').toLowerCase(); return ORDER.includes(s) ? s : 'auto'; };
+  // Signed playback (private videos): forwarded to every request.
+  const signedQuery = params.get('token') && params.get('expires')
+    ? 'token=' + encodeURIComponent(params.get('token')) + '&expires=' + encodeURIComponent(params.get('expires'))
+    : '';
+  const withToken = (url) => {
+    if (!signedQuery || !url || /[?&]token=/.test(url)) return url;
+    return url + (url.indexOf('?') >= 0 ? '&' : '?') + signedQuery;
+  };
   const autoplay = flag('autoplay', false);
   const start = Math.max(0, parseFloat(params.get('t') || '0') || 0);
   const opts = { autoplay, muted: flag('muted', autoplay), controls: flag('controls', true), src: normalizeSrc(params.get('src')), t: start };
@@ -74,7 +88,7 @@ export function startVodPlayer() {
   video.preload = 'metadata';
 
   let info = null;
-  let status = 'loading'; // loading | queued | processing | ready | failed | notfound | error
+  let status = 'loading'; // loading | queued | processing | ready | failed | notfound | private | error
   let engine = null;      // { source, kind, destroy(), levels(), current(), auto(), setLevel(i) }
   let queue = [];
   let generation = 0;
@@ -133,6 +147,7 @@ export function startVodPlayer() {
     showSpinner(false);
     let title; let text; let progress = null; let retry = false;
     if (status === 'notfound') { title = t('vodplayer.notFound'); text = t('vodplayer.notFoundText'); }
+    else if (status === 'private') { title = t('vodplayer.private'); text = t('vodplayer.privateText'); }
     else if (status === 'failed') { title = t('vodplayer.unavailable'); text = t('vodplayer.unavailableText'); }
     else if (status === 'error') { title = t('vodplayer.error'); text = t('vodplayer.errorText'); retry = true; }
     else {
@@ -190,7 +205,7 @@ export function startVodPlayer() {
     const onError = () => fatal(gen, 'native: media error ' + (video.error ? video.error.code : ''));
     video.addEventListener('error', onError);
     bindStart(() => { video.currentTime = Math.min(opts.t, (video.duration || opts.t) - 0.5); });
-    video.src = info.sources.hls;
+    video.src = withToken(info.sources.hls);
     tryPlay();
     return Promise.resolve({
       source: 'hls', kind: 'native',
@@ -205,7 +220,10 @@ export function startVodPlayer() {
         if (nativeHls()) return createNative(gen);
         throw new Error('hls.js not supported');
       }
-      const hls = new Hls({ startLevel: -1, capLevelToPlayerSize: true, startPosition: opts.t > 0 ? opts.t : -1 });
+      const config = { startLevel: -1, capLevelToPlayerSize: true, startPosition: opts.t > 0 ? opts.t : -1 };
+      // Called before the XHR is opened: opening it here with the signed URL wins.
+      if (signedQuery) config.xhrSetup = (xhr, url) => { const signed = withToken(url); if (signed !== url) xhr.open('GET', signed, true); };
+      const hls = new Hls(config);
       let recovered = false;
       hls.on(Hls.Events.ERROR, (_e, data) => {
         if (!data || !data.fatal) return;
@@ -214,7 +232,7 @@ export function startVodPlayer() {
       });
       hls.on(Hls.Events.MANIFEST_PARSED, () => { renderQuality(); tryPlay(); });
       hls.on(Hls.Events.LEVEL_SWITCHED, renderQuality);
-      hls.loadSource(info.sources.hls);
+      hls.loadSource(withToken(info.sources.hls));
       hls.attachMedia(video);
       return {
         source: 'hls', kind: 'hls.js', hls,
@@ -231,6 +249,9 @@ export function startVodPlayer() {
     return loadLib('dash').then((dashjs) => {
       if (typeof dashjs.supportsMediaSource === 'function' && !dashjs.supportsMediaSource()) throw new Error('dash.js: MSE not supported');
       const player = dashjs.MediaPlayer().create();
+      if (signedQuery && typeof player.addRequestInterceptor === 'function') {
+        player.addRequestInterceptor((request) => { request.url = withToken(request.url); return Promise.resolve(request); });
+      }
       player.updateSettings({ streaming: { abr: { autoSwitchBitrate: { video: true } } } });
       const ev = dashjs.MediaPlayer.events;
       player.on(ev.ERROR, (e) => { const err = e && e.error; fatal(gen, 'dash.js: ' + ((err && (err.message || err.code)) || 'error')); });
@@ -239,7 +260,7 @@ export function startVodPlayer() {
         renderQuality();
       });
       player.on(ev.QUALITY_CHANGE_RENDERED, renderQuality);
-      player.initialize(video, info.sources.dash, opts.autoplay);
+      player.initialize(video, withToken(info.sources.dash), opts.autoplay);
       if (opts.autoplay) tryPlay();
       const reps = () => { try { return player.getRepresentationsByType('video') || []; } catch (_) { return []; } };
       let manual = false;
@@ -302,7 +323,7 @@ export function startVodPlayer() {
     destroyEngine();
     hideNotice();
     stage.dataset.state = 'ready';
-    if (info.poster_url) video.poster = info.poster_url; else video.removeAttribute('poster');
+    if (info.poster_url) video.poster = withToken(info.poster_url); else video.removeAttribute('poster');
     queue = sourceOrder();
     tryNext();
   }
@@ -429,14 +450,17 @@ export function startVodPlayer() {
   // ---------------------------------------------------------------- info
 
   function refresh() {
-    return fetch('/api/v1/public/vod/' + encodeURIComponent(id), { cache: 'no-store' }).then((res) => {
+    const infoUrl = '/api/v1/public/vod/' + encodeURIComponent(id) + (signedQuery ? '?' + signedQuery : '');
+    return fetch(infoUrl, { cache: 'no-store' }).then((res) => {
       if (res.status === 404) return { notfound: true };
+      if (res.status === 401) return { private: true };
       if (!res.ok) throw new Error('HTTP ' + res.status);
       return res.json();
     }).then((data) => {
-      if (data.notfound) {
+      if (data.notfound || data.private) {
         info = null;
-        status = 'notfound';
+        status = data.private ? 'private' : 'notfound';
+        if (data.private) { clearInterval(pollTimer); pollTimer = null; }
         destroyEngine();
         renderTexts();
         showNotice();
@@ -479,6 +503,7 @@ export function startVodPlayer() {
     get theme() { return resolvedTheme(); },
     get options() { return Object.assign({}, opts); },
     get mode() { return mode; },
+    get signed() { return !!signedQuery; },
     reload() { if (status === 'ready') startPlayback(); },
   };
 

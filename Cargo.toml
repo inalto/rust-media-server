@@ -14,12 +14,17 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 async-stream = "0.3.6"
 axum = { version = "0.8.9", features = ["ws", "multipart", "macros"] }
+# Signed playback URLs: base64url tokens, HMAC-SHA256 (accounts, phase 8A).
+base64 = "0.22.1"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 hex = "0.4.3"
+hmac = "0.13.0"
 mime_guess = "2.0.5"
+# Storage API path normalization (percent-decoding, Unicode NFC).
+percent-encoding = "2.3.2"
 rand = "0.10.3"
 # Internal cluster client (relay, kick, status, files): rustls with the ring provider
 # (installed at startup; no aws-lc-rs, no native-tls).
@@ -43,6 +48,7 @@ tower = "0.5.3"
 tower-http = { version = "0.7.1", features = ["fs", "cors", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unicode-normalization = "0.1.25"
 uuid = { version = "1.27.0", features = ["v4", "serde"] }
 
 [profile.release]

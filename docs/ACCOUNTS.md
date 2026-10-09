@@ -8,7 +8,7 @@ Playback of private content uses **signed URLs**. The existing admin token remai
 
 Language conventions as in ARCHITECTURE.md: code/API/docs in English, dashboard it/en via `i18n.js`.
 
-## 1. Entities (schema v5 on SQLite, Postgres migration 2)
+## 1. Entities (schema v5 on SQLite, Postgres migration 3)
 
 ```sql
 CREATE TABLE users (
@@ -39,6 +39,7 @@ CREATE TABLE bucket_objects (                                  -- index of the f
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (bucket_id, path));
 ALTER TABLE vod_items ADD COLUMN user_id TEXT; ADD COLUMN bucket_id TEXT; ADD COLUMN object_id TEXT;
 ALTER TABLE vod_items ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public';   -- public|private
+ALTER TABLE vod_items ADD COLUMN output_bytes INTEGER NOT NULL DEFAULT 0;     -- (8A addition) encoding size, counted in quotas
 CREATE INDEX idx_objects_bucket_path ON bucket_objects(bucket_id, path);
 ```
 Files live under `data/buckets/<bucket_id>/<path>` (never under the bucket *name*, so renames are free).
@@ -57,8 +58,9 @@ grants `admin` on all of the user's buckets and allows managing keys/buckets. Su
 `Principal = Admin | User { user_id, key_id, scopes, permissions }`, resolved once per request by a
 middleware on `/api/v1/*` and `/storage/*`, from (in order): `Authorization: Bearer <admin token | api key>`,
 `AccessKey: <api key>` (bunny-style), cookies `rms_token` (admin) / `rms_key` (user key, HttpOnly, SameSite=Lax).
-`POST /api/v1/auth/login {token}` accepts both; response `{role:"admin"}` or `{role:"user", user:{id, username,
-display_name}, scopes}` and sets the matching cookie. `GET /api/v1/auth/check` → `{role, user?}`.
+`POST /api/v1/auth/login {token}` accepts both; response `200 {role:"admin"}` or `200 {role:"user", user:{id,
+username, display_name}, scopes, key_id}` and sets the matching cookie (clearing the other one).
+`GET /api/v1/auth/check` → `200 {role, user?, scopes?, key_id?}` (both answered `204` before 8A).
 `last_used_at` updated at most once a minute. Constant-time comparison for the admin token; keys are
 looked up by hash. Rate-limit failed logins (existing 400 ms delay).
 
@@ -73,12 +75,14 @@ looked up by hash. Rate-limit failed logins (existing 400 ms delay).
 | `PUT /storage/{b}/{dir}/` | write | create an (empty) directory → 201 |
 | `DELETE /storage/{b}/{file}` | write | deletes the file and its encoding → 204 |
 | `DELETE /storage/{b}/{dir}/` | admin | recursive delete → 204 |
-| `POST /storage/{b}/{file}?action=encode` body `{ladder?, visibility?}` | write | (re)queues the encoding → 202 `{encoding}` |
+| `POST /storage/{b}/{file}?action=encode` body `{ladder?, visibility?}` | write | (re)queues the encoding → 202 object view with `encoding` |
 | `POST /storage/{b}/{file}?action=sign` body `{expires_secs?}` | read | signed playback URLs `{hls, dash, poster, embed, expires}` |
 
 Rules: path normalization (percent-decoding, NFC, reject `..`, control chars, empty segments, `.rms` prefix);
 listings hide nothing (encodings live elsewhere). Content types from `mime_guess`. Every response carries
 `Cache-Control: no-store` except file bodies (`private, max-age=0`). CORS permissive (keys are sent as headers).
+As built (8A): a missing directory lists `[]`; `DELETE` of the bucket root → 400 (delete the bucket);
+file/directory clashes → 409; `X-Rms-Encode: none` on an overwrite deletes the stale encoding.
 
 ## 4. Management API
 
@@ -96,6 +100,9 @@ default_ladder?, auto_encode?, public_playback?}`), `GET/PATCH/DELETE /api/v1/ac
 /api/v1/account/buckets/{id}/sign {path, expires_secs?}`, `GET /api/v1/account/encodings` (the user's VOD items),
 `GET /api/v1/account/events` (SSE: `vod` events of the user's encodings + heartbeat). Validation: 400 with
 field messages; names are slugs; a key's `permissions[].bucket` must belong to the same user.
+As built (8A): bucket and user `{id}` accept the name too (`permissions[].bucket` names are stored as ids);
+a storage-only key needs ≥ 1 permission; added `GET/PATCH /api/v1/account/encodings/{id}` (title,
+description, visibility); `max_buckets` reached → 409.
 
 ## 5. Encoding & playback
 
@@ -110,6 +117,9 @@ field messages; names are slugs; a key's `permissions[].bucket` must belong to t
   segment requests work without query; the player (embed/watch) propagates the query to all requests anyway
   (hls.js `xhrSetup` re-opening with the query; dash.js request interceptor). 401 without/expired token.
   Rotating the signing key invalidates all tokens. Public items ignore tokens.
+  As built (8A): the HMAC key is the `signing_key` text (64 hex chars); playlists and MPD of private items are
+  rewritten with the token (native HLS works without player help); the access data is cached 5 s per node, so a
+  rotation or visibility change made on another cluster node applies within 5 s; admin-library items stay public.
 
 ## 6. Dashboard
 

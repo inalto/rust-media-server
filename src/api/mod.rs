@@ -2,14 +2,17 @@
 //! auth endpoints and the unauthenticated public player API. Also the JSON view types
 //! (`BroadcastView`, `PlaybackUrls`, `EmbedInfo`, ...) shared by the handlers.
 
+pub mod account;
 pub mod auth;
 pub mod broadcasts;
 pub mod events;
 pub mod metrics;
+pub mod principal;
 pub mod public;
 pub mod recordings;
 pub mod settings;
 pub mod system;
+pub mod users;
 pub mod vod;
 pub mod waiting;
 
@@ -28,7 +31,9 @@ use crate::error::ApiError;
 use crate::metrics::ViewerCounts;
 use crate::state::AppState;
 
-/// Full `/api/v1` router. Needs the state to build the auth middleware.
+/// Full `/api/v1` router. Needs the state to build the auth middlewares: the admin API
+/// (admin token only), the account API (any principal, `account` scope checked by the
+/// handlers), the auth endpoints and the public player API.
 pub fn router(state: &AppState) -> Router<AppState> {
     let admin = Router::new()
         .merge(broadcasts::routes())
@@ -39,14 +44,22 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(system::routes())
         .merge(events::routes())
         .merge(vod::routes(state))
+        .merge(users::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            auth::require_admin,
+            principal::require_admin,
         ));
+    let account = account::routes().route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        principal::require_principal,
+    ));
     let public = public::routes()
         .merge(vod::public_routes())
         .layer(CorsLayer::permissive());
-    Router::new().nest("/api/v1", admin.merge(auth::routes()).merge(public))
+    Router::new().nest(
+        "/api/v1",
+        admin.merge(account).merge(auth::routes()).merge(public),
+    )
 }
 
 /// JSON body extractor whose rejections are rendered as `{"error": ...}`.

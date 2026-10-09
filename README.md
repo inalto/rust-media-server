@@ -87,6 +87,8 @@ Chiavi principali:
 | `vod.keep_source` | `true` | conserva il file originale (serve per ricodificare e per scaricarlo) |
 | `vod.ladders` | `standard`, `mobile`, `single` | elenco delle ladder `[[vod.ladders]]`: vedi [Video on demand](#video-on-demand) |
 | `cluster.enabled` | `false` | modalità cluster: vedi [Modalità cluster](#modalità-cluster) |
+| `storage.max_object_mb` | `20480` | dimensione massima (MB) di un file caricato con l'API di storage dei bucket (`PUT /storage/<bucket>/...`, oltre: `413`) |
+| `storage.root` | vuoto | cartella dei file dei bucket (`<root>/<id bucket>/<percorso>`); vuoto = `data/buckets`. In modalità cluster deve essere condivisa tra i nodi |
 
 **Lingua dell'interfaccia.** Dashboard e player sono in italiano (predefinito) o in inglese: si sceglie
 nella dashboard in *Impostazioni → Lingua e tema* (oppure `PATCH /api/v1/settings {"ui_language":"en"}`), vale
@@ -333,6 +335,7 @@ src/recorder/      registrazione FLV → MP4 src/metrics/    tracker spettatori,
 src/api/           REST + SSE (axum)       src/web/        dashboard e player (statici incorporati)
 src/vod/           video on demand: probe, ladder, ffmpeg in un passaggio, playlist HLS/MPD, job, inbox, playback
 src/db/            SQLite (rusqlite) o PostgreSQL (sqlx)    src/cluster/  nodi, proprietà stream, NOTIFY, relay, /internal
+src/storage/       utenti e bucket: API di storage /storage/<bucket>/..., percorsi, URL firmati (docs/ACCOUNTS.md)
 docs/              architettura, protocolli, API, cluster
 ```
 

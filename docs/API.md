@@ -2,10 +2,11 @@
 
 Reference for every HTTP surface of rust-media-server (`rms`): the admin REST API, the Server-Sent
 Events streams, the public player API, the playback endpoints (HTTP-FLV, WS-FLV, LL-HLS, LL-DASH,
-WebRTC via WHEP) and the HTML pages. It is derived from the code (`src/api/*.rs`, `src/egress/*.rs`,
-`src/packager/*.rs`, `src/webrtc/*.rs`, `src/web/mod.rs`, `src/main.rs`); where it and
-[ARCHITECTURE.md](ARCHITECTURE.md) §8 differ, this file describes the behaviour of the code (see also
-ARCHITECTURE.md §13, §14, §16, §17, §18 and §19).
+WebRTC via WHEP), the HTML pages and the users' accounts, API keys and storage API (§9). It is derived
+from the code (`src/api/*.rs`, `src/storage/*.rs`, `src/egress/*.rs`, `src/packager/*.rs`,
+`src/webrtc/*.rs`, `src/web/mod.rs`, `src/main.rs`); where it and [ARCHITECTURE.md](ARCHITECTURE.md) §8
+differ, this file describes the behaviour of the code (see also ARCHITECTURE.md §13, §14, §16, §17, §18,
+§19 and §22, and [ACCOUNTS.md](ACCOUNTS.md)).
 
 Conventions used below:
 
@@ -30,6 +31,9 @@ Conventions used below:
 6. [Playback endpoints](#6-playback-endpoints)
 7. [Pages](#7-pages)
 8. [curl cookbook](#8-curl-cookbook)
+9. [Accounts, API keys and the storage API](#9-accounts-api-keys-and-the-storage-api): [Principals](#91-principals-and-api-keys) -
+   [Storage API](#92-storage-api) - [Users (admin)](#93-users-admin) - [Account](#94-account) -
+   [Signed playback URLs](#95-signed-playback-urls) - [Data types](#96-data-types) - [curl](#97-curl-examples)
 
 ---
 
@@ -49,18 +53,23 @@ The admin token is resolved once at startup, in this order:
 In cluster mode (`cluster.enabled = true`) only step 1 applies: the token must be configured and
 identical on every node (startup fails otherwise; the per-node file is neither read nor generated).
 
-There is a single shared token (no users, no expiry). It is compared in constant time.
+The admin token is the superuser (no expiry). It is compared in constant time. Users (phase 8A)
+authenticate with **API keys** (`rms_` + 40 hex characters, [§9.1](#91-principals-and-api-keys)): they
+can use the account and storage APIs, never the admin API.
 
-### Bearer header or cookie
+### Bearer header, AccessKey header or cookie
 
-An admin endpoint accepts either:
+Every authenticated request carries one credential, read in this order:
 
-- `Authorization: Bearer <token>` (the scheme is matched as `Bearer ` or `bearer `), or
-- the cookie `rms_token=<token>` set by `POST /api/v1/auth/login`.
+1. `Authorization: Bearer <admin token | API key>` (the scheme is matched as `Bearer ` or `bearer `);
+2. `AccessKey: <API key>` (bunny.net-style header);
+3. the cookie `rms_token=<admin token>` set by `POST /api/v1/auth/login`, else the cookie
+   `rms_key=<API key>` set by a login with a key.
 
 If a `Bearer` header is present it is the only credential considered: a wrong bearer token is a 401
-even when a valid cookie is also sent. The cookie *is* the token (it is not a separate session id).
-Browsers cannot set headers on `EventSource`, so the SSE streams are used with the cookie.
+even when a valid cookie is also sent. The cookie *is* the token or key (it is not a separate session
+id). Browsers cannot set headers on `EventSource`, so the SSE streams are used with the cookie. Admin
+endpoints need the admin token: a valid user key gets `403 this endpoint needs the admin token`.
 
 ### `POST /api/v1/auth/login`
 
@@ -68,20 +77,27 @@ Public. Sets the login cookie.
 
 | | |
 |---|---|
-| Body | `{"token": "<admin token>"}` (surrounding whitespace is trimmed) |
-| Success | `204 No Content` with `Set-Cookie: rms_token=<token>; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000` (30 days); `; Secure` is added when the request is HTTPS (`server.public_url` starts with `https://`, or `X-Forwarded-Proto: https`) |
-| `401` | wrong token (answered after a 400 ms delay to slow down brute force; logged as a warning) |
+| Body | `{"token": "<admin token or API key>"}` (surrounding whitespace is trimmed) |
+| Success (admin token) | `200 {"role": "admin"}` with `Set-Cookie: rms_token=<token>; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000` (30 days) and `rms_key=; …; Max-Age=0`; `; Secure` is added when the request is HTTPS (`server.public_url` starts with `https://`, or `X-Forwarded-Proto: https`) |
+| Success (API key) | `200 {"role": "user", "user": {"id", "username", "display_name"}, "scopes": [...], "key_id"}` with `Set-Cookie: rms_key=<key>; …` (until the key expires, at most 30 days) and `rms_token=; …; Max-Age=0`; the user's `last_login_at` is updated |
+| `401` | wrong token, unknown/revoked/expired key (answered after a 400 ms delay to slow down brute force; logged as a warning) |
+| `403` | a valid key of a suspended user |
 | `400` | the token is correct but contains characters that cannot go in a cookie (non-printable, `;`, `,`): `token contains characters unsuitable for a cookie; use the Authorization header`; or the body is not valid JSON / lacks `token` |
+
+Until phase 8A the success status was `204 No Content` (no body); clients that only test `res.ok`
+are unaffected.
 
 ### `POST /api/v1/auth/logout`
 
-Public, no body. Always `204 No Content` with `Set-Cookie: rms_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`.
+Public, no body. Always `204 No Content` with `Set-Cookie: rms_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+and the same for `rms_key`.
 
 ### `GET /api/v1/auth/check`
 
-Public in the sense that it never needs a valid token to be called: `204 No Content` when the request
-carries a valid token (header or cookie), `401` otherwise. The dashboard uses it to decide between the
-login view and the panel.
+Public in the sense that it never needs a valid token to be called: `200` with the same body as the
+login (`{"role": "admin"}` or `{"role": "user", "user", "scopes", "key_id"}`) when the request carries a
+valid credential (header or cookie), `401` otherwise, `403` for a suspended user. The dashboard uses it
+to decide between the login view, the admin panel and the user portal.
 
 ### Which routes need the token
 
@@ -93,14 +109,18 @@ login view and the panel.
 | `/`, `/embed/{name}`, `/player/{name}`, `/static/*`, `/waiting/*`, `/favicon.ico` | none |
 | `/healthz` | none ([4.5](#45-system)) |
 | `/internal/**` (cluster mode, separate listener `cluster.internal_bind`) | `Authorization: Bearer <cluster.internal_secret>` |
-| everything else under `/api/v1` (broadcasts, recordings incl. downloads, metrics, settings, system, events) | admin token, else `401` |
+| `/api/v1/account/**` | a user key with the `account` scope, or the admin token with `?user=<id or username>` ([9.4](#94-account)) |
+| `/storage/**` | an API key (permissions per path) or the admin token ([9.2](#92-storage-api)) |
+| `/vod/{id}/**` of a **private** video | a signed token (`?token=&expires=` or the `rms_play_<id>` cookie, [9.5](#95-signed-playback-urls)) |
+| everything else under `/api/v1` (broadcasts, recordings incl. downloads, metrics, settings, system, events, vod, users) | admin token, else `401` (`403` for a user key) |
 
 ### CORS
 
 `Access-Control-Allow-Origin: *` (permissive CORS, including preflight) is sent on the public player API,
-all playback endpoints (FLV, WS-FLV, HLS, DASH, WHEP) and the pages (`/`, `/embed`, `/player`, `/static`,
-`/waiting`). WHEP responses also carry `Access-Control-Expose-Headers: Location, Link, ETag` (see
-[6.5](#65-webrtc-whep)). The admin API and the auth endpoints send no CORS headers.
+all playback endpoints (FLV, WS-FLV, HLS, DASH, WHEP, VOD) and the pages (`/`, `/embed`, `/player`, `/static`,
+`/waiting`), and on the storage API `/storage/**` (keys travel in headers, never in cookies across
+sites). WHEP responses also carry `Access-Control-Expose-Headers: Location, Link, ETag` (see
+[6.5](#65-webrtc-whep)). The admin API, the account API and the auth endpoints send no CORS headers.
 
 ---
 
@@ -112,22 +132,29 @@ Every error produced by the API handlers is JSON:
 {"error": "broadcast not found"}
 ```
 
-with `Cache-Control: no-store` (and `WWW-Authenticate: Bearer` on 401). Internal errors (500) are logged
-in detail and returned as the generic `{"error":"internal server error"}`.
+with `Cache-Control: no-store` (and `WWW-Authenticate: Bearer` on the 401 of a missing/wrong
+credential). Validation errors of the account, user and storage APIs also name the offending field:
+
+```json
+{"error": "the username must be 2-32 characters among a-z, 0-9, - and _", "field": "username"}
+```
+
+Internal errors (500) are logged in detail and returned as the generic `{"error":"internal server error"}`.
 
 | Status | Meaning in this API |
 |---|---|
 | `400` | invalid input: malformed JSON or wrong `Content-Type`, invalid field/query value, malformed multipart, `name cannot be changed`, blocking-reload parameters out of range |
-| `401` | missing or wrong admin token |
-| `403` | playback of a protocol is disabled for that broadcast (`enable_flv` / `enable_hls` / `enable_dash` / `enable_webrtc` = false), or WebRTC is disabled on the server |
+| `401` | missing or wrong admin token / API key (unknown, revoked, expired); a private video without a valid signed token |
+| `403` | playback of a protocol is disabled for that broadcast (`enable_flv` / `enable_hls` / `enable_dash` / `enable_webrtc` = false), or WebRTC is disabled on the server; a user key on the admin API, a key without the `account` scope on the account API, a storage path outside the key's permissions, any key of a suspended user |
 | `404` | unknown or malformed broadcast name, unknown recording id or WHEP session, stream offline, unknown path (`{"error":"not found"}` from the global fallback), protocol disabled on the server |
 | `405` | `PATCH` of a WHEP session (trickle ICE is not supported; JSON body and `Allow` header) |
 | `409` | conflict: duplicate broadcast name, `broadcast is not live`, `broadcast is already being recorded`, `broadcast is not being recorded`, deleting a recording that is still recording/processing |
-| `413` | upload larger than `server.max_upload_mb` |
+| `413` | upload larger than `server.max_upload_mb`; storage API file larger than `storage.max_object_mb` |
 | `415` | unsupported media: waiting-video upload that is not an accepted video; HLS/DASH requested for a stream whose codecs cannot be packaged; WHEP offer without `Content-Type: application/sdp` or without H.264, or a stream whose video is not H.264 |
 | `422` | waiting-video upload that ffmpeg cannot decode/convert |
 | `500` | internal error |
 | `503` | not ready yet: playlist/MPD/part not available in time, the waiting-video conversion timed out; WHEP: WebRTC unavailable, too many sessions, stream starting |
+| `507` | storage API upload over the user's `quota_bytes` (files + encodings) |
 
 (`501` exists in the error type but no endpoint returns it any more.)
 
@@ -366,6 +393,10 @@ also accepts it in upper case).
 | `poster_url` | string \| null | `urls.poster` when the poster exists |
 | `source_available` | boolean | the original is still stored (download, re-transcode); false after a transcode with `vod.keep_source = false` |
 | `viewers_now` | integer | current HLS + DASH sessions of this video |
+| `user_id`, `bucket_id`, `object_id` | string \| null | owner, bucket and bucket object of an encoding of a bucket file ([§9](#9-accounts-api-keys-and-the-storage-api)); `null` for the admin library |
+| `object_path` | string \| null | path of the original in its bucket (`/videos/clip.mp4`; then `source_path` is the same and `origin` is `"storage"`) |
+| `visibility` | `"public"` \| `"private"` | private videos need a signed URL ([9.5](#95-signed-playback-urls)); only encodings of bucket files can be private |
+| `output_bytes` | integer | size of the encoding output (renditions + poster), counted in the owner's quota |
 
 ```json
 {
@@ -403,7 +434,13 @@ also accepts it in upper case).
   },
   "poster_url": "http://127.0.0.1:8080/vod/4fb48570-aaa4-45ed-8bd6-46f2e62f794d/poster.jpg",
   "source_available": true,
-  "viewers_now": 0
+  "viewers_now": 0,
+  "user_id": null,
+  "bucket_id": null,
+  "object_id": null,
+  "visibility": "public",
+  "output_bytes": 38012345,
+  "object_path": null
 }
 ```
 
@@ -1107,7 +1144,8 @@ data: {"status":"live"}
 
 #### `GET /api/v1/public/vod`
 
-The ready videos on demand, most recently published first (used by the `/vod` catalogue page):
+The ready **public** videos on demand (`visibility = public`, admin library and users' public encodings),
+most recently published first (used by the `/vod` catalogue page):
 
 ```json
 [{"id": "4fb48570-aaa4-45ed-8bd6-46f2e62f794d", "title": "Test 1080p", "description": "Mira di prova 30 s",
@@ -1140,6 +1178,10 @@ video not found` for unknown ids.
 ```
 
 `sources.*` are `null` until `status` is `ready`; `error` details are never exposed.
+
+A **private** video answers `401 {"error": "this video is private: a valid signed link (token, expires) is
+required"}` unless the request carries a valid `?token=<t>&expires=<unix>` ([9.5](#95-signed-playback-urls));
+with one, `sources.hls`, `sources.dash` and `poster_url` carry the same `token`/`expires` query.
 
 ---
 
@@ -1455,6 +1497,14 @@ Every request touches the viewer tracker under the name `vod:<id>` (protocol `hl
 expire after `metrics.session_timeout_secs`): that is `viewers_now`. A master/MPD request that opens a
 new session increments `plays`. VOD sessions are not written to the live metrics tables.
 
+**Private videos** ([9.5](#95-signed-playback-urls)): every route above needs a valid signed token, as
+the query `?token=<t>&expires=<unix>` or the cookie `rms_play_<id>=<t>:<expires>` (`HttpOnly`,
+`SameSite=Lax`, `Path=/vod/<id>/`, `Max-Age` until the expiry) that the first request accepted with
+the query sets; otherwise `401` (JSON, CORS). Their master/media playlists and MPD are rewritten so that
+every URI carries `&token=…&expires=…` (native HLS players and `ffprobe` follow the signed master
+without help) and every response is private: playlists/MPD `Cache-Control: private, no-store`, segments
+`private, max-age=31536000, immutable`, poster `private, max-age=60`. Public videos ignore tokens.
+
 ```text
 #EXTM3U
 #EXT-X-VERSION:7
@@ -1552,6 +1602,7 @@ which shows "Video non trovato" ("Video not found"). The page reads
 | `src` | `auto`, `hls`, `dash` | `auto` | `auto`/`hls`: native HLS on iOS/Safari, else hls.js, falling back to dash.js; `dash`: dash.js only |
 | `lang` | `it` / `en` | `ui_language` | as the live player |
 | `theme` | `system` / `light` / `dark` | `ui_theme` | as the live player |
+| `token`, `expires` | signed token | none | private videos ([9.5](#95-signed-playback-urls)): passed to the info request and appended by the player to the master/MPD, poster, playlist and segment requests (hls.js `xhrSetup` re-opens each XHR with the query, dash.js gets a request interceptor; native HLS relies on the rewritten playlists). Without a valid token the page shows "Video privato" / "Private video" |
 
 hls.js 1.7.3 runs with `startLevel: -1` and `capLevelToPlayerSize: true` (adaptive bitrate); dash.js
 5.2.1 with its default ABR. A quality button over the video lists *Auto* and every rendition
@@ -1560,7 +1611,8 @@ rate); choosing one pins it (`hls.currentLevel` / `setRepresentationForTypeById`
 off), *Auto* restores ABR. Native HLS has no quality API: the button is hidden. `window.rmsPlayer`
 exposes `kind: "vod"`, `status`, `source`, `engine` (`hls.js`, `native`, `dash.js`), `hls`, `dash`
 (the library instances), `levels`, `currentLevel`, `autoLevel`, `setLevel(i)` (`-1` = Auto), `info`,
-`language`, `theme`, `options`, `reload()`.
+`language`, `theme`, `options`, `signed` (the page has `token`/`expires`), `reload()`; `status` is
+`private` when the info answered 401.
 
 ### `/waiting/{path}`
 
@@ -1591,8 +1643,8 @@ H="Authorization: Bearer $TOKEN"
 J='Content-Type: application/json'
 
 # --- login with a cookie instead of the header
-curl -s -c jar.txt -H "$J" -d "{\"token\":\"$TOKEN\"}" $B/api/v1/auth/login -o /dev/null -w '%{http_code}\n'   # 204
-curl -s -b jar.txt $B/api/v1/auth/check -o /dev/null -w '%{http_code}\n'                                         # 204
+curl -s -c jar.txt -H "$J" -d "{\"token\":\"$TOKEN\"}" $B/api/v1/auth/login                                     # {"role":"admin"}
+curl -s -b jar.txt $B/api/v1/auth/check                                                                          # {"role":"admin"}
 curl -s -b jar.txt -X POST $B/api/v1/auth/logout -o /dev/null -w '%{http_code}\n'                               # 204
 
 # --- broadcasts
@@ -1682,4 +1734,278 @@ ffplay "$B/dash/evento-2026/manifest.mpd"
 curl -s -o /dev/null -w '%{http_code}\n' "$B/embed/evento-2026?autoplay=0&muted=1&controls=1&src=hls&latency=1"
 curl -s "$B/embed/evento-2026?lang=en" | grep -o '<html lang="[a-z]*"'   # <html lang="en"
 curl -s "$B/embed/evento-2026?theme=light" | grep -o 'data-theme="[a-z]*"'   # data-theme="light"
+```
+
+---
+
+## 9. Accounts, API keys and the storage API
+
+Phase 8A ([ACCOUNTS.md](ACCOUNTS.md), ARCHITECTURE.md §22), modelled on bunny.net Storage Zones + Stream:
+every **user** owns **buckets** (directory trees of files kept as originals) and **API keys** with
+path-scoped permissions; files are uploaded with a plain HTTP storage API and video files are **encoded**
+by the VOD pipeline ([4.7](#47-video-on-demand)) into multi-bitrate HLS/DASH while the originals stay in the
+bucket; private encodings are played with **signed URLs**. The admin token stays the superuser: it manages
+users ([9.3](#93-users-admin)) and may act as any user on the account API (`?user=`).
+
+Files live under `<storage.root>/<bucket id>/<path>` (default `data/buckets`; never under the bucket
+name, so renames are free). Configuration: `storage.max_object_mb` (default 20480) and `storage.root`.
+
+### 9.1 Principals and API keys
+
+A key is `rms_` + 40 lowercase hex characters (160 random bits). It is returned **once**, by the request
+that creates it; the server stores its SHA-256 and the first 12 characters (`key_prefix`, e.g.
+`rms_96202e94`) for lists. Send it as `Authorization: Bearer <key>`, `AccessKey: <key>` or (dashboard)
+the `rms_key` cookie set by [`POST /api/v1/auth/login`](#post-apiv1authlogin).
+
+| Scope | Grants |
+|---|---|
+| `account` | the account API ([9.4](#94-account)): keys, buckets, encodings, signing; **`admin` access to every bucket of the user** on the storage API |
+| `storage` | the storage API ([9.2](#92-storage-api)) within the key's `permissions` |
+
+`permissions` is a list of `{"bucket": "<bucket id> | *", "prefix": "/videos/", "access": "read | write |
+admin"}` (`*` = every bucket of the user; `prefix` defaults to `/` = the whole bucket; on input a bucket
+**name** is accepted and stored as its id; at most 100 entries). Access levels are ordered
+`read < write < admin`:
+
+| Level | Allows |
+|---|---|
+| `read` | list directories, download files, `HEAD`, `?info=1`, `?action=sign` |
+| `write` | + upload/overwrite files, create directories, delete files, `?action=encode` |
+| `admin` | + delete directories recursively |
+
+An entry applies when its bucket is `*` or the bucket's id and the **access path** starts with its
+prefix (plain string prefix): the access path is the file path (`/videos/a.mp4`) or, for a directory,
+the path with its trailing slash (`/videos/`; the root is `/`). The effective level is the highest of the
+matching entries. So `/videos/` covers `GET /storage/b/videos/` and everything below, but not the root
+listing nor `/videos-old.txt`; `/vid` would cover both `/videos/…` and `/vid.mp4`.
+
+Failures: no credential, unknown, **revoked** or **expired** key → `401`; any key of a **suspended**
+user → `403 the user is suspended`; a user key on the admin API → `403`; a key without the `account`
+scope on the account API → `403`; a path outside the permissions → `403 access denied: this key needs
+write access to /other/x.txt`. `last_used_at` is updated at most once a minute.
+
+### 9.2 Storage API
+
+`/storage/{bucket}/{path}` with a key or the admin token; CORS permissive (keys travel in headers);
+`Cache-Control: no-store` on JSON responses, `private, max-age=0` on file bodies.
+
+| Method & path | Needs | Response |
+|---|---|---|
+| `GET /storage/{b}/` · `GET /storage/{b}/{dir}/` | read on the directory | `200 [ObjectView]`: directories first, then by name; a missing directory lists `[]`. `GET /storage/{b}/{dir}` (no slash) of an existing directory lists it too |
+| `GET /storage/{b}/{file}` | read | the original: `Range` (206), `ETag: "<sha256>"` + `If-None-Match` (304), `Last-Modified`, `Content-Type` of the object; `?download=1` adds `Content-Disposition: attachment` (RFC 5987 UTF-8 name) |
+| `GET /storage/{b}/{file}?info=1[&expires_secs=3600]` | read | `200 ObjectInfo`: the object, its storage URLs and, when the encoding is private, signed playback URLs |
+| `HEAD /storage/{b}/{file}` | read | the headers of `GET` without the body |
+| `PUT /storage/{b}/{path}/{file}` | write | the raw body is the file. `201 ObjectView` (with `encoding` when queued) |
+| `PUT /storage/{b}/{dir}/` | write | creates the directory and its parents (idempotent): `201 ObjectView` |
+| `DELETE /storage/{b}/{file}` | write | `204`: the file, its index row and its encoding (job cancelled, renditions removed) |
+| `DELETE /storage/{b}/{dir}/` | **admin** | `204`: the directory, everything below it and their encodings. The root cannot be deleted (`400`: delete the bucket) |
+| `POST /storage/{b}/{file}?action=encode` body `{"ladder"?, "visibility"?}` (optional) | write | (re)queues the encoding: `202 ObjectView` with `encoding` (`status: "queued"`); a running job is cancelled, the old output removed |
+| `POST /storage/{b}/{file}?action=sign` body `{"expires_secs"?}` (optional, default 3600, max 1 year) | read | `200 SignedUrls`; `409` when the file has no encoding |
+
+**Upload** (`PUT` of a file): the body is streamed to `data/upload-tmp/` (never held in memory) while its
+SHA-256 is computed, then renamed into place (parent directories created; overwrite allowed, the object
+keeps its id). Headers:
+
+| Header | Effect |
+|---|---|
+| `Content-Length` | when larger than `storage.max_object_mb` MiB → `413` before the body is read; over the quota → `507` (without it the limits apply while streaming) |
+| `Checksum: <sha256 hex>` | verified after the upload: mismatch → `400 {"error": "checksum mismatch: the SHA-256 of the body is …", "field": "Checksum"}`, nothing stored; not 64 hex characters → `400` |
+| `X-Rms-Encode: <ladder>` | encode with that ladder (unknown → `400`, field `X-Rms-Encode`; `503` when `vod.enabled = false`) |
+| `X-Rms-Encode: none` | no encoding; an existing encoding of the overwritten file is deleted |
+| *(no `X-Rms-Encode`)* | encode when the bucket has `auto_encode` and the name has a video extension (`mp4`, `mov`, `m4v`, `mkv`, `webm`, `avi`, `mts`, `m2ts`, `ts`, `mxf`, `flv`, `mpg`, `mpeg`, `wmv`); an already encoded file is always re-encoded when overwritten |
+| `X-Rms-Visibility: public \| private` | visibility of the encoding (default: the existing encoding's, else the bucket's `public_playback`) |
+
+The ladder of a new encoding is the header's, else the bucket's `default_ladder`, else the user's, else
+`vod.default_ladder`. The encoding references the original **in place** (`source_path` = object path, no
+copy; `vod.keep_source` does not apply), its title is the file name. `Content-Type` of the stored object
+comes from the file name (`mime_guess`), `application/octet-stream` when unknown.
+
+**Quota**: `users.quota_bytes` (0 = unlimited) limits originals + encoding outputs (`usage.bytes_used`);
+an upload is refused with `507 storage quota exceeded` when `bytes_used − size of the overwritten file +
+body size > quota_bytes`. Encoding outputs are counted when they are produced (an encoding may take a
+user over the quota; the next upload is then refused).
+
+**Paths**: each segment is percent-decoded (strictly: `%ZZ` → `400`; `+` stays `+`), must be UTF-8 and is
+normalized to NFC (`e%CC%81.mp4` and `%C3%A9.mp4` are the same file). Rejected with `400 {"field":
+"path"}`: empty segments (`a//b`), `.`/`..` (also encoded), control characters, `\` and an encoded `/`,
+names starting with `.rms` (reserved), segments over 255 bytes, paths over 1024 bytes. A trailing `/`
+names a directory. `PUT` of a file below a path that is a file, or of a file where a directory exists (and
+vice versa) → `409`.
+
+Errors: `404 bucket not found` (unknown or malformed name), `404 file not found`, `403` (permissions),
+`409` (file/directory conflicts, `?action=sign` without an encoding), `413`, `507`.
+
+### 9.3 Users (admin)
+
+Admin token only. `{id}` is a user id or username.
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /api/v1/users` | | `200 [UserView]` by username |
+| `POST /api/v1/users` | `{username, display_name?, email?, status?, quota_bytes?, max_buckets?, default_ladder?}` | `201 UserView`; `400 {field}` (username slug `[a-z0-9_-]{2,32}`, email, status `active`/`suspended`, max_buckets ≤ 10000, ladder), `409` username taken |
+| `GET /api/v1/users/{id}` | | `200 UserView` |
+| `PATCH /api/v1/users/{id}` | any field of `POST` (`email`/`default_ladder`: `null` clears) | `200 UserView` |
+| `DELETE /api/v1/users/{id}[?force=1]` | | `204`; `409` when the user owns buckets unless `force`, which deletes buckets, files, encodings and keys |
+| `GET /api/v1/users/{id}/keys` | | `200 [KeyView]` newest first (revoked ones included) |
+| `POST /api/v1/users/{id}/keys` | as [`POST /account/keys`](#94-account) | `201 CreatedKey` |
+| `PATCH /api/v1/users/{id}/keys/{kid}` | `{name?, scopes?, permissions?, expires_at?}` | `200 KeyView` |
+| `DELETE /api/v1/users/{id}/keys/{kid}` | | `204` (revoked) |
+| `GET /api/v1/users/{id}/buckets` | | `200 [BucketView]` |
+| `POST /api/v1/users/{id}/buckets` | as [`POST /account/buckets`](#94-account) | `201 BucketView` |
+| `GET /api/v1/users/{id}/usage` | | `200 {user_id, quota_bytes, max_buckets, usage: Usage, buckets: [{id, name, bytes_used, objects_count}]}` |
+| `GET /api/v1/users/{id}/encodings` | | `200 [VodView]` |
+| `POST /api/v1/users/{id}/recount` | | `200 {report: {buckets, files_checked, sizes_fixed, missing_files, encodings_measured}, usage: Usage}`: re-measures the files (fixing the indexed sizes) and the encoding outputs on disk, then recomputes the counters |
+
+The admin may also call every `/api/v1/account/...` route with `?user=<id or username>`; without it the
+account routes answer `400 {"field": "user"}`.
+
+### 9.4 Account
+
+A key with the `account` scope (or the admin with `?user=`). `{id}` of a bucket is its id or name.
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /api/v1/account` | | `200 AccountView` |
+| `GET /api/v1/account/keys` | | `200 [KeyView]` |
+| `POST /api/v1/account/keys` | `{name, scopes, permissions?, expires_at?}` (`scopes` ⊆ `account`, `storage`; a storage-only key needs ≥ 1 permission; `expires_at` RFC 3339 in the future) | `201 CreatedKey` (the `key` is shown only here) |
+| `PATCH /api/v1/account/keys/{kid}` | `{name?, scopes?, permissions?, expires_at?}` (`expires_at: null` = never) | `200 KeyView`; `409` revoked |
+| `DELETE /api/v1/account/keys/{kid}` | | `204` revoked (a key may revoke itself) |
+| `GET /api/v1/account/buckets` | | `200 [BucketView]` |
+| `POST /api/v1/account/buckets` | `{name, description?, default_ladder?, auto_encode?, public_playback?}` (`name`: global slug `[a-z0-9_-]{2,63}`) | `201 BucketView`; `409` name taken or `max_buckets` reached |
+| `GET /api/v1/account/buckets/{id}` | | `200 BucketView` |
+| `PATCH /api/v1/account/buckets/{id}` | `{name?, description?, default_ladder?, auto_encode?, public_playback?}` | `200 BucketView` (a rename changes the storage URLs only) |
+| `DELETE /api/v1/account/buckets/{id}[?force=1]` | | `204`; `409` when not empty unless `force` (files and encodings deleted) |
+| `POST /api/v1/account/buckets/{id}/rotate-signing-key` | | `200 BucketView` with the new `signing_key`: every signed URL of the bucket stops working |
+| `POST /api/v1/account/buckets/{id}/sign` | `{path, expires_secs?}` | `200 SignedUrls`; `404` file, `409` no encoding |
+| `GET /api/v1/account/encodings` | | `200 [VodView]` of the user, newest first |
+| `GET /api/v1/account/encodings/{vod_id}` | | `200 VodView` |
+| `PATCH /api/v1/account/encodings/{vod_id}` | `{title?, description?, visibility?}` | `200 VodView` (visibility changes need no re-encode) |
+| `GET /api/v1/account/events` | | SSE: `vod` (a [VodView](#vodview)) when one of the user's encodings is created, progresses or changes, `vod_deleted` `{id}`, `heartbeat` `{ts}` on connect and every 15 s |
+
+### 9.5 Signed playback URLs
+
+Encodings with `visibility = private` are played only with a token signed by the bucket's `signing_key`:
+
+```
+token = base64url_nopad( HMAC-SHA256( key = signing_key (its 64 hex characters, as text),
+                                      message = "<vod_id>|<expires>" ) )
+```
+
+`expires` is a Unix time in seconds. The URLs carry `?token=<token>&expires=<expires>`; `?action=sign`,
+`?info=1` and `POST /account/buckets/{id}/sign` build them for you. A client can sign itself:
+
+```bash
+EXP=$(( $(date +%s) + 3600 ))
+TOKEN=$(printf '%s|%s' "$VOD_ID" "$EXP" | openssl dgst -sha256 -hmac "$SIGNING_KEY" -binary | base64 | tr '+/' '-_' | tr -d '=')
+echo "$B/embed/vod/$VOD_ID?token=$TOKEN&expires=$EXP"
+```
+
+Accepted on every `/vod/{id}/*` request (master, playlists, MPD, init and media segments, poster) and on
+`GET /api/v1/public/vod/{id}`; the first playback request accepted with the query sets the cookie
+`rms_play_<id>` (`Path=/vod/<id>/`) so later same-origin requests work without it; playlists and MPD are
+rewritten with the token ([6.6](#66-video-on-demand)); the players of `/embed/vod/{id}` and `/watch/{id}`
+forward `token`/`expires` of the page to every request ([7](#embedvodid-and-watchid)). Wrong, tampered or
+expired tokens → `401`. Rotating the signing key invalidates every token at once on the node that rotated
+it, within 5 s on the other nodes of a cluster. Public encodings ignore tokens. The admin library cannot be
+private (`PATCH /vod/{id} {"visibility":"private"}` → `400`): signing keys belong to buckets.
+
+### 9.6 Data types
+
+**UserView**: the user + `usage`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id`, `username`, `display_name` | string | `display_name` defaults to the username |
+| `email` | string \| null | |
+| `status` | `"active"` \| `"suspended"` | |
+| `quota_bytes` | integer | 0 = unlimited (files + encodings) |
+| `max_buckets` | integer | default 10 |
+| `default_ladder` | string \| null | |
+| `created_at`, `updated_at`, `last_login_at` | timestamp | `last_login_at`: last dashboard login with a key |
+| `usage` | Usage | `{bytes_used, originals_bytes, encodings_bytes, buckets, objects, encodings, keys}` (`objects` = files; `keys` = not revoked) |
+
+**KeyView** (`CreatedKey` = the same + `key`): `{id, user_id, name, key_prefix, scopes, permissions,
+expires_at, last_used_at, revoked_at, created_at, state}` with `state` = `active` | `expired` | `revoked`.
+
+**BucketView**: `{id, user_id, name, description, default_ladder, auto_encode, public_playback,
+signing_key, bytes_used, objects_count, created_at, updated_at, storage_url}` (`bytes_used` = files +
+encoding outputs, `objects_count` = files; `storage_url` = `<base>/storage/<name>/`).
+
+**ObjectView**: `{id, name, path, is_dir, size, content_type, sha256, created_at, updated_at, encoding?}`;
+`encoding` (only when the file has one) = `{vod_id, status, progress, ladder, visibility, renditions,
+error, duration_secs, output_bytes, hls_url, dash_url, poster_url, embed_url, watch_url, created_at,
+ready_at}` (unsigned URLs; `poster_url` null until the poster exists).
+
+**ObjectInfo** (`?info=1`): ObjectView + `bucket: {id, name}`, `url`, `download_url`, `signed`
+(SignedUrls when the encoding is private, else null).
+
+**SignedUrls**: `{hls, dash, poster, embed, watch, token, expires, expires_at}`.
+
+**AccountView**: `{user, usage: Usage + quota_bytes, limits: {quota_bytes, max_buckets, max_object_mb,
+ladders, default_ladder, vod_available}, key: {id, scopes} | null}` (`key` = the key of the request).
+
+```json
+{
+  "id": "ae6da904-d3e1-4b97-a4d3-e4a93d140cbf", "name": "clip.mp4", "path": "/videos/clip.mp4",
+  "is_dir": false, "size": 4358120, "content_type": "video/mp4",
+  "sha256": "07e6e65232db95c8618cdb8cbc46ae317d13c9e5e2107500b12d81eb787a5adc",
+  "created_at": "2026-10-09T21:07:42.315Z", "updated_at": "2026-10-09T21:07:42.315Z",
+  "encoding": {
+    "vod_id": "4b298743-1303-4fca-b518-ba82d17863de", "status": "ready", "progress": 100,
+    "ladder": "standard", "visibility": "private",
+    "renditions": [{"name": "720p", "width": 1280, "height": 720, "video_kbps": 2800, "audio_kbps": 128, "bandwidth": 2989925}, "..."],
+    "error": null, "duration_secs": 12.0, "output_bytes": 7860009,
+    "hls_url": "http://127.0.0.1:8080/vod/4b298743-…/hls/master.m3u8",
+    "dash_url": "http://127.0.0.1:8080/vod/4b298743-…/dash/manifest.mpd",
+    "poster_url": "http://127.0.0.1:8080/vod/4b298743-…/poster.jpg",
+    "embed_url": "http://127.0.0.1:8080/embed/vod/4b298743-…",
+    "watch_url": "http://127.0.0.1:8080/watch/4b298743-…",
+    "created_at": "2026-10-09T21:07:42.316Z", "ready_at": "2026-10-09T21:07:45.172Z"
+  }
+}
+```
+
+```json
+{"hls": "http://127.0.0.1:8080/vod/4b298743-…/hls/master.m3u8?token=d9paAvKBadcpU4RYvZCfUyZAidWy0r-ogn3Mb_qoPYY&expires=1791583687",
+ "dash": "…/dash/manifest.mpd?token=…&expires=1791583687", "poster": "…/poster.jpg?token=…&expires=1791583687",
+ "embed": "…/embed/vod/4b298743-…?token=…&expires=1791583687", "watch": "…/watch/4b298743-…?token=…&expires=1791583687",
+ "token": "d9paAvKBadcpU4RYvZCfUyZAidWy0r-ogn3Mb_qoPYY", "expires": 1791583687, "expires_at": "2026-10-09T22:08:07Z"}
+```
+
+### 9.7 curl examples
+
+```bash
+B=http://127.0.0.1:8080; H="Authorization: Bearer $TOKEN"; J='Content-Type: application/json'
+
+# --- admin: a user and its first key (with the account scope)
+curl -s -H "$H" -H "$J" -d '{"username":"alice","display_name":"Alice Rossi","quota_bytes":10737418240}' $B/api/v1/users
+KEY=$(curl -s -H "$H" -H "$J" -d '{"name":"dashboard","scopes":["account"]}' $B/api/v1/users/alice/keys | jq -r .key)
+curl -s -H "AccessKey: $KEY" $B/api/v1/auth/check                       # {"role":"user","user":{…},"scopes":["account"],…}
+
+# --- the user: a bucket and an upload-only key for /videos/
+curl -s -H "AccessKey: $KEY" -H "$J" -d '{"name":"alice-media","public_playback":false}' $B/api/v1/account/buckets
+UP=$(curl -s -H "AccessKey: $KEY" -H "$J" -d '{"name":"uploader","scopes":["storage"],
+  "permissions":[{"bucket":"alice-media","prefix":"/videos/","access":"write"}]}' $B/api/v1/account/keys | jq -r .key)
+
+# --- storage API
+curl -s -H "AccessKey: $UP" -H "Checksum: $(sha256sum clip.mp4 | cut -d' ' -f1)" \
+     -X PUT --data-binary @clip.mp4 $B/storage/alice-media/videos/clip.mp4 | jq .encoding.status   # "queued"
+curl -s -H "AccessKey: $UP" -T big.mov $B/storage/alice-media/videos/big.mov          # -T streams large files
+curl -s -H "AccessKey: $UP" -X PUT -H 'X-Rms-Encode: none' --data-binary @notes.txt $B/storage/alice-media/videos/notes.txt
+curl -s -H "AccessKey: $UP" $B/storage/alice-media/videos/ | jq '.[] | {name, size, status: .encoding.status}'
+curl -s -H "AccessKey: $UP" -o clip.mp4 $B/storage/alice-media/videos/clip.mp4       # the original (Range ok)
+curl -s -H "AccessKey: $UP" "$B/storage/alice-media/videos/clip.mp4?info=1" | jq .signed.embed
+curl -s -H "AccessKey: $UP" -X POST -H "$J" -d '{"ladder":"mobile","visibility":"public"}' \
+     "$B/storage/alice-media/videos/clip.mp4?action=encode"                            # 202, re-encoded
+curl -s -H "AccessKey: $UP" -X POST -H "$J" -d '{"expires_secs":86400}' \
+     "$B/storage/alice-media/videos/clip.mp4?action=sign" | jq -r .embed                 # signed player link
+curl -s -H "AccessKey: $UP" -X DELETE $B/storage/alice-media/videos/clip.mp4 -w '%{http_code}\n'   # 204 (+ encoding)
+curl -s -H "AccessKey: $KEY" -X DELETE $B/storage/alice-media/videos/ -w '%{http_code}\n'           # 204 (needs admin)
+
+# --- account
+curl -s -H "AccessKey: $KEY" $B/api/v1/account | jq '.usage'
+curl -s -H "AccessKey: $KEY" -X POST $B/api/v1/account/buckets/alice-media/rotate-signing-key | jq -r .signing_key
+curl -N -H "AccessKey: $KEY" $B/api/v1/account/events                                # vod / vod_deleted / heartbeat
+curl -s -H "$H" "$B/api/v1/account/buckets?user=alice"                              # the admin, as alice
+curl -s -H "$H" -X POST $B/api/v1/users/alice/recount | jq .report
 ```
