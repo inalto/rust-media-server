@@ -98,6 +98,10 @@ renditions = [
 [log]
 level = "info"             # RUST_LOG overrides
 
+[storage]                  # users' buckets and the storage API /storage/<bucket>/<path> (docs/ACCOUNTS.md)
+max_object_mb = 20480      # largest file accepted by PUT /storage/... (MiB); above: 413
+root = ""                  # bucket files: <root>/<bucket id>/<path>; empty = <data_dir>/buckets (shared volume in cluster mode)
+
 [cluster]                  # multi-instance mode (docs/CLUSTER.md): PostgreSQL instead of SQLite, relays between nodes
 enabled = false            # false = single node (SQLite, nothing below is used)
 node_id = ""               # unique and stable per node; empty = host name (RMS_CLUSTER_NODE_ID)

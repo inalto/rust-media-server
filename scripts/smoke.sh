@@ -45,10 +45,12 @@ not_contains() {
 echo "rms smoke test against $BASE (broadcast $NAME)"
 expect "auth check without token -> 401" 401 "$BASE/api/v1/auth/check"
 contains "401 body is JSON error" '"error"'
-expect "auth check with bearer -> 204" 204 "${AUTH[@]}" "$BASE/api/v1/auth/check"
+expect "auth check with bearer -> 200" 200 "${AUTH[@]}" "$BASE/api/v1/auth/check"
+contains "auth check says admin" '"role":"admin"'
 expect "login with wrong token -> 401" 401 -H 'Content-Type: application/json' -d '{"token":"nope"}' "$BASE/api/v1/auth/login"
-expect "login with token -> 204 (cookie)" 204 -c "$TMP.cookies" -H 'Content-Type: application/json' -d "{\"token\":\"$TOKEN\"}" "$BASE/api/v1/auth/login"
-expect "cookie auth -> 204" 204 -b "$TMP.cookies" "$BASE/api/v1/auth/check"
+expect "login with token -> 200 (cookie)" 200 -c "$TMP.cookies" -H 'Content-Type: application/json' -d "{\"token\":\"$TOKEN\"}" "$BASE/api/v1/auth/login"
+contains "login says admin" '"role":"admin"'
+expect "cookie auth -> 200" 200 -b "$TMP.cookies" "$BASE/api/v1/auth/check"
 rm -f "$TMP.cookies"
 expect "admin API without token -> 401" 401 "$BASE/api/v1/broadcasts"
 expect "GET /system" 200 "${AUTH[@]}" "$BASE/api/v1/system"
@@ -235,6 +237,102 @@ if [[ "$VOD_AVAILABLE" == 1 ]] && command -v ffmpeg >/dev/null; then
 else
   echo "  skip VOD upload (ffmpeg missing here or VOD unavailable on the server)"
 fi
+
+# Accounts, API keys, buckets and the storage API (phase 8A, docs/ACCOUNTS.md).
+# jget <key>: first "key":"value" of the last response body.
+jget() { grep -o "\"$1\":\"[^\"]*\"" "$TMP" | head -1 | cut -d'"' -f4; }
+J='Content-Type: application/json'
+SU="smoke-u$RANDOM$RANDOM"; SB="smoke-b$RANDOM$RANDOM"
+echo "accounts: user $SU, bucket $SB"
+expect "POST /users invalid username -> 400" 400 "${AUTH[@]}" -H "$J" -d '{"username":"Bad Name"}' "$BASE/api/v1/users"
+contains "validation error names the field" '"field":"username"'
+expect "POST /users -> 201" 201 "${AUTH[@]}" -H "$J" -d "{\"username\":\"$SU\",\"display_name\":\"Smoke User\"}" "$BASE/api/v1/users"
+USER_ID="$(jget id)"
+expect "POST /users duplicate -> 409" 409 "${AUTH[@]}" -H "$J" -d "{\"username\":\"$SU\"}" "$BASE/api/v1/users"
+expect "POST /users/{id}/keys (account) -> 201" 201 "${AUTH[@]}" -H "$J" -d '{"name":"smoke account","scopes":["account"]}' "$BASE/api/v1/users/$USER_ID/keys"
+ACCOUNT_KEY="$(jget key)"
+contains "account key shown once" '"key":"rms_'
+KA=(-H "AccessKey: $ACCOUNT_KEY")
+expect "auth check with the user key" 200 -H "Authorization: Bearer $ACCOUNT_KEY" "$BASE/api/v1/auth/check"
+contains "auth check says user" '"role":"user"'
+expect "user key on the admin API -> 403" 403 "${KA[@]}" "$BASE/api/v1/broadcasts"
+expect "GET /account" 200 "${KA[@]}" "$BASE/api/v1/account"
+contains "account has usage" '"usage":{'
+expect "admin on /account needs ?user= -> 400" 400 "${AUTH[@]}" "$BASE/api/v1/account"
+expect "admin on /account?user= -> 200" 200 "${AUTH[@]}" "$BASE/api/v1/account?user=$SU"
+expect "create bucket (private playback) -> 201" 201 "${KA[@]}" -H "$J" -d "{\"name\":\"$SB\",\"public_playback\":false}" "$BASE/api/v1/account/buckets"
+BUCKET_ID="$(jget id)"
+contains "bucket has a storage URL" "/storage/$SB/"
+expect "create storage key -> 201" 201 "${KA[@]}" -H "$J" -d "{\"name\":\"smoke storage\",\"scopes\":[\"storage\"],\"permissions\":[{\"bucket\":\"$BUCKET_ID\",\"prefix\":\"/videos/\",\"access\":\"write\"},{\"bucket\":\"$BUCKET_ID\",\"prefix\":\"/public/\",\"access\":\"read\"}]}" "$BASE/api/v1/account/keys"
+STORAGE_KEY="$(jget key)"; STORAGE_KID="$(jget id)"
+KS=(-H "AccessKey: $STORAGE_KEY")
+expect "storage key cannot manage the account -> 403" 403 "${KS[@]}" "$BASE/api/v1/account/keys"
+ACC_CLIP="$VOD_DIR/acc_test.mp4"
+if [[ "$VOD_AVAILABLE" == 1 ]] && command -v ffmpeg >/dev/null \
+   && ffmpeg -nostdin -v error -y -f lavfi -i testsrc2=size=320x180:rate=25 -f lavfi -i sine=frequency=330 \
+        -t 3 -c:v libx264 -pix_fmt yuv420p -c:a aac "$ACC_CLIP"; then
+  SUM="$(sha256sum "$ACC_CLIP" | cut -d' ' -f1)"
+  expect "PUT video with Checksum -> 201" 201 --max-time 60 "${KS[@]}" -H "Checksum: $SUM" -X PUT --data-binary "@$ACC_CLIP" "$BASE/storage/$SB/videos/test.mp4"
+  contains "upload has the sha256" "\"sha256\":\"$SUM\""
+  contains "encoding queued" '"status":"queued"'
+  VOD2="$(jget vod_id)"
+  STATUS=""
+  for _ in $(seq 1 45); do
+    STATUS="$(curl -s --max-time 5 "${KS[@]}" "$BASE/storage/$SB/videos/" | grep -o '"status":"[a-z]*"' | head -1 | cut -d'"' -f4)"
+    [[ "$STATUS" == ready || "$STATUS" == failed ]] && break
+    sleep 2
+  done
+  if [[ "$STATUS" == ready ]]; then PASS=$((PASS + 1)); echo "  ok   bucket video encoded (ready)"
+  else FAIL=$((FAIL + 1)); echo "  FAIL bucket video not ready after 90 s (status: ${STATUS:-?})"; fi
+  expect "listing shows the object" 200 "${KS[@]}" "$BASE/storage/$SB/videos/"
+  contains "listing has the file" '"path":"/videos/test.mp4"'
+  contains "listing has encoding.status=ready" '"encoding":{"vod_id":"[0-9a-f-]*","status":"ready"'
+  expect "download the original (Range)" 206 "${KS[@]}" -H 'Range: bytes=0-99' "$BASE/storage/$SB/videos/test.mp4"
+  expect "admin VOD list shows the bucket link" 200 "${AUTH[@]}" "$BASE/api/v1/vod/$VOD2"
+  contains "VOD item has object_path" '"object_path":"/videos/test.mp4"'
+  contains "VOD item is private" '"visibility":"private"'
+  expect "public catalogue hides it" 200 "$BASE/api/v1/public/vod"
+  not_contains "catalogue without the private video" "$VOD2"
+  expect "?action=sign -> 200" 200 "${KS[@]}" -X POST "$BASE/storage/$SB/videos/test.mp4?action=sign"
+  HLS_SIGNED="$(jget hls)"
+  contains "signed URL has a token" 'token='
+  expect "unsigned master -> 401" 401 "$BASE/vod/$VOD2/hls/master.m3u8"
+  expect "public info without token -> 401" 401 "$BASE/api/v1/public/vod/$VOD2"
+  expect "signed master -> 200" 200 "$HLS_SIGNED"
+  contains "signed master carries the token" 'm3u8?v=[0-9a-z]*&token='
+  MEDIA_URL="$(grep -v '^#' "$TMP" | grep -m1 'm3u8')"
+  expect "signed media playlist -> 200" 200 "$BASE/vod/$VOD2/hls/$MEDIA_URL"
+  SEG_URL="$(grep -v '^#' "$TMP" | grep -m1 'm4s')"
+  expect "signed segment -> 200" 200 "$BASE/vod/$VOD2/hls/$SEG_URL"
+  expect "segment without token -> 401" 401 "$BASE/vod/$VOD2/hls/${SEG_URL%%\?*}"
+  expect "tampered token -> 401" 401 "${HLS_SIGNED/token=/token=A}"
+  expect "embed page accepts the token" 200 "$BASE/embed/vod/$VOD2?${HLS_SIGNED#*\?}"
+  expect "rotate-signing-key -> 200" 200 "${KA[@]}" -X POST "$BASE/api/v1/account/buckets/$BUCKET_ID/rotate-signing-key"
+  expect "signed URL after rotation -> 401" 401 "$HLS_SIGNED"
+  expect "DELETE the file -> 204" 204 "${KS[@]}" -X DELETE "$BASE/storage/$SB/videos/test.mp4"
+  expect "its encoding is gone" 404 "${AUTH[@]}" "$BASE/api/v1/vod/$VOD2"
+else
+  echo "  skip bucket encoding (ffmpeg missing here or VOD unavailable on the server)"
+  expect "PUT a file with Checksum -> 201" 201 "${KS[@]}" -H "Checksum: $(printf 'hello' | sha256sum | cut -d' ' -f1)" -X PUT --data-binary 'hello' "$BASE/storage/$SB/videos/hello.txt"
+  expect "DELETE the file -> 204" 204 "${KS[@]}" -X DELETE "$BASE/storage/$SB/videos/hello.txt"
+fi
+expect "PUT outside the key's prefixes -> 403" 403 "${KS[@]}" -X PUT --data-binary 'x' "$BASE/storage/$SB/other/x.txt"
+expect "GET /public/ (read-only prefix) -> 200" 200 "${KS[@]}" "$BASE/storage/$SB/public/"
+if [[ "$(cat "$TMP")" == "[]" ]]; then PASS=$((PASS + 1)); echo "  ok   empty listing"; else FAIL=$((FAIL + 1)); echo "  FAIL listing not empty: $(head -c 200 "$TMP")"; fi
+expect "DELETE a directory with a write key -> 403" 403 "${KS[@]}" -X DELETE "$BASE/storage/$SB/videos/"
+expect "wrong Checksum -> 400" 400 "${KS[@]}" -H "Checksum: $(printf 'other' | sha256sum | cut -d' ' -f1)" -X PUT --data-binary 'abc' "$BASE/storage/$SB/videos/c.txt"
+contains "checksum error names the field" '"field":"Checksum"'
+expect "path with .. -> 400" 400 "${KS[@]}" -X PUT --data-binary 'x' "$BASE/storage/$SB/videos/%2e%2e/x.txt"
+expect "PATCH quota_bytes=10" 200 "${AUTH[@]}" -X PATCH -H "$J" -d '{"quota_bytes":10}' "$BASE/api/v1/users/$USER_ID"
+expect "PUT over quota -> 507" 507 "${KS[@]}" -X PUT --data-binary '0123456789abcdef' "$BASE/storage/$SB/videos/q.bin"
+expect "suspend the user" 200 "${AUTH[@]}" -X PATCH -H "$J" -d '{"status":"suspended"}' "$BASE/api/v1/users/$USER_ID"
+expect "suspended user's key -> 403" 403 "${KS[@]}" "$BASE/storage/$SB/videos/"
+expect "reactivate the user" 200 "${AUTH[@]}" -X PATCH -H "$J" -d '{"status":"active"}' "$BASE/api/v1/users/$USER_ID"
+expect "revoke the storage key -> 204" 204 "${KA[@]}" -X DELETE "$BASE/api/v1/account/keys/$STORAGE_KID"
+expect "revoked key -> 401" 401 "${KS[@]}" "$BASE/storage/$SB/videos/"
+expect "DELETE user owning buckets -> 409" 409 "${AUTH[@]}" -X DELETE "$BASE/api/v1/users/$USER_ID"
+expect "DELETE user ?force=1 -> 204" 204 "${AUTH[@]}" -X DELETE "$BASE/api/v1/users/$USER_ID?force=1"
+expect "deleted user's key -> 401" 401 "${KA[@]}" "$BASE/api/v1/account"
 
 echo "passed: $PASS  failed: $FAIL"
 [[ "$FAIL" -eq 0 ]]
