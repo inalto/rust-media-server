@@ -1,52 +1,165 @@
-/* rms embeddable player (/embed/{name} in iframes, /player/{name} full page). */
+/* rms embeddable player (/embed/{name} in iframes, /player/{name} full page).
+ *
+ * Dark and light themes as in style.css (ARCHITECTURE.md §18): <html data-theme> holds
+ * the choice (`?theme=` or the `ui_theme` setting); `:root` is the dark palette, the
+ * light one applies to [data-theme="light"] and, for `system`, under
+ * prefers-color-scheme: light (both light blocks identical, checked by a Rust test).
+ * The stage stays black (video letterboxing); overlays on the video (badges, buttons)
+ * carry their own background so they read on any frame. */
+
+/* Dark theme (default). */
+:root {
+  color-scheme: dark;
+  --frame-bg: #000;
+  --page-bg: #0b0e14;
+  --root-bg: #000;
+  --text: #fff;
+  --video-bg: #000;
+  --stage-waiting-bg: #000;
+  --video-waiting-bg: #000;
+  --stage-shadow: 0 12px 40px rgba(0, 0, 0, .5);
+  --waiting-bg: radial-gradient(120% 120% at 20% 10%, #1e3a8a 0%, #111827 45%, #05070c 100%);
+  --waiting-sweep: rgba(96, 165, 250, .10);
+  --waiting-title-shadow: 0 2px 8px rgba(0, 0, 0, .5);
+  --waiting-text: #cbd5e1;
+  --badge-bg: rgba(255, 255, 255, .12);
+  --dot-waiting: #f59e0b;
+  --dot-paused: #94a3b8;
+  --overlay-bg: rgba(0, 0, 0, .55);
+  --overlay-text: #fff;
+  --latency-bg: rgba(0, 0, 0, .6);
+  --live-bg: #dc2626;
+  --on-live: #fff;
+  --pill-bg: rgba(0, 0, 0, .7);
+  --pill-bg-hover: rgba(0, 0, 0, .85);
+  --focus: #8db4ff;
+  --accent: #2f6fe0;
+  --accent-hover: #3b7bec;
+  --on-accent: #fff;
+  --spinner-track: rgba(255, 255, 255, .25);
+  --spinner-head: #fff;
+}
+
+/* Light theme: explicit choice... */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --frame-bg: #000;
+  --page-bg: #f5f7fa;
+  --root-bg: #f5f7fa;
+  --text: #0f172a;
+  --video-bg: #000;
+  --stage-waiting-bg: var(--waiting-bg);
+  --video-waiting-bg: transparent;
+  --stage-shadow: 0 12px 40px rgba(15, 23, 42, .18);
+  --waiting-bg: radial-gradient(120% 120% at 20% 10%, #d6e2fb 0%, #eaf0f8 45%, #f8fafc 100%);
+  --waiting-sweep: rgba(37, 99, 235, .08);
+  --waiting-title-shadow: 0 1px 2px rgba(255, 255, 255, .6);
+  --waiting-text: #334155;
+  --badge-bg: rgba(15, 23, 42, .07);
+  --dot-waiting: #d97706;
+  --dot-paused: #64748b;
+  --overlay-bg: rgba(255, 255, 255, .88);
+  --overlay-text: #0f172a;
+  --latency-bg: rgba(255, 255, 255, .85);
+  --live-bg: #dc2626;
+  --on-live: #fff;
+  --pill-bg: rgba(255, 255, 255, .9);
+  --pill-bg-hover: #fff;
+  --focus: #2563eb;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --on-accent: #fff;
+  --spinner-track: rgba(255, 255, 255, .25);
+  --spinner-head: #fff;
+}
+
+/* ...or `system` with a light OS preference. Same values as above. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]):not([data-theme="light"]) {
+    color-scheme: light;
+    --frame-bg: #000;
+    --page-bg: #f5f7fa;
+    --root-bg: #f5f7fa;
+    --text: #0f172a;
+    --video-bg: #000;
+    --stage-waiting-bg: var(--waiting-bg);
+    --video-waiting-bg: transparent;
+    --stage-shadow: 0 12px 40px rgba(15, 23, 42, .18);
+    --waiting-bg: radial-gradient(120% 120% at 20% 10%, #d6e2fb 0%, #eaf0f8 45%, #f8fafc 100%);
+    --waiting-sweep: rgba(37, 99, 235, .08);
+    --waiting-title-shadow: 0 1px 2px rgba(255, 255, 255, .6);
+    --waiting-text: #334155;
+    --badge-bg: rgba(15, 23, 42, .07);
+    --dot-waiting: #d97706;
+    --dot-paused: #64748b;
+    --overlay-bg: rgba(255, 255, 255, .88);
+    --overlay-text: #0f172a;
+    --latency-bg: rgba(255, 255, 255, .85);
+    --live-bg: #dc2626;
+    --on-live: #fff;
+    --pill-bg: rgba(255, 255, 255, .9);
+    --pill-bg-hover: #fff;
+    --focus: #2563eb;
+    --accent: #2563eb;
+    --accent-hover: #1d4ed8;
+    --on-accent: #fff;
+    --spinner-track: rgba(255, 255, 255, .25);
+    --spinner-head: #fff;
+  }
+}
+
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+html, body { margin: 0; height: 100%; background: var(--frame-bg); color: var(--text); font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
 /* Embed: fill the iframe (the host sizes it, e.g. width:100%; aspect-ratio:16/9). */
 .page { height: 100%; }
 .player-header { display: none; }
-.stage { position: relative; width: 100%; height: 100%; min-height: 120px; background: #000; overflow: hidden; }
+.stage { position: relative; width: 100%; height: 100%; min-height: 120px; background: var(--video-bg); overflow: hidden; }
 
 /* Full-page player: title above a 16:9 stage. */
-body[data-mode="player"] { background: #0b0e14; height: auto; min-height: 100%; }
+html:has(body[data-mode="player"]) { background: var(--root-bg); }
+body[data-mode="player"] { background: var(--page-bg); height: auto; min-height: 100%; }
 body[data-mode="player"] .page { height: auto; max-width: 1280px; margin: 0 auto; padding: 16px; }
 body[data-mode="player"] .player-header { display: block; padding: 4px 0 14px; }
 body[data-mode="player"] .player-header h1 { margin: 0; font-size: clamp(18px, 3vw, 26px); font-weight: 700; overflow-wrap: anywhere; }
-body[data-mode="player"] .stage { height: auto; aspect-ratio: 16 / 9; border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,.5); }
+body[data-mode="player"] .stage { height: auto; aspect-ratio: 16 / 9; border-radius: 12px; box-shadow: var(--stage-shadow); }
 
-.stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+.stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: var(--video-bg); }
 #video { z-index: 0; }
+/* Waiting screen: no black under the (light) overlay, so rounded corners stay clean. */
+.stage[data-state="waiting"], .stage[data-state="notfound"] { background: var(--stage-waiting-bg); }
+.stage[data-state="waiting"] #video, .stage[data-state="notfound"] #video { background: var(--video-waiting-bg); }
 .waiting-video { z-index: 1; }
 .waiting { position: absolute; inset: 0; z-index: 2; display: flex; align-items: center; justify-content: center; text-align: center; padding: 6%;
-  background: radial-gradient(120% 120% at 20% 10%, #1e3a8a 0%, #111827 45%, #05070c 100%); }
-.waiting::before { content: ""; position: absolute; inset: -40%; background: conic-gradient(from 0deg, transparent 0 70%, rgba(96, 165, 250, .10) 80%, transparent 90%); animation: sweep 9s linear infinite; }
+  background: var(--waiting-bg); }
+.waiting::before { content: ""; position: absolute; inset: -40%; background: conic-gradient(from 0deg, transparent 0 70%, var(--waiting-sweep) 80%, transparent 90%); animation: sweep 9s linear infinite; }
 .waiting-card { position: relative; display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: 760px; }
-.waiting-title { margin: 6px 0 0; font-size: clamp(18px, 5vw, 38px); font-weight: 750; line-height: 1.15; overflow-wrap: anywhere; text-shadow: 0 2px 8px rgba(0,0,0,.5); }
-.waiting-text { margin: 0; font-size: clamp(14px, 3vw, 20px); color: #cbd5e1; overflow-wrap: anywhere; white-space: pre-line; }
+.waiting-title { margin: 6px 0 0; font-size: clamp(18px, 5vw, 38px); font-weight: 750; line-height: 1.15; overflow-wrap: anywhere; text-shadow: var(--waiting-title-shadow); }
+.waiting-text { margin: 0; font-size: clamp(14px, 3vw, 20px); color: var(--waiting-text); overflow-wrap: anywhere; white-space: pre-line; }
 /* Over a waiting video: only a discreet badge in the corner. */
 .waiting.over-video { background: none; align-items: flex-start; justify-content: flex-start; padding: 12px; pointer-events: none; }
 .waiting.over-video::before { display: none; }
 .waiting.over-video .waiting-title, .waiting.over-video .waiting-text { display: none; }
-.waiting.over-video .pulse-badge { background: rgba(0, 0, 0, .55); }
+.waiting.over-video .pulse-badge { background: var(--overlay-bg); color: var(--overlay-text); }
 
-.pulse-badge { display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 999px; background: rgba(255,255,255,.12); font-size: 13px; font-weight: 600; letter-spacing: .02em; backdrop-filter: blur(4px); }
-.pulse-badge .dot { width: 9px; height: 9px; border-radius: 50%; background: #f59e0b; animation: pulse 1.6s ease-in-out infinite; }
-.pulse-badge.paused .dot { background: #94a3b8; }
+.pulse-badge { display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 999px; background: var(--badge-bg); font-size: 13px; font-weight: 600; letter-spacing: .02em; backdrop-filter: blur(4px); }
+.pulse-badge .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dot-waiting); animation: pulse 1.6s ease-in-out infinite; }
+.pulse-badge.paused .dot { background: var(--dot-paused); }
 @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.7); } }
 @keyframes sweep { to { transform: rotate(360deg); } }
 
 .hud { position: absolute; top: 12px; left: 12px; z-index: 3; display: flex; gap: 6px; align-items: center; pointer-events: none; }
-.live-badge { padding: 3px 9px; border-radius: 4px; background: #dc2626; font-size: 12px; font-weight: 800; letter-spacing: .08em; }
-.latency { padding: 3px 8px; border-radius: 4px; background: rgba(0,0,0,.6); font-size: 12px; font-variant-numeric: tabular-nums; }
+.live-badge { padding: 3px 9px; border-radius: 4px; background: var(--live-bg); color: var(--on-live); font-size: 12px; font-weight: 800; letter-spacing: .08em; }
+.latency { padding: 3px 8px; border-radius: 4px; background: var(--latency-bg); color: var(--overlay-text); font-size: 12px; font-variant-numeric: tabular-nums; }
 .actions { position: absolute; top: 12px; right: 12px; z-index: 3; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
-.pill { display: inline-flex; align-items: center; gap: 6px; min-height: 34px; padding: 6px 12px; border: 0; border-radius: 999px; background: rgba(0,0,0,.7); color: #fff; font: 600 13px/1.2 inherit; font-family: inherit; cursor: pointer; backdrop-filter: blur(4px); }
-.pill:hover { background: rgba(0,0,0,.85); }
-.pill:focus-visible, .stage video:focus-visible { outline: 2px solid #8db4ff; outline-offset: 2px; }
-#unmute { background: #2f6fe0; }
-#unmute:hover { background: #3b7bec; }
-.spinner { position: absolute; left: 50%; top: 50%; z-index: 4; width: 42px; height: 42px; margin: -21px 0 0 -21px; border-radius: 50%; border: 3px solid rgba(255,255,255,.25); border-top-color: #fff; animation: spin .8s linear infinite; }
+.pill { display: inline-flex; align-items: center; gap: 6px; min-height: 34px; padding: 6px 12px; border: 0; border-radius: 999px; background: var(--pill-bg); color: var(--overlay-text); font: 600 13px/1.2 inherit; font-family: inherit; cursor: pointer; backdrop-filter: blur(4px); }
+.pill:hover { background: var(--pill-bg-hover); }
+.pill:focus-visible, .stage video:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+#unmute { background: var(--accent); color: var(--on-accent); }
+#unmute:hover { background: var(--accent-hover); }
+.spinner { position: absolute; left: 50%; top: 50%; z-index: 4; width: 42px; height: 42px; margin: -21px 0 0 -21px; border-radius: 50%; border: 3px solid var(--spinner-track); border-top-color: var(--spinner-head); animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 420px) {

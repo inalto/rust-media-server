@@ -1,15 +1,20 @@
 //! Pages and static assets (ARCHITECTURE.md §8.3).
 //!
 //! - `/` dashboard SPA (`static/index.html` + ES modules `app.js`, `core.js`,
-//!   `detail.js`, `metrics.js`, `mock.js`, `i18n.js` and `style.css`), Italian or English
-//!   UI (`ui_language` setting, ARCHITECTURE.md §17).
+//!   `detail.js`, `metrics.js`, `mock.js`, `i18n.js`, `theme.js` and `style.css`), Italian
+//!   or English UI (`ui_language` setting, ARCHITECTURE.md §17), dark or light theme
+//!   (`ui_theme`, §18).
 //! - `/embed/{name}` player page for iframes, `/player/{name}` full-page player
-//!   (same `embed.html`, `data-mode` differs; ES module `player.js` + `i18n.js`).
+//!   (same `embed.html`, `data-mode` differs; ES module `player.js` + `i18n.js` +
+//!   `theme.js`).
 //! - `/static/*` assets embedded in the binary with `include_str!`.
 //! - `/waiting/*` files from `data/waiting/` (waiting videos and posters).
 //!
-//! The pages get `<html lang>` from the `ui_language` setting (one small SQLite read per
-//! page); `?lang=it|en` on the player pages overrides it.
+//! The pages get `<html lang>` from the `ui_language` setting and `<html data-theme>` from
+//! `ui_theme` (one small SQLite read per page); `?lang=it|en` and
+//! `?theme=system|light|dark` on the player pages override them. An inline script in the
+//! `<head>` of both pages applies the per-browser override (dashboard, `localStorage`
+//! `rms.theme`) or `?theme=` before the first paint.
 
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -22,7 +27,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use crate::db::broadcasts::is_valid_name;
-use crate::db::settings::{self, UiLanguage};
+use crate::db::settings::{self, UiLanguage, UiTheme};
 use crate::state::AppState;
 
 /// Embedded static assets: (file name, content type, content).
@@ -61,6 +66,11 @@ const ASSETS: &[(&str, &str, &str)] = &[
         "i18n.js",
         "text/javascript; charset=utf-8",
         include_str!("static/i18n.js"),
+    ),
+    (
+        "theme.js",
+        "text/javascript; charset=utf-8",
+        include_str!("static/theme.js"),
     ),
     (
         "style.css",
@@ -119,32 +129,37 @@ fn html_response(body: String) -> Response {
     r
 }
 
-/// The language attribute every HTML template starts with.
-const HTML_LANG_TAG: &str = "<html lang=\"it\">";
+/// The `<html>` tag every HTML template starts with.
+const HTML_TAG: &str = "<html lang=\"it\" data-theme=\"system\">";
 
-/// `template` with `<html lang>` set to `lang`.
-fn with_lang(template: &str, lang: UiLanguage) -> String {
+/// `template` with `<html lang>` set to `lang` and `<html data-theme>` to `theme`.
+fn with_prefs(template: &str, lang: UiLanguage, theme: UiTheme) -> String {
     template.replacen(
-        HTML_LANG_TAG,
-        &format!("<html lang=\"{}\">", lang.as_str()),
+        HTML_TAG,
+        &format!(
+            "<html lang=\"{}\" data-theme=\"{}\">",
+            lang.as_str(),
+            theme.as_str()
+        ),
         1,
     )
 }
 
-/// UI language setting (`it` if it cannot be read).
-async fn ui_language(state: &AppState) -> UiLanguage {
-    match settings::ui_language(&state.db).await {
-        Ok(l) => l,
+/// UI language and default theme settings (defaults if they cannot be read).
+async fn ui_prefs(state: &AppState) -> (UiLanguage, UiTheme) {
+    match settings::ui_prefs(&state.db).await {
+        Ok(p) => p,
         Err(e) => {
-            tracing::warn!(error = %e, "cannot read the UI language setting");
-            UiLanguage::default()
+            tracing::warn!(error = %e, "cannot read the UI language/theme settings");
+            Default::default()
         }
     }
 }
 
 async fn index(State(state): State<AppState>) -> Response {
     let template = asset("index.html").map(|(_, b)| b).unwrap_or_default();
-    html_response(with_lang(template, ui_language(&state).await))
+    let (lang, theme) = ui_prefs(&state).await;
+    html_response(with_prefs(template, lang, theme))
 }
 
 /// Embedded assets change with the binary: `no-cache` + content-hash ETag, so
@@ -180,22 +195,26 @@ async fn static_asset(Path(path): Path<String>, headers: HeaderMap) -> Response 
 struct PlayerQuery {
     /// `it` | `en` (case-insensitive): overrides the `ui_language` setting.
     lang: Option<String>,
+    /// `system` | `light` | `dark` (case-insensitive): overrides the `ui_theme` setting.
+    theme: Option<String>,
 }
 
 async fn player_html(state: &AppState, name: &str, mode: &str, query: PlayerQuery) -> Response {
     if !is_valid_name(name) {
         return (StatusCode::NOT_FOUND, "broadcast not found").into_response();
     }
-    let lang = match query
+    let (setting_lang, setting_theme) = ui_prefs(state).await;
+    let lang = query
         .lang
         .and_then(|l| UiLanguage::parse(&l.trim().to_ascii_lowercase()))
-    {
-        Some(l) => l,
-        None => ui_language(state).await,
-    };
+        .unwrap_or(setting_lang);
+    let theme = query
+        .theme
+        .and_then(|t| UiTheme::parse(&t.trim().to_ascii_lowercase()))
+        .unwrap_or(setting_theme);
     let template = asset("embed.html").map(|(_, b)| b).unwrap_or_default();
     // `name` is a validated slug: safe to inline.
-    let body = with_lang(template, lang)
+    let body = with_prefs(template, lang, theme)
         .replace("data-mode=\"embed\"", &format!("data-mode=\"{mode}\""))
         .replace("{{NAME}}", name);
     html_response(body)
@@ -414,6 +433,326 @@ mod tests {
             .await
             .unwrap();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn pages_follow_the_ui_theme() {
+        let (state, dir) = test_state(false).await;
+        let attr = |body: &str, name: &str| {
+            // The tag itself, not the `<html lang>` mentioned in comments.
+            let tag = &body[body.find("<html lang=\"").unwrap()..];
+            let tag = &tag[..tag.find('>').unwrap()];
+            let key = format!(" {name}=\"");
+            let v = &tag[tag
+                .find(&key)
+                .unwrap_or_else(|| panic!("no {name} in {tag}"))
+                + key.len()..];
+            v[..v.find('"').unwrap()].to_string()
+        };
+        // Every template starts with the tag the server rewrites.
+        for page in ["index.html", "embed.html"] {
+            assert!(asset(page).unwrap().1.contains(HTML_TAG), "{page}");
+        }
+        let (st, body) = page(&state, "/").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(attr(&body, "data-theme"), "system");
+        assert_eq!(
+            attr(&page(&state, "/embed/show").await.1, "data-theme"),
+            "system"
+        );
+
+        settings::set(&state.db, settings::UI_THEME, "light")
+            .await
+            .unwrap();
+        let body = page(&state, "/").await.1;
+        assert_eq!(
+            (attr(&body, "lang"), attr(&body, "data-theme")),
+            ("it".into(), "light".into())
+        );
+        assert_eq!(
+            attr(&page(&state, "/player/show").await.1, "data-theme"),
+            "light"
+        );
+        // ?theme= overrides the setting (case-insensitive); invalid values are ignored;
+        // ?lang= is independent.
+        for (query, want) in [
+            ("theme=dark", "dark"),
+            ("theme=DARK", "dark"),
+            ("theme=%20System%20", "system"),
+            ("theme=blue", "light"),
+            ("theme=", "light"),
+            ("lang=en&theme=dark&autoplay=0", "dark"),
+        ] {
+            let (st, body) = page(&state, &format!("/embed/show?{query}")).await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(attr(&body, "data-theme"), want, "{query}");
+        }
+        let body = page(&state, "/player/show?lang=en&theme=dark").await.1;
+        assert_eq!(
+            (attr(&body, "lang"), attr(&body, "data-theme")),
+            ("en".into(), "dark".into())
+        );
+        // An invalid stored value means `system`.
+        settings::set(&state.db, settings::UI_THEME, "blue")
+            .await
+            .unwrap();
+        assert_eq!(attr(&page(&state, "/").await.1, "data-theme"), "system");
+        // Both pages support both schemes and apply the override before the first paint.
+        for (page_name, needle) in [
+            ("index.html", "localStorage.getItem('rms.theme')"),
+            ("embed.html", "get('theme')"),
+        ] {
+            let html = asset(page_name).unwrap().1;
+            assert!(
+                html.contains(r#"<meta name="color-scheme" content="light dark">"#),
+                "{page_name}"
+            );
+            let head = &html[..html.find("</head>").unwrap()];
+            let script = head.find(needle).expect("inline theme script in <head>");
+            assert!(
+                script < head.find("<link rel=\"stylesheet\"").unwrap(),
+                "{page_name}"
+            );
+        }
+        let (st, js) = page(&state, "/static/theme.js").await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(js.contains("export function initTheme("));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Stylesheets checked by [`css_colours_are_theme_tokens`].
+    const STYLESHEETS: &[(&str, &str)] = &[
+        ("style.css", include_str!("static/style.css")),
+        ("player.css", include_str!("static/player.css")),
+    ];
+
+    /// Colour literals allowed outside the theme token blocks: `(file, literal)`. Keep it
+    /// empty unless a colour truly must not change with the theme *and* cannot be a token
+    /// (document why here).
+    const COLOUR_EXCEPTIONS: &[(&str, &str)] = &[];
+
+    /// A style rule: enclosing at-rule preludes, selector, declarations.
+    struct CssRule {
+        at: Vec<String>,
+        selector: String,
+        decls: Vec<(String, String)>,
+    }
+
+    /// Minimal CSS parser (comments stripped, nested at-rules, no nested style rules).
+    fn css_rules(src: &str) -> Vec<CssRule> {
+        let mut text = String::new();
+        let mut rest = src;
+        while let Some(i) = rest.find("/*") {
+            text.push_str(&rest[..i]);
+            rest = &rest[i + 2..];
+            rest = &rest[rest.find("*/").expect("unterminated comment") + 2..];
+        }
+        text.push_str(rest);
+        let mut rules = Vec::new();
+        let mut at: Vec<String> = Vec::new();
+        let mut prelude = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '{' => {
+                    let p = prelude.trim().to_string();
+                    prelude.clear();
+                    if p.starts_with('@') {
+                        at.push(p);
+                        continue;
+                    }
+                    let mut body = String::new();
+                    for c in chars.by_ref() {
+                        if c == '}' {
+                            break;
+                        }
+                        assert_ne!(c, '{', "nested rule in {p}");
+                        body.push(c);
+                    }
+                    let decls = body
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|d| !d.is_empty())
+                        .map(|d| {
+                            let (k, v) = d
+                                .split_once(':')
+                                .unwrap_or_else(|| panic!("bad declaration {d}"));
+                            (
+                                k.trim().to_string(),
+                                v.split_whitespace().collect::<Vec<_>>().join(" "),
+                            )
+                        })
+                        .collect();
+                    rules.push(CssRule {
+                        at: at.clone(),
+                        selector: p,
+                        decls,
+                    });
+                }
+                '}' => {
+                    assert!(at.pop().is_some(), "unbalanced }}");
+                    prelude.clear();
+                }
+                ';' if prelude.trim_start().starts_with('@') => prelude.clear(),
+                _ => prelude.push(c),
+            }
+        }
+        assert!(at.is_empty(), "unclosed at-rule");
+        rules
+    }
+
+    /// Colour literals in a declaration value: hex, rgb[a](), hsl[a](), white/black.
+    fn colour_literals(value: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let lower = value.to_ascii_lowercase();
+        let b = lower.as_bytes();
+        for (i, _) in lower.match_indices('#') {
+            let n = b[i + 1..]
+                .iter()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .count();
+            let ident_follows = b
+                .get(i + 1 + n)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'-');
+            if matches!(n, 3 | 4 | 6 | 8) && !ident_follows {
+                out.push(lower[i..i + 1 + n].to_string());
+            }
+        }
+        for f in [
+            "rgb(", "rgba(", "hsl(", "hsla(", "hwb(", "lab(", "lch(", "oklab(", "oklch(", "color(",
+        ] {
+            for (i, _) in lower.match_indices(f) {
+                if i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'-') {
+                    out.push(f.to_string());
+                }
+            }
+        }
+        for word in lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+            if matches!(word, "white" | "black") {
+                out.push(word.to_string());
+            }
+        }
+        out
+    }
+
+    /// Theme token block: only `:root…` selectors (no descendants), only custom
+    /// properties and `color-scheme`.
+    fn is_token_block(r: &CssRule) -> bool {
+        r.selector
+            .split(',')
+            .map(str::trim)
+            .all(|s| s.starts_with(":root") && !s.contains(' '))
+            && r.decls
+                .iter()
+                .all(|(k, _)| k.starts_with("--") || k == "color-scheme")
+    }
+
+    #[test]
+    fn css_colours_are_theme_tokens() {
+        for (file, src) in STYLESHEETS {
+            let rules = css_rules(src);
+            assert!(
+                rules.len() > 20,
+                "{file}: only {} rules parsed",
+                rules.len()
+            );
+            // 1. No colour literal outside the token blocks.
+            let mut offending = Vec::new();
+            for r in rules.iter().filter(|r| !is_token_block(r)) {
+                for (k, v) in &r.decls {
+                    for lit in colour_literals(v) {
+                        if !COLOUR_EXCEPTIONS.contains(&(file, lit.as_str())) {
+                            offending.push(format!("{} {{ {k}: {v} }} ({lit})", r.selector));
+                        }
+                    }
+                }
+            }
+            assert!(
+                offending.is_empty(),
+                "{file}: colour literals outside the theme tokens:\n{}",
+                offending.join("\n")
+            );
+
+            // 2. Dark tokens on `:root`, a complete light palette twice (explicit choice and
+            //    `system` with a light OS preference), identical in both places.
+            let scheme =
+                |r: &&CssRule, v: &str| r.decls.iter().any(|(k, x)| k == "color-scheme" && x == v);
+            let tokens = |r: &CssRule| -> BTreeMap<String, String> {
+                r.decls
+                    .iter()
+                    .filter(|(k, _)| k.starts_with("--"))
+                    .cloned()
+                    .collect()
+            };
+            let dark: Vec<_> = rules.iter().filter(|r| scheme(r, "dark")).collect();
+            assert_eq!(dark.len(), 1, "{file}: one dark block");
+            assert!(
+                dark[0].selector == ":root" && dark[0].at.is_empty(),
+                "{file}: dark tokens on :root"
+            );
+            let explicit: Vec<_> = rules
+                .iter()
+                .filter(|r| scheme(r, "light") && r.at.is_empty())
+                .collect();
+            assert_eq!(explicit.len(), 1, "{file}: one explicit light block");
+            assert_eq!(
+                explicit[0].selector, r#":root[data-theme="light"]"#,
+                "{file}"
+            );
+            let system: Vec<_> = rules
+                .iter()
+                .filter(|r| scheme(r, "light") && !r.at.is_empty())
+                .collect();
+            assert_eq!(
+                system.len(),
+                1,
+                "{file}: one prefers-color-scheme light block"
+            );
+            assert_eq!(
+                system[0].at,
+                vec!["@media (prefers-color-scheme: light)".to_string()],
+                "{file}"
+            );
+            assert_eq!(
+                system[0].selector, r#":root:not([data-theme="dark"]):not([data-theme="light"])"#,
+                "{file}"
+            );
+            let (dark, light) = (tokens(dark[0]), tokens(explicit[0]));
+            assert_eq!(
+                light,
+                tokens(system[0]),
+                "{file}: the two light blocks differ"
+            );
+            assert_eq!(
+                dark.keys().collect::<Vec<_>>(),
+                light.keys().collect::<Vec<_>>(),
+                "{file}: dark and light define different tokens"
+            );
+            assert!(dark.len() > 20, "{file}: only {} tokens", dark.len());
+            // 3. Every token used is defined (in some :root block).
+            let defined: BTreeSet<String> = rules
+                .iter()
+                .filter(|r| is_token_block(r))
+                .flat_map(|r| r.decls.iter().map(|(k, _)| k.clone()))
+                .collect();
+            for r in &rules {
+                for (_, v) in &r.decls {
+                    for (i, _) in v.match_indices("var(--") {
+                        let name: String = v[i + 4..]
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                            .collect();
+                        assert!(defined.contains(&name), "{file}: undefined token {name}");
+                    }
+                }
+            }
+        }
+        // The checker itself finds literals.
+        assert_eq!(
+            colour_literals("0 0 0 3px rgba(1, 2, 3, .5), #fff solid white"),
+            ["#fff", "rgba(", "white"]
+        );
+        assert!(colour_literals("var(--accent) #app-x").is_empty());
     }
 
     #[tokio::test]

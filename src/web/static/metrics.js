@@ -7,19 +7,54 @@ import {
   fmtInt, fmtBytes, fmtDuration, fmtWhen, fmtDateTime, totalViewers,
 } from './core.js';
 import { t, formatDate } from './i18n.js';
+import { onThemeChange, themeColor } from './theme.js';
 
 const CHART_JS = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.1/chart.umd.min.js';
 
-// Categorical palette validated for the dark surface (fixed order, never cycled).
-// Labels are functions: resolved in the UI language when the section is built.
+// Categorical palette (fixed order, never cycled): CSS tokens `--series-*` of the theme
+// (style.css; ≥ 3:1 against both chart surfaces, the light theme darkens the green and
+// the amber). Labels are functions: resolved in the UI language when the section is built.
 const SERIES = [
-  { key: 'total', label: () => t('common.total'), color: '#3987e5' },
-  { key: 'flv', label: () => 'HTTP-FLV', color: '#d95926' },
-  { key: 'ws_flv', label: () => 'WS-FLV', color: '#199e70' },
-  { key: 'hls', label: () => 'LL-HLS', color: '#c98500' },
-  { key: 'dash', label: () => 'LL-DASH', color: '#d55181' },
-  { key: 'webrtc', label: () => 'WebRTC', color: '#008300' },
+  { key: 'total', label: () => t('common.total'), token: '--series-total' },
+  { key: 'flv', label: () => 'HTTP-FLV', token: '--series-flv' },
+  { key: 'ws_flv', label: () => 'WS-FLV', token: '--series-ws-flv' },
+  { key: 'hls', label: () => 'LL-HLS', token: '--series-hls' },
+  { key: 'dash', label: () => 'LL-DASH', token: '--series-dash' },
+  { key: 'webrtc', label: () => 'WebRTC', token: '--series-webrtc' },
 ];
+
+/** Chart colours of the current theme (re-read on every theme change). */
+function chartColors() {
+  return {
+    series: SERIES.map((s) => themeColor(s.token)),
+    grid: themeColor('--chart-grid'),
+    ink: themeColor('--text-2'),
+    tooltipBg: themeColor('--bg'),
+    tooltipBorder: themeColor('--border'),
+    tooltipText: themeColor('--text'),
+  };
+}
+
+/** Area fill of the total: its line colour (a `#rrggbb` token) at 18 % opacity. */
+const fillOf = (hex) => (/^#[0-9a-f]{6}$/i.test(hex) ? hex + '2e' : 'transparent');
+
+/** Apply the theme colours to an existing chart's datasets and options. */
+function paintChart(chart, c) {
+  chart.data.datasets.forEach((d, i) => {
+    d.borderColor = c.series[i];
+    d.backgroundColor = SERIES[i].key === 'total' ? fillOf(c.series[i]) : c.series[i];
+  });
+  const { x, y } = chart.options.scales;
+  x.ticks.color = c.ink;
+  x.grid.color = c.grid;
+  x.border.color = c.grid;
+  y.ticks.color = c.ink;
+  y.grid.color = c.grid;
+  y.title.color = c.ink;
+  Object.assign(chart.options.plugins.tooltip, {
+    backgroundColor: c.tooltipBg, borderColor: c.tooltipBorder, titleColor: c.tooltipText, bodyColor: c.tooltipText,
+  });
+}
 
 const RANGES = [
   { key: '1h', label: () => t('metrics.range1h'), secs: 3600 },
@@ -47,10 +82,6 @@ function saveVisibility(v) {
 function toLocalInput(d) {
   const p = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-
-function cssVar(name, fallback) {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
 }
 
 /**
@@ -103,7 +134,7 @@ export function metricsSection(name) {
   // --- series toggles (HTML legend, keyboard accessible)
   const toggles = SERIES.map((s, i) => {
     const btn = h('button', { type: 'button', class: 'legend-item', 'aria-pressed': String(!!visible[s.key]) },
-      h('span', { class: 'swatch', style: { background: s.color }, 'aria-hidden': 'true' }),
+      h('span', { class: 'swatch', style: { background: `var(${s.token})` }, 'aria-hidden': 'true' }),
       s.label());
     btn.addEventListener('click', () => {
       visible[s.key] = !visible[s.key];
@@ -260,11 +291,12 @@ export function metricsSection(name) {
       return;
     }
     if (destroyed) return;
-    const datasets = SERIES.map((s) => ({
+    const c = chartColors();
+    const datasets = SERIES.map((s, i) => ({
       label: s.label(),
       data: points.map((p) => ({ x: Date.parse(p.t), y: Number(p[s.key]) || 0 })),
-      borderColor: s.color,
-      backgroundColor: s.key === 'total' ? s.color + '2e' : s.color,
+      borderColor: c.series[i],
+      backgroundColor: s.key === 'total' ? fillOf(c.series[i]) : c.series[i],
       fill: s.key === 'total' ? 'origin' : false,
       stepped: 'before',
       borderWidth: 2,
@@ -275,8 +307,7 @@ export function metricsSection(name) {
     }));
     const any = points.some((p) => (Number(p.total) || 0) > 0);
     chartEmpty.hidden = any;
-    const grid = cssVar('--chart-grid', 'rgba(255,255,255,.07)');
-    const ink = cssVar('--text-2', '#a9b1c2');
+    const { grid, ink } = c;
     const span = to - from;
     if (chart) {
       chart.data.datasets = datasets;
@@ -312,8 +343,8 @@ export function metricsSection(name) {
         plugins: {
           legend: { display: false },
           tooltip: {
-            backgroundColor: '#0b0e14', borderColor: '#263042', borderWidth: 1,
-            titleColor: '#e6e9ef', bodyColor: '#e6e9ef', padding: 10,
+            backgroundColor: c.tooltipBg, borderColor: c.tooltipBorder, borderWidth: 1,
+            titleColor: c.tooltipText, bodyColor: c.tooltipText, padding: 10,
             callbacks: { title: (items) => (items.length ? fmtDateTime(items[0].parsed.x) : '') },
           },
         },
@@ -328,6 +359,13 @@ export function metricsSection(name) {
     setChildren(tableBody, rows.length ? rows : h('tr', null, h('td', { colspan: String(SERIES.length + 1) }, t('metrics.noData'))));
   }
 
+  // Theme switched (toggle, server default, or the OS with `system`): recolour in place.
+  const offTheme = onThemeChange(() => {
+    if (!chart) return;
+    paintChart(chart, chartColors());
+    chart.update('none');
+  });
+
   return {
     el,
     /** Live counts from the admin SSE keep the "now" tile fresh between refreshes. */
@@ -337,6 +375,7 @@ export function metricsSection(name) {
     refresh,
     destroy() {
       destroyed = true;
+      offTheme();
       clearTimeout(timer);
       if (inflight) inflight.abort();
       if (chart) chart.destroy();
