@@ -8,6 +8,8 @@
 //! - `stream`: `{name, status}` when a stream starts or ends;
 //! - `settings`: `{ui_language, ui_theme, default_waiting_text}` after `PATCH /settings`
 //!   (the dashboard switches language and default theme without a reload);
+//! - `vod`: `VodView` when a video on demand item is created or changes (status,
+//!   progress, title, plays); `vod_deleted`: `{id}`;
 //! - `heartbeat`: `{ts}` every 15 s.
 
 use std::convert::Infallible;
@@ -23,7 +25,7 @@ use futures::Stream;
 use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 
-use super::{BroadcastStatus, ViewContext};
+use super::{BaseUrl, BroadcastStatus, ViewContext};
 use crate::db;
 use crate::hub::HubEvent;
 use crate::state::AppState;
@@ -83,6 +85,17 @@ async fn translate(state: &AppState, headers: &HeaderMap, ev: HubEvent) -> Vec<E
                     }),
                 )),
                 Err(e) => tracing::warn!(error = %e, "SSE: failed to load settings"),
+            }
+            return out;
+        }
+        HubEvent::VodChanged { id } => {
+            match db::vod::get(&state.db, id).await {
+                Ok(Some(item)) => {
+                    let base = BaseUrl::from_request(&state.config, headers);
+                    out.extend(json_event("vod", &super::vod::vod_view(state, &base, item)));
+                }
+                Ok(None) => out.extend(json_event("vod_deleted", &json!({ "id": id }))),
+                Err(e) => tracing::warn!(error = %e, "SSE: failed to load video"),
             }
             return out;
         }

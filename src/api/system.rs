@@ -33,6 +33,8 @@ pub struct SystemInfo {
     pub public_url: String,
     pub hub: HubInfo,
     pub webrtc: crate::webrtc::WebRtcStatus,
+    /// Video on demand: `{enabled, available, inbox_dir, jobs_running, queued, ...}`.
+    pub vod: crate::vod::VodStatus,
 }
 
 async fn system(State(state): State<AppState>) -> Json<SystemInfo> {
@@ -52,5 +54,6 @@ async fn system(State(state): State<AppState>) -> Json<SystemInfo> {
             live_streams: state.hub.live_count(),
         },
         webrtc: state.webrtc.status(),
+        vod: state.vod.status().await,
     })
 }

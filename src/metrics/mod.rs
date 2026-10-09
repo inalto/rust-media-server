@@ -259,8 +259,20 @@ impl ViewerTracker {
 
     /// Register activity of a request-oriented session (HLS, DASH).
     pub fn touch(&self, name: &str, protocol: Protocol, ip: IpAddr, user_agent: &str) {
+        self.touch_is_new(name, protocol, ip, user_agent);
+    }
+
+    /// [`Self::touch`], returning `true` when the request opened a new session (used to
+    /// count video on demand plays).
+    pub fn touch_is_new(
+        &self,
+        name: &str,
+        protocol: Protocol,
+        ip: IpAddr,
+        user_agent: &str,
+    ) -> bool {
         let id = Self::request_session_id(name, protocol, ip, user_agent);
-        self.insert(id, name, protocol, ip, user_agent);
+        self.insert(id, name, protocol, ip, user_agent)
     }
 
     /// `sha256(ip|ua|name|protocol)` as hex.
@@ -284,13 +296,20 @@ impl ViewerTracker {
     /// Register session `id`, or only refresh its `last_seen` if it already exists.
     /// Lookup and insertion happen under one lock: concurrent first requests of the
     /// same HLS/DASH viewer must not count it twice (the reaper removes the entry
-    /// once, so a double count would never go away).
-    fn insert(&self, id: String, name: &str, protocol: Protocol, ip: IpAddr, user_agent: &str) {
+    /// once, so a double count would never go away). Returns `true` for a new session.
+    fn insert(
+        &self,
+        id: String,
+        name: &str,
+        protocol: Protocol,
+        ip: IpAddr,
+        user_agent: &str,
+    ) -> bool {
         let (info, counts) = {
             let mut inner = self.lock();
             if let Some(e) = inner.sessions.get_mut(&id) {
                 e.last_seen = Instant::now();
-                return;
+                return false;
             }
             let info = SessionInfo {
                 id: id.clone(),
@@ -319,6 +338,7 @@ impl ViewerTracker {
         };
         tracing::debug!(broadcast = %name, %protocol, ip = %info.ip, "viewer session opened");
         self.emit(name, counts);
+        true
     }
 
     fn close(&self, id: &str) {

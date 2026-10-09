@@ -37,11 +37,14 @@ pub enum HubEvent {
     /// Global settings changed (`PATCH /api/v1/settings`: UI language, default waiting
     /// text). Not tied to a broadcast.
     SettingsChanged,
+    /// A video on demand item was created, changed (status, progress, title, plays) or
+    /// deleted (admin SSE `vod` / `vod_deleted`). Not tied to a broadcast.
+    VodChanged { id: String },
 }
 
 impl HubEvent {
-    /// Broadcast the event refers to; `""` for [`HubEvent::SettingsChanged`] (never a
-    /// valid broadcast name).
+    /// Broadcast the event refers to; `""` for [`HubEvent::SettingsChanged`] and
+    /// [`HubEvent::VodChanged`] (never a valid broadcast name).
     pub fn name(&self) -> &str {
         match self {
             HubEvent::StreamStarted { name }
@@ -49,7 +52,7 @@ impl HubEvent {
             | HubEvent::Metadata { name }
             | HubEvent::ViewerCountChanged { name, .. }
             | HubEvent::BroadcastUpdated { name } => name,
-            HubEvent::SettingsChanged => "",
+            HubEvent::SettingsChanged | HubEvent::VodChanged { .. } => "",
         }
     }
 }

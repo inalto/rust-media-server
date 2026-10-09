@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod packager;
 pub mod recorder;
 pub mod state;
+pub mod vod;
 pub mod web;
 pub mod webrtc;
 
