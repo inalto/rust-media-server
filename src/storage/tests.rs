@@ -1033,6 +1033,12 @@ async fn encodings_of_bucket_files() {
         ),
         (Some("single"), Some("public"))
     );
+    let again = vod_repo::get(&t.state.db, &vod_id).await.unwrap().unwrap();
+    assert_eq!(
+        (again.source_size, again.status.as_str()),
+        (15, "queued"),
+        "same original: size kept"
+    );
     let r = t
         .send(
             Request::builder()

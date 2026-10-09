@@ -590,21 +590,38 @@ async fn encoding_after_write(
         .clone()
         .or_else(|| existing.as_ref().map(|i| i.visibility.clone()))
         .unwrap_or_else(|| bucket_visibility(bucket).to_string());
-    upsert_encoding(state, bucket, owner, object, existing, &ladder, &visibility)
+    let new = NewEncoding {
+        ladder: &ladder,
+        visibility: &visibility,
+        new_source: true,
+    };
+    upsert_encoding(state, bucket, owner, object, existing, new)
         .await
         .map(Some)
 }
 
-/// Re-queue `existing` (or create the encoding) with `ladder` and `visibility`.
+/// What [`upsert_encoding`] queues.
+struct NewEncoding<'a> {
+    ladder: &'a str,
+    visibility: &'a str,
+    /// The original changed (overwrite): its size is updated and its probe data reset.
+    new_source: bool,
+}
+
+/// Re-queue `existing` (or create the encoding) with a ladder and a visibility.
 async fn upsert_encoding(
     state: &AppState,
     bucket: &Bucket,
     owner: &User,
     object: &BucketObject,
     existing: Option<VodItem>,
-    ladder: &str,
-    visibility: &str,
+    new: NewEncoding<'_>,
 ) -> ApiResult<VodItem> {
+    let NewEncoding {
+        ladder,
+        visibility,
+        new_source,
+    } = new;
     let Some(item) = existing else {
         return Ok(state
             .vod
@@ -613,7 +630,7 @@ async fn upsert_encoding(
     };
     let mut item = state
         .vod
-        .reencode(&item.id, ladder, Some(object.size))
+        .reencode(&item.id, ladder, new_source.then_some(object.size))
         .await?
         .ok_or_else(|| ApiError::conflict("the encoding was deleted meanwhile"))?;
     if item.visibility != visibility
@@ -651,16 +668,12 @@ pub async fn encode(
     let visibility = visibility
         .or_else(|| existing.as_ref().map(|i| i.visibility.clone()))
         .unwrap_or_else(|| bucket_visibility(bucket).to_string());
-    let item = upsert_encoding(
-        state,
-        bucket,
-        &owner,
-        object,
-        existing,
-        &ladder,
-        &visibility,
-    )
-    .await?;
+    let new = NewEncoding {
+        ladder: &ladder,
+        visibility: &visibility,
+        new_source: false,
+    };
+    let item = upsert_encoding(state, bucket, &owner, object, existing, new).await?;
     recount(state, &bucket.id).await;
     Ok(item)
 }
