@@ -1,10 +1,11 @@
 # rms HTTP API reference
 
 Reference for every HTTP surface of rust-media-server (`rms`): the admin REST API, the Server-Sent
-Events streams, the public player API, the playback endpoints (HTTP-FLV, WS-FLV, LL-HLS, LL-DASH) and
-the HTML pages. It is derived from the code (`src/api/*.rs`, `src/egress/*.rs`, `src/packager/*.rs`,
-`src/web/mod.rs`, `src/main.rs`); where it and [ARCHITECTURE.md](ARCHITECTURE.md) §8 differ, this file
-describes the behaviour of the code (see also ARCHITECTURE.md §13 and §14).
+Events streams, the public player API, the playback endpoints (HTTP-FLV, WS-FLV, LL-HLS, LL-DASH,
+WebRTC via WHEP) and the HTML pages. It is derived from the code (`src/api/*.rs`, `src/egress/*.rs`,
+`src/packager/*.rs`, `src/webrtc/*.rs`, `src/web/mod.rs`, `src/main.rs`); where it and
+[ARCHITECTURE.md](ARCHITECTURE.md) §8 differ, this file describes the behaviour of the code (see also
+ARCHITECTURE.md §13, §14 and §16).
 
 Conventions used below:
 
@@ -84,15 +85,16 @@ login view and the panel.
 |---|---|
 | `/api/v1/auth/login`, `/api/v1/auth/logout`, `/api/v1/auth/check` | none (see above) |
 | `/api/v1/public/**` | none |
-| `/live/{name}.flv`, `/ws/live/{name}.flv`, `/hls/**`, `/dash/**` | none |
+| `/live/{name}.flv`, `/ws/live/{name}.flv`, `/hls/**`, `/dash/**`, `/whep/**` | none |
 | `/`, `/embed/{name}`, `/player/{name}`, `/static/*`, `/waiting/*`, `/favicon.ico` | none |
 | everything else under `/api/v1` (broadcasts, recordings incl. downloads, metrics, settings, system, events) | admin token, else `401` |
 
 ### CORS
 
 `Access-Control-Allow-Origin: *` (permissive CORS, including preflight) is sent on the public player API,
-all playback endpoints (FLV, WS-FLV, HLS, DASH) and the pages (`/`, `/embed`, `/player`, `/static`,
-`/waiting`). The admin API and the auth endpoints send no CORS headers.
+all playback endpoints (FLV, WS-FLV, HLS, DASH, WHEP) and the pages (`/`, `/embed`, `/player`, `/static`,
+`/waiting`). WHEP responses also carry `Access-Control-Expose-Headers: Location, Link, ETag` (see
+[6.5](#65-webrtc-whep)). The admin API and the auth endpoints send no CORS headers.
 
 ---
 
@@ -111,14 +113,15 @@ in detail and returned as the generic `{"error":"internal server error"}`.
 |---|---|
 | `400` | invalid input: malformed JSON or wrong `Content-Type`, invalid field/query value, malformed multipart, `name cannot be changed`, blocking-reload parameters out of range |
 | `401` | missing or wrong admin token |
-| `403` | playback of a protocol is disabled for that broadcast (`enable_flv` / `enable_hls` / `enable_dash` = false) |
-| `404` | unknown or malformed broadcast name, unknown recording id, stream offline, unknown path (`{"error":"not found"}` from the global fallback), protocol disabled on the server |
+| `403` | playback of a protocol is disabled for that broadcast (`enable_flv` / `enable_hls` / `enable_dash` / `enable_webrtc` = false), or WebRTC is disabled on the server |
+| `404` | unknown or malformed broadcast name, unknown recording id or WHEP session, stream offline, unknown path (`{"error":"not found"}` from the global fallback), protocol disabled on the server |
+| `405` | `PATCH` of a WHEP session (trickle ICE is not supported; JSON body and `Allow` header) |
 | `409` | conflict: duplicate broadcast name, `broadcast is not live`, `broadcast is already being recorded`, `broadcast is not being recorded`, deleting a recording that is still recording/processing |
 | `413` | upload larger than `server.max_upload_mb` |
-| `415` | unsupported media: waiting-video upload that is not an accepted video; HLS/DASH requested for a stream whose codecs cannot be packaged |
+| `415` | unsupported media: waiting-video upload that is not an accepted video; HLS/DASH requested for a stream whose codecs cannot be packaged; WHEP offer without `Content-Type: application/sdp` or without H.264, or a stream whose video is not H.264 |
 | `422` | waiting-video upload that ffmpeg cannot decode/convert |
 | `500` | internal error |
-| `503` | not ready yet: playlist/MPD/part not available in time, or the waiting-video conversion timed out |
+| `503` | not ready yet: playlist/MPD/part not available in time, the waiting-video conversion timed out; WHEP: WebRTC unavailable, too many sessions, stream starting |
 
 (`501` exists in the error type but no endpoint returns it any more.)
 
@@ -146,6 +149,7 @@ flattened into the object, followed by the computed fields.
 | `enable_flv` | boolean | HTTP-FLV and WS-FLV playback |
 | `enable_hls` | boolean | LL-HLS playback |
 | `enable_dash` | boolean | LL-DASH playback |
+| `enable_webrtc` | boolean | WebRTC playback via WHEP (default `true`) |
 | `paused` | boolean | admin-forced "waiting" state (does not disconnect the publisher) |
 | `waiting_video` | string \| null | the broadcast's *own* waiting video, relative to `data/waiting/` (`<name>/<uuid>.mp4`) |
 | `waiting_text` | string | the broadcast's own waiting text; `""` means "use the global default or the built-in text" |
@@ -168,6 +172,7 @@ flattened into the object, followed by the computed fields.
   "enable_flv": true,
   "enable_hls": true,
   "enable_dash": true,
+  "enable_webrtc": true,
   "paused": false,
   "waiting_video": null,
   "waiting_text": "La diretta inizierà a breve",
@@ -205,6 +210,7 @@ flattened into the object, followed by the computed fields.
     "ws_flv": "ws://127.0.0.1:8080/ws/live/evento-2026.flv",
     "hls": "http://127.0.0.1:8080/hls/evento-2026/master.m3u8",
     "dash": "http://127.0.0.1:8080/dash/evento-2026/manifest.mpd",
+    "whep": "http://127.0.0.1:8080/whep/evento-2026",
     "embed": "http://127.0.0.1:8080/embed/evento-2026",
     "player": "http://127.0.0.1:8080/player/evento-2026"
   },
@@ -216,7 +222,8 @@ flattened into the object, followed by the computed fields.
 ### ViewerCounts
 
 `{"flv": u32, "ws_flv": u32, "hls": u32, "dash": u32, "webrtc": u32, "total": u32}`. `total` is the sum
-of the five protocol counters. `webrtc` is reserved and always 0 (WHEP egress is not implemented).
+of the five protocol counters. `webrtc` counts WHEP sessions whose peer connection is connected (a
+session is counted from the DTLS handshake until it closes).
 HLS/DASH viewers are request-based: a viewer is counted from its first playlist/segment request until
 `metrics.session_timeout_secs` (default 30) pass without one.
 
@@ -252,7 +259,7 @@ Present in `BroadcastView.live` while a publisher is connected.
 
 ### PlaybackUrls
 
-`{flv, ws_flv, hls, dash, embed, player}`, absolute URLs built from `server.public_url` when set,
+`{flv, ws_flv, hls, dash, whep, embed, player}`, absolute URLs built from `server.public_url` when set,
 otherwise from the request: scheme `http` (or `https` if the first `X-Forwarded-Proto` value is
 `https`) plus the `Host` header (a malformed `Host` falls back to `localhost`). `ws_flv` uses `ws`/`wss`.
 The URLs are shown above. They are built for every broadcast whether or not the protocol is enabled.
@@ -344,7 +351,7 @@ Create a broadcast.
 | `name` | string | derived from `title` | `[a-z0-9_-]{1,64}`. If absent/blank, a slug is derived from the title (lowercase ASCII, accents transliterated, other characters collapsed to `-`) and made unique with `-2`, `-3`...; if the title yields no characters the name is `live-<6 hex>` |
 | `description` | string | `""` | up to 5000 characters |
 | `record` | boolean | `false` | auto-record |
-| `enable_flv`, `enable_hls`, `enable_dash` | boolean | `true` | |
+| `enable_flv`, `enable_hls`, `enable_dash`, `enable_webrtc` | boolean | `true` | |
 | `waiting_text` | string | `La diretta inizierà a breve` | up to 500 characters; `""` = use the global default |
 
 - Response `201`: `BroadcastView` (status `offline`, a fresh `stream_key`).
@@ -368,17 +375,19 @@ Partial update; only the supplied fields change.
 |---|---|---|
 | `title` | string | 1-200 characters, not empty |
 | `description` | string | up to 5000 |
-| `record`, `enable_flv`, `enable_hls`, `enable_dash` | boolean | |
+| `record`, `enable_flv`, `enable_hls`, `enable_dash`, `enable_webrtc` | boolean | |
 | `waiting_text` | string | up to 500; `""` = use the global default |
 | `name` | string | accepted only when equal to the current name; otherwise `400 name cannot be changed` |
 
 - Response `200`: `BroadcastView`. `400`, `404` as above.
 - `enable_*` changes take effect on new requests (the packager caches the flags for at most 5 s).
+  Setting `enable_webrtc` to `false` also closes the broadcast's open WebRTC sessions (players fall back
+  to the next source).
 
 #### `DELETE /api/v1/broadcasts/{name}`
 
-Disconnects the publisher (if live), deletes the broadcast's waiting video and poster, and removes the
-row. Recordings and their files are kept.
+Disconnects the publisher (if live), closes its WebRTC sessions, deletes the broadcast's waiting video
+and poster, and removes the row. Recordings and their files are kept.
 
 - Response `204 No Content`. `404` unknown.
 
@@ -410,18 +419,21 @@ Ready-to-paste embed code.
 ```json
 {
   "iframe": "<iframe src=\"http://127.0.0.1:8080/embed/evento-2026\" width=\"640\" height=\"360\" style=\"border:0;max-width:100%;aspect-ratio:16/9;height:auto\" allow=\"autoplay; fullscreen; picture-in-picture\" allowfullscreen></iframe>",
-  "urls": { "flv": "...", "ws_flv": "...", "hls": "...", "dash": "...", "embed": "...", "player": "..." },
+  "urls": { "flv": "...", "ws_flv": "...", "hls": "...", "dash": "...", "whep": "...", "embed": "...", "player": "..." },
   "obs": { "server": "rtmp://127.0.0.1:1935/live", "stream_key": "9f86d081884c7d659a2feaa0c55ad015" },
   "snippets": {
     "hlsjs": "<video id=\"rms-player\" ...></video>\n<script src=\"https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js\"></script>...",
     "mpegtsjs": "... mpegts.js@1.8.2 ... (HTTP-FLV)",
-    "dashjs": "... dashjs@5.2.1 ... (LL-DASH)"
+    "dashjs": "... dashjs@5.2.1 ... (LL-DASH)",
+    "whep": "<video id=\"rms-player\" ...></video>\n<script>... RTCPeerConnection ... fetch(endpoint, {method: 'POST', ...}) ...</script>"
   }
 }
 ```
 
 `urls` is a [PlaybackUrls](#playbackurls), `obs` an [ObsSettings](#obssettings). The `snippets` are
-self-contained HTML (a `<video>` element, the pinned CDN script and a few lines of player setup). The
+self-contained HTML (a `<video>` element, the pinned CDN script and a few lines of player setup; `whep`
+needs no library: ~25 lines of vanilla JavaScript with `RTCPeerConnection`, recvonly video and audio
+transceivers, the WHEP `POST`, and a `DELETE` of the session on `pagehide`). The
 iframe `src` has no query string; see [`/embed/{name}`](#embedname-and-playername) for the parameters
 you can append.
 
@@ -662,12 +674,30 @@ Upload of the global default video (same pipeline and limits as above, stored un
   "rtmp_bind": "0.0.0.0:1935",
   "http_bind": "0.0.0.0:8080",
   "public_url": "",
-  "hub": {"live_streams": 1}
+  "hub": {"live_streams": 1},
+  "webrtc": {
+    "enabled": true,
+    "available": true,
+    "udp_port": 8443,
+    "public_ip": [],
+    "candidates": ["192.168.1.20:8443"],
+    "ice_lite": true,
+    "sessions": 2,
+    "publishers": 1,
+    "audio": true,
+    "error": null
+  }
 }
 ```
 
 `ffmpeg.path` / `ffmpeg.version` are `null` when ffmpeg is unavailable (`version` is the first line of
 `ffmpeg -version`). `public_url` is `server.public_url` as configured (empty = derived from `Host`).
+
+`webrtc`: `enabled` is `webrtc.enabled`; `available` is false when disabled or when the UDP port could
+not be bound (`error` says why); `candidates` are the ICE host candidates given to viewers
+(`webrtc.public_ip`, else the IPv4 addresses of the local interfaces, with `udp_port`); `sessions` counts
+WHEP sessions (connecting or connected); `publishers` the broadcasts with a running WebRTC publisher;
+`audio` is false without ffmpeg (sessions are then video-only).
 
 ### 4.6 Events (SSE)
 
@@ -718,11 +748,13 @@ embed player uses.
     "flv": "http://127.0.0.1:8080/live/evento-2026.flv",
     "ws_flv": "ws://127.0.0.1:8080/ws/live/evento-2026.flv",
     "hls": "http://127.0.0.1:8080/hls/evento-2026/master.m3u8",
-    "dash": null
+    "dash": null,
+    "whep": "http://127.0.0.1:8080/whep/evento-2026"
   },
   "enable_flv": true,
   "enable_hls": true,
-  "enable_dash": false
+  "enable_dash": false,
+  "enable_webrtc": true
 }
 ```
 
@@ -733,8 +765,8 @@ embed player uses.
 | `waiting_video_url` | string \| null | effective waiting video (own, else global default) |
 | `waiting_text` | string | *effective* text: the broadcast's, else the global default, else the built-in `La diretta inizierà a breve` |
 | `poster_url` | string \| null | the video's `.jpg` poster, only if that file exists |
-| `sources` | object | `flv`, `ws_flv`, `hls`, `dash`: URL, or `null` when the protocol is disabled. `flv` and `ws_flv` follow `enable_flv`; `hls` / `dash` are `null` when disabled for the broadcast *or* on the server (`hls.enabled` / `dash.enabled`) |
-| `enable_flv`, `enable_hls`, `enable_dash` | boolean | `enable_hls` / `enable_dash` already include the server-wide switch |
+| `sources` | object | `flv`, `ws_flv`, `hls`, `dash`, `whep`: URL, or `null` when the protocol is disabled. `flv` and `ws_flv` follow `enable_flv`; `hls` / `dash` are `null` when disabled for the broadcast *or* on the server (`hls.enabled` / `dash.enabled`); `whep` is `null` when `enable_webrtc` is false, WebRTC is disabled or unavailable on the server (`webrtc.enabled`, UDP port not bound), or the live video codec is known and is not H.264 |
+| `enable_flv`, `enable_hls`, `enable_dash`, `enable_webrtc` | boolean | `enable_hls` / `enable_dash` / `enable_webrtc` already include the server-wide conditions (`enable_webrtc` = `sources.whep` is non-null) |
 
 `404 broadcast not found` for an unknown name.
 
@@ -961,6 +993,68 @@ Client example: `dashjs.MediaPlayer().create()` with
 `updateSettings({streaming: {delay: {liveDelay: 2}, liveCatchup: {enabled: true}}})` (dash.js 5 reads
 the low-latency parameters from the MPD; `streaming.lowLatencyEnabled` no longer exists).
 
+### 6.5 WebRTC (WHEP)
+
+WebRTC egress following the WHEP draft (`draft-ietf-wish-whep`): the client `POST`s an SDP offer and
+gets the SDP answer; media flows over **one UDP port** shared by every session (`webrtc.udp_port`,
+default 8443; it is not proxied by nginx/Caddy and must be reachable by viewers). The server is ICE-lite
+(`webrtc.ice_lite`) and its answer already contains every candidate (host candidates for
+`webrtc.public_ip`, else for the IPv4 addresses of the local interfaces, plus `a=end-of-candidates`), so
+no trickle ICE is needed and the client may `POST` without waiting for its own candidates.
+
+Media: H.264 passed through as received (decode order; encoders should not use B-frames, e.g. x264
+`tune=zerolatency` or OBS `bframes=0`) with SPS/PPS sent before every IDR; AAC transcoded to Opus
+(48 kHz stereo, 20 ms, `webrtc.audio_bitrate_kbps`) by ffmpeg. Without ffmpeg the answer rejects the
+audio section (video-only). A new viewer starts at the next keyframe (at most one keyframe interval).
+
+| Method & path | Request | Response |
+|---|---|---|
+| `POST /whep/{name}` | `Content-Type: application/sdp`, body = SDP offer (≤ 64 KiB) with a video section offering H.264 (`packetization-mode=1`); audio optional | `201 Created`, `Content-Type: application/sdp`, body = SDP answer, `Location: /whep/{name}/{session}`, `ETag: "<session>"`, `Link` (ICE servers, below) |
+| `DELETE /whep/{name}/{session}` | | `200` (session closed; also for a session the server closed in the last 2 minutes), `404 session not found` |
+| `PATCH /whep/{name}/{session}` | | `405` with `Allow: DELETE, OPTIONS` (trickle ICE / ICE restart not supported) |
+| `OPTIONS /whep/{name}` | | `204`, `Allow: POST, OPTIONS`, CORS preflight headers, `Link` |
+| `OPTIONS /whep/{name}/{session}` | | `204`, `Allow: DELETE, OPTIONS` |
+
+`POST` errors (JSON `{"error": ...}`), in the order they are checked:
+
+| Status | When |
+|---|---|
+| `403` | `WebRTC is disabled on this server` (`webrtc.enabled = false`) |
+| `404` | `broadcast not found` |
+| `403` | `WebRTC playback is disabled for this broadcast` (`enable_webrtc = false`) |
+| `415` | `expected Content-Type: application/sdp` |
+| `400` | `invalid SDP offer: ...` (empty, not UTF-8, not `v=0`, too large, no media section, no ICE credentials or DTLS fingerprint, rejected by the WebRTC stack) |
+| `415` | the offer has no video section or no H.264 (`the offer has no H.264 video codec`; also when only `packetization-mode=0` is offered) |
+| `404` | `stream offline` |
+| `503` | `WebRTC is not available on this server` (UDP port not bound), `too many WebRTC sessions` (`webrtc.max_sessions`, default 100), `stream is starting (no H.264 sequence header yet)` (after waiting up to 5 s) |
+| `415` | the stream's video cannot be sent over WebRTC (HEVC, AV1...: only H.264) or the stream is audio-only |
+
+Every response has `Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers: Location, Link,
+ETag`. When `webrtc.stun_server` is set, `POST` and `OPTIONS` responses carry
+`Link: <stun:host:port>; rel="ice-server"` (a bare `host:port` gets the `stun:` prefix).
+
+Session lifetime: the server closes a session on `DELETE`, when the peer connection fails or closes,
+after 10 s in the `disconnected` state (consent freshness lost: tab closed without `DELETE`, network
+gone), when it does not connect within 30 s, when the stream ends, when `enable_webrtc` is set to false
+or the broadcast is deleted, and on shutdown. The viewer is counted as `webrtc` while connected.
+The per-broadcast WebRTC publisher (packetizer and Opus encoder) starts with the first session and stops
+when the stream ends or after `webrtc.idle_stop_secs` (default 30) without sessions.
+
+Minimal client (the same as `snippets.whep`):
+
+```js
+const pc = new RTCPeerConnection();
+pc.addTransceiver('video', { direction: 'recvonly' });
+pc.addTransceiver('audio', { direction: 'recvonly' });
+const stream = new MediaStream();
+pc.ontrack = (e) => { stream.addTrack(e.track); video.srcObject = stream; };
+await pc.setLocalDescription(await pc.createOffer());
+const res = await fetch('http://127.0.0.1:8080/whep/evento-2026', {
+  method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
+const session = new URL(res.headers.get('Location'), res.url).href;   // DELETE it when done
+await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
+```
+
 ---
 
 ## 7. Pages
@@ -989,21 +1083,27 @@ Query parameters (all optional):
 | `autoplay` | `1` / `0` | `1` | start playing as soon as the stream is live; with `0` the viewer starts it with the controls (or the play button when `controls=0`) |
 | `muted` | `1` / `0` | `1` | start muted. With `muted=0` browsers often block autoplay with sound: the player then retries muted and shows an "Attiva audio" button |
 | `controls` | `1` / `0` | `1` | show the native video controls |
-| `src` | `auto`, `flv`, `hls`, `dash` | `auto` | source to try first (any other value is `auto`); see below |
+| `src` | `auto`, `webrtc` (alias `whep`), `flv`, `hls`, `dash` | `auto` | source to try first (any other value is `auto`); see below |
 | `latency` | `1` / `0` | `0` on `/embed`, `1` on `/player` | show the estimated latency in the corner |
 
 A flag is false when present with the value `0`, `false`, `no` or `off` (case-insensitive) and true for
 any other value, including an empty one. The dashboard preview uses `?muted=1&autoplay=1&latency=1`.
 
-Source selection: `auto` tries `flv` -> `hls` -> `dash` (on iOS: `hls` -> `dash`). `flv` plays
+Source selection: `auto` tries `webrtc` -> `flv` -> `hls` -> `dash` (on iOS: `webrtc` -> `hls` ->
+`dash`). `webrtc` is a built-in WHEP client (no library; see [6.5](#65-webrtc-whep)); `flv` plays
 HTTP-FLV with mpegts.js (needs Media Source Extensions); `hls` uses native HLS on iOS/Safari and hls.js
 elsewhere; `dash` uses dash.js. An explicit `src=hls` starts at HLS and may still fall back to `dash`;
-`src=dash` only tries DASH. Only sources enabled for the broadcast (non-null in `sources`) and supported
+`src=dash` only tries DASH. WebRTC fails over to the next source when the WHEP `POST` is refused (403,
+404, 415, 503...), ICE does not connect within 6 s, the connection fails or closes, no video frame
+arrives within 8 s, or no video packet arrives for 4 s; leaving it (another source, `offline`/`paused`
+status, `pagehide`) closes the peer connection and `DELETE`s the session. Only sources enabled for the broadcast (non-null in `sources`) and supported
 by the browser are used. When a source fails fatally, makes no progress for 12 s, or does not start
 within 15 s, the player checks the status and tries the next source; when all fail it returns to the
 waiting screen and retries after 5 s. The libraries are loaded on demand from jsDelivr: mpegts.js 1.8.2,
 hls.js 1.7.3 (`lowLatencyMode`, `liveSyncDuration: 1.5`, `liveMaxLatencyDuration: 4`), dash.js 5.2.1.
-`window.rmsPlayer` exposes `status`, `source`, `engine`, `latency`, `setSource(src)` and `reload()` for debugging.
+`window.rmsPlayer` exposes `status`, `source`, `engine` (`webrtc`, `mpegts.js`, `hls.js`, `native`,
+`dash.js`), `latency` (for WebRTC: jitter-buffer delay + half the RTT from `getStats()`),
+`peerConnection` (WebRTC only), `setSource(src)` and `reload()` for debugging.
 
 ### `/waiting/{path}`
 
@@ -1082,6 +1182,9 @@ curl -s $B/api/v1/public/broadcasts/evento-2026 | jq '{status, sources}'
 
 # --- playback
 ffplay "$B/live/evento-2026.flv"                                # HTTP-FLV
+curl -s -i -X OPTIONS $B/whep/evento-2026                       # 204 + CORS (+ Link with a STUN server)
+curl -s -i -H 'Content-Type: application/sdp' --data-binary @offer.sdp $B/whep/evento-2026   # 201 + answer
+curl -s -X DELETE $B/whep/evento-2026/<session> -w '%{http_code}\n'                          # 200
 curl -s "$B/live/evento-2026.flv" | ffprobe -hide_banner -         # inspect the live FLV
 ffplay "$B/hls/evento-2026/master.m3u8"                         # LL-HLS
 curl -s "$B/hls/evento-2026/master.m3u8"

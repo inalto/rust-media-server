@@ -150,7 +150,7 @@ p.attachMediaElement(video); p.load(); p.play();
 - **Scalabilità**: stato per viewer (ICE, DTLS, SRTP, feedback RTCP): non si appoggia a una CDN HTTP; si scala con più nodi/SFU. Servono porte UDP raggiungibili (a volte TURN). Per rms è adatta a pubblici interattivi di dimensione contenuta, non a grandi audience.
 - **Player**: `RTCPeerConnection` + una `fetch` verso l'endpoint WHEP (poche righe di JS); nessuna libreria obbligatoria.
 - **Crate Rust candidati** (versioni crates.io al controllo [30]): `webrtc` 0.21.0 (async, Tokio) e `str0m` 0.24.1 (stile sans-IO).
-- **Stato**: **Stretch** (Fase 4); `Protocol::WebRtc` esiste già nel tracker dei viewer (ARCHITECTURE 4.4).
+- **Stato**: **implementato** (Fase 4, ARCHITECTURE §16): `POST /whep/{name}` con ICE-lite su un'unica porta UDP (`webrtc.udp_port`), H.264 inoltrato senza transcodifica, AAC → Opus con ffmpeg; primo tentativo del player embed in modalità `auto`.
 
 ### 3.5 HESP (menzione)
 
