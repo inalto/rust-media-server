@@ -17,16 +17,21 @@
 <body>
   <a class="skip-link" href="#app" data-i18n="app.skip">Vai al contenuto</a>
   <header id="topbar" class="topbar" hidden>
-    <a class="brand" href="#/" aria-label="rms, elenco dirette" data-i18n-aria-label="nav.brandLabel">
+    <a id="brand" class="brand" href="#/" aria-label="rms, elenco dirette">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49M7.76 16.24a6 6 0 0 1 0-8.49M19.07 4.93a10 10 0 0 1 0 14.14M4.93 19.07a10 10 0 0 1 0-14.14"/></svg>
       <span>rms</span>
     </a>
     <nav class="nav" aria-label="Navigazione principale" data-i18n-aria-label="nav.label">
-      <a href="#/" data-nav="list" data-i18n="nav.broadcasts">Dirette</a>
-      <a href="#/vod" data-nav="vod"><span class="nav-long" data-i18n="nav.vod">Video on demand</span><span class="nav-short" data-i18n="nav.vodShort">Video</span></a>
-      <a href="#/settings" data-nav="settings" data-i18n="nav.settings">Impostazioni</a>
+      <a href="#/" data-nav="list" data-role="admin" data-i18n="nav.broadcasts">Dirette</a>
+      <a href="#/vod" data-nav="vod" data-role="admin"><span class="nav-long" data-i18n="nav.vod">Video on demand</span><span class="nav-short" data-i18n="nav.vodShort">Video</span></a>
+      <a href="#/users" data-nav="users" data-role="admin" data-i18n="nav.users">Utenti</a>
+      <a href="#/settings" data-nav="settings" data-role="admin" data-i18n="nav.settings">Impostazioni</a>
+      <a href="#/buckets" data-nav="buckets" data-role="user" hidden><span class="nav-long" data-i18n="nav.buckets">I miei bucket</span><span class="nav-short" data-i18n="nav.bucketsShort">Bucket</span></a>
+      <a href="#/keys" data-nav="keys" data-role="user" hidden><span class="nav-long" data-i18n="nav.keys">Chiavi API</span><span class="nav-short" data-i18n="nav.keysShort">Chiavi</span></a>
+      <a href="#/account" data-nav="account" data-role="user" hidden data-i18n="nav.account">Account</a>
     </nav>
     <div class="topbar-end">
+      <a id="whoami" class="whoami" href="#/account" hidden></a>
       <span id="conn" class="conn" data-state="connecting" role="status"><span class="conn-dot" aria-hidden="true"></span><span class="conn-label" data-i18n="conn.connecting">Connessione…</span></span>
       <button id="theme-toggle" type="button" class="btn ghost small icon-only" aria-label="Tema" title="Tema"></button>
       <button id="logout" type="button" class="btn ghost small" title="Esci dal pannello" aria-label="Esci" data-i18n-title="logout.title" data-i18n-aria-label="logout.label">

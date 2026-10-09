@@ -1,9 +1,11 @@
 //! Pages and static assets (ARCHITECTURE.md §8.3).
 //!
 //! - `/` dashboard SPA (`static/index.html` + ES modules `app.js`, `core.js`,
-//!   `detail.js`, `metrics.js`, `mock.js`, `i18n.js`, `theme.js` and `style.css`), Italian
-//!   or English UI (`ui_language` setting, ARCHITECTURE.md §17), dark or light theme
-//!   (`ui_theme`, §18).
+//!   `detail.js`, `metrics.js`, `mock.js`, `vod.js`, `i18n.js`, `theme.js` and
+//!   `style.css`), Italian or English UI (`ui_language` setting, ARCHITECTURE.md §17), dark
+//!   or light theme (`ui_theme`, §18). Role-aware (§23): the admin pages plus `users.js`
+//!   (admin "Utenti"), or the user portal `portal.js` (buckets, API keys, account) with
+//!   the bucket browser `browser.js`; `accounts.js` holds their shared dialogs.
 //! - `/embed/{name}` player page for iframes, `/player/{name}` full-page player
 //!   (same `embed.html`, `data-mode` differs; ES module `player.js` + `i18n.js` +
 //!   `theme.js`).
@@ -125,6 +127,26 @@ const ASSETS: &[(&str, &str, &str)] = &[
         "vod.js",
         "text/javascript; charset=utf-8",
         include_str!("static/vod.js"),
+    ),
+    (
+        "accounts.js",
+        "text/javascript; charset=utf-8",
+        include_str!("static/accounts.js"),
+    ),
+    (
+        "browser.js",
+        "text/javascript; charset=utf-8",
+        include_str!("static/browser.js"),
+    ),
+    (
+        "users.js",
+        "text/javascript; charset=utf-8",
+        include_str!("static/users.js"),
+    ),
+    (
+        "portal.js",
+        "text/javascript; charset=utf-8",
+        include_str!("static/portal.js"),
     ),
 ];
 
@@ -342,6 +364,10 @@ mod tests {
         ("catalog.html", include_str!("static/catalog.html")),
         ("catalog.js", include_str!("static/catalog.js")),
         ("vod.js", include_str!("static/vod.js")),
+        ("accounts.js", include_str!("static/accounts.js")),
+        ("browser.js", include_str!("static/browser.js")),
+        ("users.js", include_str!("static/users.js")),
+        ("portal.js", include_str!("static/portal.js")),
     ];
 
     /// `export const <lang> = { ... };` of i18n.js: one `'key': 'text',` per line.
