@@ -53,8 +53,9 @@ use crate::metrics::{Protocol as ViewerProtocol, ViewerSession, ViewerTracker};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// A session `Disconnected` for longer than this is closed.
 const DISCONNECTED_GRACE: Duration = Duration::from_secs(10);
-/// Upper bound of a single protocol-timer sleep.
+/// Bounds of a single protocol-timer sleep.
 const MAX_SLEEP: Duration = Duration::from_secs(1);
+const MIN_SLEEP: Duration = Duration::from_millis(1);
 
 /// H.264 (packetization-mode=1) profiles the answer can accept, with the payload types
 /// used when they are not dictated by the offer.
@@ -493,6 +494,14 @@ pub async fn run(t: SessionTask) -> EndReason {
     };
     let mut lagged: u64 = 0;
     let reason = loop {
+        // Overdue protocol timers first, on every iteration: a steady flow of media or
+        // datagrams can never starve retransmissions, keepalives or RTCP reports.
+        let now = Instant::now();
+        if d.pc.poll_timeout().is_some_and(|t| t <= now)
+            && let Err(e) = d.pc.handle_timeout(now)
+        {
+            tracing::debug!(task = "webrtc-session", session = %id, error = %e, "timeout handling failed");
+        }
         d.flush().await;
         d.drain_events(&tracker, ip, &user_agent);
         d.flush().await;
@@ -508,15 +517,11 @@ pub async fn run(t: SessionTask) -> EndReason {
         {
             break EndReason::Disconnected;
         }
+        // Never a zero sleep (no busy loop if the core keeps reporting a past deadline).
         let deadline =
             d.pc.poll_timeout()
-                .map_or(now + MAX_SLEEP, |t| t.min(now + MAX_SLEEP));
-        if deadline <= now {
-            if let Err(e) = d.pc.handle_timeout(now) {
-                tracing::debug!(task = "webrtc-session", session = %id, error = %e, "timeout handling failed");
-            }
-            continue;
-        }
+                .map_or(now + MAX_SLEEP, |t| t.min(now + MAX_SLEEP))
+                .max(now + MIN_SLEEP);
         let sleep = pin!(tokio::time::sleep_until(deadline.into()));
         tokio::select! {
             biased;
