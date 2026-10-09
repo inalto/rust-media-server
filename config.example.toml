@@ -43,5 +43,15 @@ retention_days = 90
 [ffmpeg]
 path = ""                  # empty = search PATH
 
+[webrtc]                   # WebRTC egress via WHEP: POST /whep/<name>
+enabled = true
+udp_port = 8443            # ONE UDP port for every session: open it in the firewall (not proxied by nginx/Caddy)
+public_ip = []             # e.g. ["203.0.113.7"] behind 1:1 NAT (cloud VM); empty = local interface addresses
+ice_lite = true
+max_sessions = 100
+audio_bitrate_kbps = 96    # AAC -> Opus transcode (needs ffmpeg; without it sessions are video-only)
+idle_stop_secs = 30        # stop the per-broadcast WebRTC publisher after this long without viewers
+stun_server = ""           # optional, e.g. "stun.l.google.com:19302", advertised in the WHEP Link header
+
 [log]
 level = "info"             # RUST_LOG overrides
