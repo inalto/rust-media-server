@@ -74,6 +74,12 @@ Chiavi principali:
 | `webrtc.idle_stop_secs` | `30` | ferma il publisher WebRTC di una diretta dopo questi secondi senza spettatori WebRTC |
 | `webrtc.stun_server` | vuoto | server STUN opzionale annunciato ai client nell'header `Link` (es. `stun.l.google.com:19302`) |
 
+**Lingua dell'interfaccia.** Dashboard e player sono in italiano (predefinito) o in inglese: si sceglie
+nella dashboard in *Impostazioni → Lingua* (oppure `PATCH /api/v1/settings {"ui_language":"en"}`), vale
+subito per le dashboard aperte e per i testi del player incorporato (badge di attesa/pausa, pulsanti, testo
+di attesa predefinito: «La diretta inizierà a breve» / «The live stream will start shortly»). I testi di
+attesa personalizzati restano come sono. Un singolo embed può forzare la lingua con `?lang=it|en`.
+
 ## Flusso di lavoro
 
 1. Nella dashboard crea una **diretta** (titolo → nome URL automatico). Ogni diretta ha una stream key segreta.
@@ -104,7 +110,7 @@ Chiavi principali:
 | Player embed | `http://<host>:8080/embed/<nome>` | iframe |
 | Player pagina intera | `http://<host>:8080/player/<nome>` | browser |
 
-Parametri del player embed (tutti opzionali): `?autoplay=1|0&muted=1|0&controls=1|0&src=auto|webrtc|flv|hls|dash&latency=1|0` (default: `1`, `1`, `1`, `auto`; `latency` è `0` in `/embed` e `1` in `/player`). Con `auto` l'ordine è WebRTC → HTTP-FLV → LL-HLS → LL-DASH. Dettagli in [docs/API.md](docs/API.md) §6.5 e §7.
+Parametri del player embed (tutti opzionali): `?autoplay=1|0&muted=1|0&controls=1|0&src=auto|webrtc|flv|hls|dash&latency=1|0&lang=it|en` (default: `1`, `1`, `1`, `auto`; `latency` è `0` in `/embed` e `1` in `/player`; `lang` predefinito = lingua impostata in *Impostazioni*). Con `auto` l'ordine è WebRTC → HTTP-FLV → LL-HLS → LL-DASH. Dettagli in [docs/API.md](docs/API.md) §6.5 e §7.
 
 **WebRTC: rete.** Il segnale WHEP passa in HTTP(S) dal reverse proxy come il resto, ma l'audio/video viaggia
 su UDP direttamente verso `webrtc.udp_port` (default `8443/udp`): la porta va aperta nel firewall e, dietro
@@ -152,6 +158,7 @@ curl -s -H "$H" "$B/broadcasts/prova/metrics?step=60"            # serie spettat
 curl -s -H "$H" $B/broadcasts/prova/embed                        # iframe e snippet pronti
 curl -s -H "$H" -F file=@attesa.mp4 $B/broadcasts/prova/waiting-video
 curl -N -H "$H" $B/events                                        # SSE: stato, spettatori
+curl -s -H "$H" -H 'Content-Type: application/json' -X PATCH -d '{"ui_language":"en"}' $B/settings   # interfaccia in inglese
 ```
 
 ## Deploy
