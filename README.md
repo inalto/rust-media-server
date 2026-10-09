@@ -13,6 +13,7 @@ pronti da incollare e un video d'attesa quando la diretta non c'è.
 - Metriche: spettatori simultanei per protocollo campionati su SQLite, grafici Chart.js, picco/sessioni/durata media
 - Video d'attesa per diretta o globale, mostrato dal player quando la diretta è offline o **in pausa**
 - **Video on demand** con qualità adattiva (ABR): caricamento dalla dashboard o cartella *inbox*, codifica in un solo passaggio ffmpeg in più qualità (ladder configurabili), pubblicazione in HLS e DASH (CMAF), player con selettore di qualità, pagina pubblica e catalogo
+- **Utenti, chiavi API e bucket** (stile bunny.net): ogni utente ha i propri bucket di file, un'API di storage (`PUT`/`GET`/`DELETE`) con chiavi a permessi per percorso, codifica automatica dei video caricati, video privati con link firmati e un portale web per gestire tutto
 - Zero dipendenze esterne a runtime sul server: SQLite incorporato; `ffmpeg` opzionale (remux MP4, normalizzazione video d'attesa, audio Opus per WebRTC; indispensabile, con `ffprobe`, per il video on demand). I browser caricano hls.js, mpegts.js, dash.js (jsDelivr) e Chart.js (cdnjs) da CDN; il client WebRTC non usa librerie
 
 Architettura e contratto API: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (inglese).
@@ -278,6 +279,46 @@ del player VOD: `?autoplay=1|0&muted=1|0&controls=1|0&t=<secondi>&src=auto|hls|d
 Altre azioni: rinomina e descrizione, **ricodifica** con un'altra ladder (anche per riprovare un video in
 errore), download dell'originale, eliminazione (anche durante la codifica, che viene interrotta). Il
 contatore *riproduzioni* conta le sessioni di visione avviate; *spettatori ora* quelle attive.
+
+## Utenti, chiavi API e bucket
+
+L'amministratore crea gli **utenti**; ogni utente ha uno o più **bucket** (alberi di cartelle e file
+originali, come le Storage Zone di bunny.net), carica i file con una semplice API HTTP e i video vengono
+**codificati** dalla pipeline VOD in HLS/DASH mentre l'originale resta nel bucket. Contratto e dettagli:
+[docs/ACCOUNTS.md](docs/ACCOUNTS.md) e [docs/API.md §9](docs/API.md#9-accounts-api-keys-and-the-storage-api).
+
+**Amministratore (dashboard → *Utenti*).** Elenco con stato, bucket, spazio usato rispetto alla quota,
+chiavi e ultimo accesso; *Nuovo utente* (nome utente proposto dal nome visualizzato, email, quota in GB o
+illimitata, numero massimo di bucket, ladder predefinita); sospensione e riattivazione (le chiavi smettono
+di funzionare), eliminazione (con conferma aggiuntiva se l'utente possiede bucket). Il dettaglio di un
+utente mostra l'utilizzo (*Ricalcola* rimisura i file sul disco), le **chiavi API** (la chiave completa si
+vede una sola volta, alla creazione), i bucket, che si aprono nello stesso browser di file del portale, e
+le codifiche. La libreria *Video on demand* indica proprietario e bucket dei video degli utenti.
+
+**Portale utente.** Si entra nella stessa pagina di login con una chiave API che ha l'ambito *Account*
+(una chiave solo *Storage* viene rifiutata: serve ai programmi). Tre sezioni:
+
+- **I miei bucket**: schede dei bucket (spazio, file, codifica automatica, riproduzione pubblica o privata)
+  e impostazioni (descrizione, ladder, rotazione della chiave di firma, eliminazione). Il **browser** di un
+  bucket ha percorso cliccabile, cartelle, caricamento con trascinamento o selezione multipla (un `PUT` in
+  streaming per file, con avanzamento, annullamento, checksum SHA-256 calcolato nel browser fino a 256 MB,
+  scelta della codifica e della visibilità), stato della codifica in tempo reale, selezione multipla. La
+  scheda di un file riporta metadati, qualità prodotte, tutti i link con il pulsante *Copia* (URL diretto,
+  download, HLS, DASH, anteprima, player, pagina, codice iframe), la visibilità pubblica/privata e, per i
+  video privati, i **link firmati** con scadenza a scelta (1 ora, 24 ore, 7 giorni o personalizzata);
+  *Riproduci* apre il player firmato in una finestra.
+- **Chiavi API**: nome, ambiti (*Account*: gestione completa; *Storage*: solo file), permessi per bucket e
+  prefisso di percorso con livello lettura/scrittura/amministrazione, scadenza facoltativa; modifica e revoca.
+- **Account**: profilo, spazio usato e quota, limiti, chiave in uso.
+
+```bash
+# una chiave Storage che può scrivere solo in /videos/ del bucket "corso"
+curl -s -H "AccessKey: $KEY" -T lezione1.mp4 http://127.0.0.1:8080/storage/corso/videos/lezione1.mp4   # 201, codifica in coda
+curl -s -H "AccessKey: $KEY" http://127.0.0.1:8080/storage/corso/videos/                               # elenco JSON
+curl -s -H "AccessKey: $KEY" -T note.txt http://127.0.0.1:8080/storage/corso/altro/note.txt             # 403
+```
+
+Schermate: [docs/screenshots/](docs/screenshots/).
 
 ## Test senza OBS
 

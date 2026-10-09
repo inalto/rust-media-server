@@ -92,6 +92,16 @@ const ICONS = {
   themeSystem: '<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/>',
   layers: '<path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/>',
   inbox: '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
+  bucket: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>',
+  folderPlus: '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><path d="M12 11v6M9 14h6"/>',
+  file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>',
+  lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+  globe: '<circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>',
+  user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>',
+  chevron: '<path d="m9 18 6-6-6-6"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/>',
 };
 
 /** Inline SVG icon (decorative: aria-hidden). */
@@ -157,9 +167,11 @@ export const store = {
 // ---------------------------------------------------------------------------
 
 export class ApiError extends Error {
-  constructor(status, message) {
+  /** `field`: the request field named by a `400 {error, field}` (accounts/storage API). */
+  constructor(status, message, field = null) {
     super(message);
     this.status = status;
+    this.field = field;
   }
 }
 
@@ -167,37 +179,83 @@ let unauthorizedHandler = () => {};
 export function onUnauthorized(fn) { unauthorizedHandler = fn; }
 
 /** JSON API call under /api/v1. Throws ApiError; 401 triggers the login view. */
-export async function api(path, { method = 'GET', body, signal } = {}) {
+export async function api(path, opts = {}) {
   if (mockEnabled()) {
-    const mocked = mockResponse(method, path);
+    const mocked = mockResponse(opts.method || 'GET', path);
     if (mocked !== undefined) return mocked;
   }
+  return request('/api/v1' + path, { ...opts, auth: !path.startsWith('/auth/') });
+}
+
+/**
+ * JSON request to any same-origin URL (the API, the storage API `/storage/...`) with the
+ * session cookie. Throws ApiError (with the `field` of a `400 {error, field}`); a 401
+ * triggers the login view unless `auth` is false. `headers` are extra request headers.
+ */
+export async function request(url, { method = 'GET', body, signal, headers = {}, auth = true } = {}) {
   let res;
   try {
-    res = await fetch('/api/v1' + path, {
+    res = await fetch(url, {
       method,
       signal,
       credentials: 'same-origin',
-      headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
+      headers: body !== undefined ? { 'Content-Type': 'application/json', ...headers } : headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   } catch (e) {
     if (e && e.name === 'AbortError') throw e;
     throw new ApiError(0, 'network error');
   }
-  if (res.status === 401 && !path.startsWith('/auth/')) {
+  if (res.status === 401 && auth) {
     unauthorizedHandler();
     throw new ApiError(401, 'unauthorized');
   }
   if (res.status === 204) return null;
   let data = null;
   if ((res.headers.get('content-type') || '').includes('json')) data = await res.json().catch(() => null);
-  if (!res.ok) throw new ApiError(res.status, (data && data.error) || res.statusText);
+  if (!res.ok) throw new ApiError(res.status, (data && data.error) || res.statusText, (data && data.field) || null);
   return data;
+}
+
+/** Run the 401 handler (session gone) from code that does its own requests (XHR uploads). */
+export function signalUnauthorized() { unauthorizedHandler(); }
+
+/** Label of a storage access level (read / write / admin). */
+export function accessName(level) {
+  if (level === 'read') return t('access.read');
+  if (level === 'write') return t('access.write');
+  if (level === 'admin') return t('access.admin');
+  return level || '—';
 }
 
 // Server error messages (English) → user-facing text in the UI language.
 const ERROR_TRANSLATIONS = [
+  // Accounts, keys, buckets and the storage API (phase 8)
+  [/the user is suspended/i, () => t('error.userSuspended')],
+  [/lacks the account scope/i, () => t('error.noAccountScope')],
+  [/access denied: this key needs (\w+) access to (.*)$/i, (m) => t('error.accessDenied', { access: accessName(m[1]), path: m[2] })],
+  [/storage quota exceeded/i, () => t('error.quotaExceeded')],
+  [/checksum mismatch/i, () => t('error.checksum')],
+  [/this username is already taken/i, () => t('error.usernameTaken')],
+  [/the username must be/i, () => t('error.invalidUsername')],
+  [/this bucket name is already taken/i, () => t('error.bucketNameTaken')],
+  [/the bucket name must be/i, () => t('error.invalidBucketName')],
+  [/bucket limit reached/i, () => t('error.bucketLimit')],
+  [/bucket not found/i, () => t('error.bucketNotFound')],
+  [/user not found/i, () => t('error.userNotFound')],
+  [/key not found/i, () => t('error.keyNotFound')],
+  [/the key is revoked/i, () => t('error.keyRevoked')],
+  [/file not found|directory not found|not a directory/i, () => t('error.fileNotFound')],
+  [/a directory exists at this path|this is a directory/i, () => t('error.isDirectory')],
+  [/a file exists at this path|parent of this path is a file|this is a file/i, () => t('error.isFile')],
+  [/this file has no encoding/i, () => t('error.noEncoding')],
+  [/storage key needs at least one permission/i, () => t('error.keyNeedsPermission')],
+  [/at least one scope is required/i, () => t('error.scopeRequired')],
+  [/expires_at must be in the future/i, () => t('error.expiryPast')],
+  [/invalid email address/i, () => t('error.invalidEmail')],
+  [/is not one of this user's buckets/i, () => t('error.permissionBucket')],
+  [/^prefix: /i, () => t('error.invalidPrefix')],
+  [/the bucket root always exists/i, () => t('error.bucketRoot')],
   [/video not found/i, () => t('error.vodNotFound')],
   [/video on demand is disabled/i, () => t('error.vodDisabled')],
   [/video on demand needs ffmpeg/i, () => t('error.vodNoFfmpeg')],
@@ -233,8 +291,13 @@ export function describeError(err) {
   if (err.status === 0) return t('error.network');
   if (err.status === 401) return t('error.sessionExpired');
   if (err.status === 501) return t('error.notImplemented');
-  for (const [re, text] of ERROR_TRANSLATIONS) if (re.test(err.message)) return text();
+  for (const [re, text] of ERROR_TRANSLATIONS) {
+    const m = re.exec(err.message);
+    if (m) return text(m);
+  }
+  if (err.field === 'path') return t('error.invalidPath');
   if (err.status === 413) return t('error.fileTooLarge');
+  if (err.status === 507) return t('error.quotaExceeded');
   if (err.status >= 500) return t('error.server', { status: err.status });
   return t('error.request', { status: err.status, message: err.message });
 }

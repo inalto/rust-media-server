@@ -1,7 +1,15 @@
-// rms dashboard — entry point: UI language, login, hash router, admin SSE (live
-// updates with reconnect/backoff and polling fallback), broadcast list, "new broadcast"
-// dialog and the settings page. The broadcast detail lives in detail.js, the video on
-// demand section (#/vod) in vod.js.
+// rms dashboard — entry point: UI language, login, role-aware shell, hash router, SSE
+// (live updates with reconnect/backoff and polling fallback), broadcast list, "new
+// broadcast" dialog and the settings page. The broadcast detail lives in detail.js, the
+// video on demand section (#/vod) in vod.js, the admin "Utenti" pages in users.js, the
+// user portal in portal.js and the bucket browser in browser.js.
+//
+// Roles (POST /auth/login and GET /auth/check answer {role, user?, scopes?, key_id?}):
+// `admin` (the admin token) gets the admin navigation (Dirette / Video on demand /
+// Utenti / Impostazioni) and the admin SSE /api/v1/events; `user` (an API key with the
+// `account` scope) gets the portal (I miei bucket / Chiavi API / Account) and the
+// account SSE /api/v1/account/events. A key without the `account` scope is refused
+// (logged out with a message): it is meant for the storage API only.
 //
 // Language: <html lang> (set by the server) at startup, then GET /api/v1/public/ui
 // before the login view, then GET /settings after login; the admin SSE `settings`
@@ -20,6 +28,10 @@ import {
 } from './core.js';
 import { mountDetail } from './detail.js';
 import { mountVod, vodSettingsPanel, vodSystemLine } from './vod.js';
+import { mountUsers, mountUserDetail } from './users.js';
+import { mountBuckets, mountKeys, mountAccount } from './portal.js';
+import { mountBrowser } from './browser.js';
+import { accountCtx } from './accounts.js';
 import { t, tn, setLanguage, getLanguage, onLanguageChange, translateDom } from './i18n.js';
 import {
   initTheme, getThemeChoice, getThemeOverride, getServerTheme, setServerTheme, setThemeOverride,
@@ -36,8 +48,13 @@ const app = document.getElementById('app');
 const topbar = document.getElementById('topbar');
 const connEl = document.getElementById('conn');
 const themeBtn = document.getElementById('theme-toggle');
+const brandEl = document.getElementById('brand');
+const whoamiEl = document.getElementById('whoami');
 let unmount = null;
 let authed = false;
+/** 'admin' | 'user' once logged in; `session` = the auth/check (or login) answer. */
+let role = null;
+let session = null;
 
 // ---------------------------------------------------------------------------
 // Theme toggle (top bar): system → light → dark, stored in this browser only
@@ -67,6 +84,8 @@ renderThemeToggle();
 
 function showLogin(message) {
   authed = false;
+  role = null;
+  session = null;
   stopLiveUpdates();
   if (unmount) { unmount(); unmount = null; }
   store.clear();
@@ -89,10 +108,11 @@ function showLogin(message) {
     if (!value) { err.textContent = t('login.emptyToken'); err.hidden = false; token.control.focus(); return; }
     submit.disabled = true;
     try {
-      await api('/auth/login', { method: 'POST', body: { token: value } });
-      await start();
+      const res = await api('/auth/login', { method: 'POST', body: { token: value } });
+      await start(res);
     } catch (ex) {
-      err.textContent = ex instanceof ApiError && ex.status === 401 ? t('login.invalidToken') : describeError(ex);
+      err.textContent = ex instanceof ApiError && ex.status === 401 ? t('login.invalidToken')
+        : ex instanceof ApiError && ex.status === 403 ? t('error.userSuspended') : describeError(ex);
       err.hidden = false;
       token.control.select();
     } finally { submit.disabled = false; }
@@ -102,26 +122,67 @@ function showLogin(message) {
       h('div', { class: 'brand big' }, icon('radio', 28), h('span', null, 'rms')),
       h('h1', null, t('login.title')),
       h('p', { class: 'muted' }, t('login.lead')),
-      form)));
+      form,
+      h('div', { class: 'login-help' },
+        h('p', null, icon('user', 16), h('span', null, t('login.helpAdmin'))),
+        h('p', null, icon('key', 16), h('span', null, t('login.helpKeys')))))));
   token.control.focus();
 }
 
 onUnauthorized(() => { if (authed) showLogin(t('error.sessionExpired')); });
 
-document.getElementById('logout').addEventListener('click', async () => {
-  try { await api('/auth/logout', { method: 'POST' }); } catch (_) { /* ignore */ }
-  showLogin();
-});
+document.getElementById('logout').addEventListener('click', logout);
 
-async function start() {
+/** Enter the panel after a login or a session check: `auth` = {role, user?, scopes?, key_id?}. */
+async function start(auth) {
+  if (!auth || !auth.role) auth = await api('/auth/check');
+  if (auth && auth.role === 'user') return startUser(auth);
   const [list, settings] = await Promise.all([api('/broadcasts'), api('/settings').catch(() => null)]);
   if (settings && settings.ui_theme) setServerTheme(settings.ui_theme);
   if (settings && settings.ui_language) setLanguage(settings.ui_language);
   authed = true;
+  role = 'admin';
+  session = auth || { role: 'admin' };
   store.replaceAll(list);
+  applyRole();
   topbar.hidden = false;
   startLiveUpdates();
   route();
+}
+
+/** User portal: only keys with the `account` scope may use the panel. */
+async function startUser(auth) {
+  if (!(auth.scopes || []).includes('account')) {
+    try { await api('/auth/logout', { method: 'POST' }); } catch (_) { /* ignore */ }
+    showLogin(t('login.noAccountScope'));
+    return;
+  }
+  authed = true;
+  role = 'user';
+  session = auth;
+  applyRole();
+  topbar.hidden = false;
+  startLiveUpdates();
+  route();
+}
+
+/** Navigation, brand link and "who am I" of the current role. */
+function applyRole() {
+  for (const a of topbar.querySelectorAll('[data-role]')) a.hidden = a.dataset.role !== role;
+  const user = role === 'user' && session && session.user;
+  brandEl.href = user ? '#/buckets' : '#/';
+  brandEl.setAttribute('aria-label', user ? t('nav.brandLabelUser') : t('nav.brandLabel'));
+  whoamiEl.hidden = !user;
+  if (user) {
+    setChildren(whoamiEl, icon('user', 16), h('span', { class: 'whoami-name' }, user.display_name || user.username));
+    whoamiEl.title = t('nav.whoami', { name: user.username });
+    whoamiEl.setAttribute('aria-label', t('nav.whoami', { name: user.username }));
+  }
+}
+
+async function logout() {
+  try { await api('/auth/logout', { method: 'POST' }); } catch (_) { /* ignore */ }
+  showLogin();
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +202,8 @@ function setConn(state) {
 }
 
 async function refreshList() {
+  // The portal's views reload their own data.
+  if (role === 'user') { bus.emit('resync'); return; }
   try { store.replaceAll(await api('/broadcasts')); } catch (_) { /* 401 handled globally */ }
 }
 
@@ -156,7 +219,8 @@ function connectSSE() {
   if (!authed) return;
   if (!('EventSource' in window)) { setConn('polling'); startPolling(); return; }
   setConn(everConnected ? 'polling' : 'connecting');
-  es = new EventSource('/api/v1/events');
+  // Admin: every event; user: the account stream (`vod`, `vod_deleted`, `heartbeat`).
+  es = new EventSource(role === 'user' ? '/api/v1/account/events' : '/api/v1/events');
   const parse = (ev) => { try { return JSON.parse(ev.data); } catch (_) { return null; } };
   es.addEventListener('open', () => {
     backoff = 1000;
@@ -194,7 +258,9 @@ function connectSSE() {
     setConn('polling');
     startPolling();
     // A 401 closes the stream for good: check the session before reconnecting.
-    try { await api('/auth/check'); } catch (e) { if (e instanceof ApiError && e.status === 401) { showLogin(t('error.sessionExpired')); return; } }
+    try { await api('/auth/check'); } catch (e) {
+      if (e instanceof ApiError && (e.status === 401 || e.status === 403)) { showLogin(e.status === 403 ? t('error.userSuspended') : t('error.sessionExpired')); return; }
+    }
     if (!authed) return;
     reconnectTimer = setTimeout(connectSSE, backoff);
     backoff = Math.min(backoff * 2, SSE_MAX_BACKOFF);
@@ -225,13 +291,66 @@ function setNav(active) {
   }
 }
 
+/** `#/a/b%20c/` → ['a', 'b c', ''] (segments of the hash path, decoded). */
+function hashSegments(hash) {
+  return hash.replace(/^#\/?/, '').split('?')[0].split('/').map((s) => { try { return decodeURIComponent(s); } catch (_) { return s; } });
+}
+
+/** Directory path of a browser hash: the segments after the bucket ("/a/b/"). */
+function dirOf(segs) {
+  const parts = segs.filter((s) => s !== '');
+  return parts.length ? `/${parts.join('/')}/` : '/';
+}
+
 function route() {
   if (!authed) return;
   if (unmount) { unmount(); unmount = null; }
   const hash = location.hash || '#/';
-  const m = hash.match(/^#\/b\/([^/?#]+)/);
   window.scrollTo(0, 0);
-  if (m) {
+  if (role === 'user') routeUser(hash);
+  else routeAdmin(hash);
+  app.focus({ preventScroll: true });
+}
+
+function routeUser(hash) {
+  const segs = hashSegments(hash);
+  const ctx = accountCtx({ currentKeyId: session && session.key_id });
+  if (segs[0] === 'buckets' && segs[1]) {
+    setNav('buckets');
+    unmount = mountBrowser(app, {
+      ctx, bucketName: segs[1], dir: dirOf(segs.slice(2)), baseHash: `#/buckets/${encodeURIComponent(segs[1])}`,
+      back: { href: '#/buckets', label: t('browser.backToBuckets') },
+    });
+  } else if (segs[0] === 'keys') {
+    setNav('keys');
+    unmount = mountKeys(app, { ctx, onRevokedSelf: () => showLogin(t('keys.revokedSelf')) });
+  } else if (segs[0] === 'account') {
+    setNav('account');
+    unmount = mountAccount(app, { ctx, onLogout: logout });
+  } else {
+    if (segs[0] !== 'buckets') history.replaceState(null, '', '#/buckets');
+    setNav('buckets');
+    unmount = mountBuckets(app, { ctx });
+  }
+}
+
+function routeAdmin(hash) {
+  const m = hash.match(/^#\/b\/([^/?#]+)/);
+  const segs = hashSegments(hash);
+  if (segs[0] === 'users' && segs[1] && segs[2] === 'buckets' && segs[3]) {
+    setNav('users');
+    unmount = mountBrowser(app, {
+      ctx: accountCtx({ userId: segs[1] }), bucketName: segs[3], dir: dirOf(segs.slice(4)),
+      baseHash: `#/users/${encodeURIComponent(segs[1])}/buckets/${encodeURIComponent(segs[3])}`,
+      back: { href: `#/users/${encodeURIComponent(segs[1])}`, label: t('browser.backToUser', { name: segs[1] }) },
+    });
+  } else if (segs[0] === 'users' && segs[1]) {
+    setNav('users');
+    unmount = mountUserDetail(app, segs[1], { navigate });
+  } else if (segs[0] === 'users') {
+    setNav('users');
+    unmount = mountUsers(app, { navigate });
+  } else if (m) {
     setNav('list');
     unmount = mountDetail(app, decodeURIComponent(m[1]), { navigate });
   } else if (hash.startsWith('#/settings')) {
@@ -241,10 +360,10 @@ function route() {
     setNav('vod');
     unmount = mountVod(app);
   } else {
+    if (segs[0]) history.replaceState(null, '', '#/');
     setNav('list');
     unmount = mountList(app);
   }
-  app.focus({ preventScroll: true });
 }
 
 window.addEventListener('hashchange', route);
@@ -736,6 +855,7 @@ onLanguageChange(() => {
   translateDom(document);
   renderThemeToggle();
   if (!authed) return;
+  applyRole();
   setConn(connEl.dataset.state);
   const y = window.scrollY;
   route();
@@ -749,9 +869,10 @@ onLanguageChange(() => {
   try {
     const [, check] = await Promise.allSettled([loadPublicLanguage(), api('/auth/check')]);
     if (check.status === 'rejected') throw check.reason;
-    await start();
+    await start(check.value);
   } catch (e) {
     if (e instanceof ApiError && e.status === 401) showLogin();
+    else if (e instanceof ApiError && e.status === 403) showLogin(t('error.userSuspended'));
     else {
       setChildren(app, h('div', { class: 'empty' }, icon('alert', 32), h('h1', null, t('boot.unreachable')),
         h('p', { class: 'muted' }, describeError(e)),
