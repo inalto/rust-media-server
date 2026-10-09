@@ -25,7 +25,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::http::StatusCode;
@@ -46,6 +46,10 @@ pub use whep::WhepError;
 
 /// How long an offer waits for the publisher (H.264 sequence header) of a stream.
 const READY_WAIT: Duration = Duration::from_secs(5);
+/// Closed sessions are remembered this long so that a client's late `DELETE` (after
+/// the server closed the session: stream ended, WebRTC disabled) still gets `200`.
+const CLOSED_SESSION_TTL: Duration = Duration::from_secs(120);
+const MAX_CLOSED_SESSIONS: usize = 4096;
 
 /// `GET /system` → `webrtc`.
 #[derive(Debug, Clone, Serialize)]
@@ -89,6 +93,8 @@ pub struct WebRtcManager {
     error: Mutex<Option<String>>,
     publishers: Mutex<HashMap<String, Arc<WhepPublisher>>>,
     sessions: Mutex<HashMap<String, SessionEntry>>,
+    /// Recently closed sessions: id → (broadcast name, closed at).
+    closed: Mutex<HashMap<String, (String, Instant)>>,
     next_id: AtomicU64,
     ffmpeg_warned: AtomicBool,
 }
@@ -105,6 +111,7 @@ impl WebRtcManager {
             error: Mutex::new(None),
             publishers: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
+            closed: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             ffmpeg_warned: AtomicBool::new(false),
         })
@@ -208,15 +215,38 @@ impl WebRtcManager {
         n
     }
 
-    /// `DELETE /whep/{name}/{id}`: close a session. False if unknown.
+    /// `DELETE /whep/{name}/{id}`: close a session. False if unknown (sessions closed
+    /// by the server in the last [`CLOSED_SESSION_TTL`] count as known).
     pub fn delete_session(&self, name: &str, id: &str) -> bool {
-        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        match sessions.get(id) {
-            Some(s) if s.name == name => {
+        {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = sessions.get(id) {
+                if s.name != name {
+                    return false;
+                }
                 s.cancel.cancel();
-                true
+                return true;
             }
-            _ => false,
+        }
+        let closed = self.closed.lock().unwrap_or_else(|e| e.into_inner());
+        closed
+            .get(id)
+            .is_some_and(|(n, at)| n == name && at.elapsed() < CLOSED_SESSION_TTL)
+    }
+
+    /// Forget a finished session, keeping a short-lived tombstone for late DELETEs.
+    fn session_finished(&self, id: &str) {
+        let entry = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        if let Some(entry) = entry {
+            let mut closed = self.closed.lock().unwrap_or_else(|e| e.into_inner());
+            closed.retain(|_, (_, at)| at.elapsed() < CLOSED_SESSION_TTL);
+            if closed.len() < MAX_CLOSED_SESSIONS {
+                closed.insert(id.to_string(), (entry.name, Instant::now()));
+            }
         }
     }
 
@@ -487,10 +517,7 @@ impl WebRtcManager {
         tracing::debug!(task = "webrtc", broadcast = %name, session = %id, audio = task.negotiated.audio.is_some(), "WHEP session created");
         tokio::spawn(async move {
             session::run(task).await;
-            this.sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&session_id);
+            this.session_finished(&session_id);
         });
         Ok((id, answer))
     }

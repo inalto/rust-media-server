@@ -26,6 +26,7 @@
   var ORDER = ['webrtc', 'flv', 'hls', 'dash'];
   var ICE_TIMEOUT_MS = 6000;
   var FIRST_FRAME_TIMEOUT_MS = 8000;
+  var WEBRTC_NO_MEDIA_S = 4;
   var RETRY_MS = 5000;
   var POLL_MS = 5000;
   var START_TIMEOUT_MS = 15000;
@@ -386,6 +387,8 @@
     var latency = NaN;
     var lastStats = null;
     var statsTimer = null;
+    var lastPackets = -1;
+    var silentSeconds = 0;
     pc.addTransceiver('video', { direction: 'recvonly' });
     pc.addTransceiver('audio', { direction: 'recvonly' });
     pc.ontrack = function (e) {
@@ -410,16 +413,27 @@
       var st = pc.connectionState;
       if (st === 'failed' || st === 'closed') fatal(gen, 'webrtc: connection ' + st);
     };
-    // Estimated delay: jitter buffer (last second) + half the round-trip time.
+    // Estimated delay: jitter buffer (last second) + half the round-trip time. Also
+    // detects a session the server closed (stream ended, WebRTC disabled): a live
+    // stream never stops sending video packets for seconds.
     function pollStats() {
       pc.getStats().then(function (report) {
-        var jb = null, rtt = 0;
+        var jb = null, rtt = 0, packets = 0;
         report.forEach(function (r) {
-          if (r.type === 'inbound-rtp' && r.kind === 'video') jb = { delay: r.jitterBufferDelay || 0, count: r.jitterBufferEmittedCount || 0 };
+          if (r.type === 'inbound-rtp' && r.kind === 'video') {
+            jb = { delay: r.jitterBufferDelay || 0, count: r.jitterBufferEmittedCount || 0 };
+            packets = r.packetsReceived || 0;
+          }
           if (r.type === 'candidate-pair' && r.nominated && typeof r.currentRoundTripTime === 'number') rtt = r.currentRoundTripTime;
         });
         if (jb && lastStats && jb.count > lastStats.count) latency = (jb.delay - lastStats.delay) / (jb.count - lastStats.count) + rtt / 2;
         if (jb) lastStats = jb;
+        if (packets > 0 && packets === lastPackets) {
+          if (++silentSeconds >= WEBRTC_NO_MEDIA_S) fatal(gen, 'webrtc: no media for ' + WEBRTC_NO_MEDIA_S + ' s');
+        } else {
+          silentSeconds = 0;
+        }
+        lastPackets = packets;
       }, function () {});
     }
     function teardown() {
