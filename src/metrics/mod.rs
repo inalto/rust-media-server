@@ -176,6 +176,8 @@ pub struct ViewerTracker {
     /// Writes dropped because the queue was full (database far behind).
     db_dropped: AtomicU64,
     session_timeout: Duration,
+    /// `metrics.sample_interval_secs` (bucket used to add up the samples of several nodes).
+    sample_interval_secs: u64,
 }
 
 /// Guard for a connection-oriented viewer session; dropping it closes the session.
@@ -219,7 +221,13 @@ impl ViewerTracker {
             db_queue: Mutex::new(None),
             db_dropped: AtomicU64::new(0),
             session_timeout: Duration::from_secs(config.metrics.session_timeout_secs.max(1)),
+            sample_interval_secs: config.metrics.sample_interval_secs.max(1),
         })
+    }
+
+    /// `metrics.sample_interval_secs` (the samplers of all nodes use the same slots).
+    pub fn sample_interval_secs(&self) -> u64 {
+        self.sample_interval_secs
     }
 
     /// Spawn the reaper task expiring idle HLS/DASH sessions (every 5 s).

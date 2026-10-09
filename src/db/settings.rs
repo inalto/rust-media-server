@@ -4,7 +4,9 @@ use std::collections::HashMap;
 
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
+use sqlx_core::row::Row;
 
+use super::pg::q;
 use super::{Db, DbResult};
 
 /// Relative path (under `data/waiting/`) of the global default waiting video.
@@ -126,6 +128,14 @@ pub async fn ui_prefs(db: &Db) -> DbResult<(UiLanguage, UiTheme)> {
 }
 
 pub async fn get(db: &Db, key: &str) -> DbResult<Option<String>> {
+    if let Some(pool) = db.pg() {
+        return Ok(q("SELECT value FROM settings WHERE key = $1")
+            .bind(key.to_string())
+            .fetch_optional(pool)
+            .await?
+            .map(|r| r.try_get::<String, _>(0))
+            .transpose()?);
+    }
     let key = key.to_string();
     db.call(move |c| {
         Ok(
@@ -138,29 +148,65 @@ pub async fn get(db: &Db, key: &str) -> DbResult<Option<String>> {
     .await
 }
 
+/// Insert or replace a setting. Clears the broadcasts cache (views derived from the
+/// broadcasts may depend on the global defaults).
 pub async fn set(db: &Db, key: &str, value: &str) -> DbResult<()> {
-    let (key, value) = (key.to_string(), value.to_string());
-    db.call(move |c| {
-        c.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
-    })
-    .await
+    let r = match db.pg() {
+        Some(pool) => q("INSERT INTO settings (key, value) VALUES ($1, $2) \
+                ON CONFLICT (key) DO UPDATE SET value = excluded.value")
+        .bind(key.to_string())
+        .bind(value.to_string())
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(Into::into),
+        None => {
+            let (key, value) = (key.to_string(), value.to_string());
+            db.call(move |c| {
+                c.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![key, value],
+                )?;
+                Ok(())
+            })
+            .await
+        }
+    };
+    db.broadcast_cache().invalidate_all();
+    r
 }
 
 pub async fn delete(db: &Db, key: &str) -> DbResult<()> {
-    let key = key.to_string();
-    db.call(move |c| {
-        c.execute("DELETE FROM settings WHERE key = ?1", [&key])?;
-        Ok(())
-    })
-    .await
+    let r = match db.pg() {
+        Some(pool) => q("DELETE FROM settings WHERE key = $1")
+            .bind(key.to_string())
+            .execute(pool)
+            .await
+            .map(|_| ())
+            .map_err(Into::into),
+        None => {
+            let key = key.to_string();
+            db.call(move |c| {
+                c.execute("DELETE FROM settings WHERE key = ?1", [&key])?;
+                Ok(())
+            })
+            .await
+        }
+    };
+    db.broadcast_cache().invalidate_all();
+    r
 }
 
 pub async fn all(db: &Db) -> DbResult<HashMap<String, String>> {
+    if let Some(pool) = db.pg() {
+        return q("SELECT key, value FROM settings")
+            .fetch_all(pool)
+            .await?
+            .iter()
+            .map(|r| Ok((r.try_get::<String, _>(0)?, r.try_get::<String, _>(1)?)))
+            .collect();
+    }
     db.call(|c| {
         let mut st = c.prepare("SELECT key, value FROM settings")?;
         let map = st
@@ -175,9 +221,7 @@ pub async fn all(db: &Db) -> DbResult<HashMap<String, String>> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn get_set_delete() {
-        let db = Db::open_in_memory().unwrap();
+    async fn get_set_delete_body(db: Db) {
         assert_eq!(get(&db, DEFAULT_WAITING_TEXT).await.unwrap(), None);
         set(&db, DEFAULT_WAITING_TEXT, "a").await.unwrap();
         set(&db, DEFAULT_WAITING_TEXT, "b").await.unwrap();
@@ -189,10 +233,9 @@ mod tests {
         delete(&db, DEFAULT_WAITING_TEXT).await.unwrap();
         assert_eq!(get(&db, DEFAULT_WAITING_TEXT).await.unwrap(), None);
     }
+    crate::db::testkit::dual_db_test!(get_set_delete, get_set_delete_body);
 
-    #[tokio::test]
-    async fn ui_language_default_and_parse() {
-        let db = Db::open_in_memory().unwrap();
+    async fn ui_language_default_and_parse_body(db: Db) {
         assert_eq!(ui_language(&db).await.unwrap(), UiLanguage::It);
         set(&db, UI_LANGUAGE, "en").await.unwrap();
         assert_eq!(ui_language(&db).await.unwrap(), UiLanguage::En);
@@ -213,10 +256,12 @@ mod tests {
         ));
         assert!(!UiLanguage::is_builtin_waiting_text("Torniamo presto"));
     }
+    crate::db::testkit::dual_db_test!(
+        ui_language_default_and_parse,
+        ui_language_default_and_parse_body
+    );
 
-    #[tokio::test]
-    async fn ui_theme_default_and_parse() {
-        let db = Db::open_in_memory().unwrap();
+    async fn ui_theme_default_and_parse_body(db: Db) {
         assert_eq!(
             ui_prefs(&db).await.unwrap(),
             (UiLanguage::It, UiTheme::System)
@@ -241,4 +286,5 @@ mod tests {
         assert_eq!(UiTheme::parse("Light"), None);
         assert_eq!(UiTheme::parse(""), None);
     }
+    crate::db::testkit::dual_db_test!(ui_theme_default_and_parse, ui_theme_default_and_parse_body);
 }

@@ -188,8 +188,8 @@ pub struct Peak {
 ///
 /// `current` and `live_since` describe "now"; `peak`, `sessions_total`,
 /// `avg_watch_secs` and `bytes_in` cover `[from, to)`:
-/// - `peak`: highest sampled total (the live count is included when "now" is in the
-///   range), `null` when there is no sample;
+/// - `peak`: highest sampled total (summed over the nodes per sampling slot; the live
+///   count is included when "now" is in the range), `null` when there is no sample;
 /// - `sessions_total`: viewer sessions overlapping the range (all protocols);
 /// - `avg_watch_secs`: average full duration of those sessions (open ones up to now);
 /// - `bytes_in`: bytes received in the live periods overlapping the range (the current
@@ -243,7 +243,7 @@ pub async fn summary(
     let now = Utc::now();
     let current = tracker.counts(&broadcast.name);
     let stream = hub.get(&broadcast.name);
-    let sampled = repo::peak(db, &broadcast.id, from, to).await?;
+    let sampled = repo::peak(db, &broadcast.id, from, to, tracker.sample_interval_secs()).await?;
     let sessions_total = repo::sessions_total(db, &broadcast.id, from, to).await?;
     let avg = repo::avg_watch_secs(db, &broadcast.id, from, to, now).await?;
     let mut bytes_in = repo::stream_bytes_in(db, &broadcast.id, from, to).await?;

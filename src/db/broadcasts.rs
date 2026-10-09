@@ -279,26 +279,54 @@ pub fn update_sync(c: &Connection, name: &str, p: &BroadcastPatch) -> DbResult<O
     )
 }
 
-// ---- async API ----
+// ---- async API (dispatch on the backend; lookups go through the cache) ----
 
 pub async fn list(db: &Db) -> DbResult<Vec<Broadcast>> {
+    if let Some(pool) = db.pg() {
+        return pg::list(pool).await;
+    }
     db.call(|c| list_sync(c)).await
 }
 
+/// Lookup by name (cached, see `db::cache`).
 pub async fn find_by_name(db: &Db, name: &str) -> DbResult<Option<Broadcast>> {
-    let name = name.to_string();
-    db.call(move |c| find_by_name_sync(c, &name)).await
+    let cache = db.broadcast_cache();
+    if let Some(b) = cache.get_by_name(name) {
+        return Ok(Some(b));
+    }
+    let generation = cache.generation();
+    let found = find_uncached(db, "name", name).await?;
+    if let Some(b) = &found {
+        cache.insert(generation, b);
+    }
+    Ok(found)
 }
 
-/// Lookup by secret stream key (RTMP ingest auth).
+/// Lookup by secret stream key (RTMP ingest auth; cached, see `db::cache`).
 pub async fn find_by_key(db: &Db, stream_key: &str) -> DbResult<Option<Broadcast>> {
-    let key = stream_key.to_string();
-    db.call(move |c| query_one(c, "stream_key", &key)).await
+    let cache = db.broadcast_cache();
+    if let Some(b) = cache.get_by_key(stream_key) {
+        return Ok(Some(b));
+    }
+    let generation = cache.generation();
+    let found = find_uncached(db, "stream_key", stream_key).await?;
+    if let Some(b) = &found {
+        cache.insert(generation, b);
+    }
+    Ok(found)
 }
 
 pub async fn find_by_id(db: &Db, id: &str) -> DbResult<Option<Broadcast>> {
-    let id = id.to_string();
-    db.call(move |c| query_one(c, "id", &id)).await
+    find_uncached(db, "id", id).await
+}
+
+/// `column` is one of the constants `name` / `stream_key` / `id` (never request data).
+async fn find_uncached(db: &Db, column: &'static str, value: &str) -> DbResult<Option<Broadcast>> {
+    if let Some(pool) = db.pg() {
+        return pg::find(pool, column, value).await;
+    }
+    let value = value.to_string();
+    db.call(move |c| query_one(c, column, &value)).await
 }
 
 pub async fn name_exists(db: &Db, name: &str) -> DbResult<bool> {
@@ -308,40 +336,72 @@ pub async fn name_exists(db: &Db, name: &str) -> DbResult<bool> {
 /// Insert a new broadcast with a fresh id and stream key. A duplicate name yields a
 /// unique-violation [`super::DbError`] (HTTP 409).
 pub async fn create(db: &Db, new: NewBroadcast) -> DbResult<Broadcast> {
-    db.call(move |c| insert_sync(c, &new)).await
+    let name = new.name.clone();
+    let r = match db.pg() {
+        Some(pool) => pg::insert(pool, &new).await,
+        None => db.call(move |c| insert_sync(c, &new)).await,
+    };
+    db.broadcast_cache().invalidate(&name);
+    r
 }
 
 pub async fn update(db: &Db, name: &str, patch: BroadcastPatch) -> DbResult<Option<Broadcast>> {
-    let name = name.to_string();
-    db.call(move |c| update_sync(c, &name, &patch)).await
+    let r = match db.pg() {
+        Some(pool) => pg::update(pool, name, &patch).await,
+        None => {
+            let name = name.to_string();
+            db.call(move |c| update_sync(c, &name, &patch)).await
+        }
+    };
+    db.broadcast_cache().invalidate(name);
+    r
 }
 
 /// Delete and return the deleted row (so callers can clean up files).
 pub async fn delete(db: &Db, name: &str) -> DbResult<Option<Broadcast>> {
-    let name = name.to_string();
-    db.call(move |c| {
-        let Some(b) = find_by_name_sync(c, &name)? else {
-            return Ok(None);
-        };
-        c.execute("DELETE FROM broadcasts WHERE id = ?1", [&b.id])?;
-        Ok(Some(b))
-    })
-    .await
+    let r = match db.pg() {
+        Some(pool) => pg::delete(pool, name).await,
+        None => {
+            let name = name.to_string();
+            db.call(move |c| {
+                let Some(b) = find_by_name_sync(c, &name)? else {
+                    return Ok(None);
+                };
+                c.execute("DELETE FROM broadcasts WHERE id = ?1", [&b.id])?;
+                Ok(Some(b))
+            })
+            .await
+        }
+    };
+    db.broadcast_cache().invalidate(name);
+    r
 }
 
 pub async fn regenerate_key(db: &Db, name: &str) -> DbResult<Option<Broadcast>> {
-    let name = name.to_string();
-    db.call(move |c| {
-        let key = generate_stream_key();
-        update_and_get(c, &name, "stream_key = ?1", &[&key])
-    })
-    .await
+    let key = generate_stream_key();
+    let r = match db.pg() {
+        Some(pool) => pg::set_column(pool, name, "stream_key", key).await,
+        None => {
+            let name = name.to_string();
+            db.call(move |c| update_and_get(c, &name, "stream_key = ?1", &[&key]))
+                .await
+        }
+    };
+    db.broadcast_cache().invalidate(name);
+    r
 }
 
 pub async fn set_paused(db: &Db, name: &str, paused: bool) -> DbResult<Option<Broadcast>> {
-    let name = name.to_string();
-    db.call(move |c| update_and_get(c, &name, "paused = ?1", &[&paused]))
-        .await
+    let r = match db.pg() {
+        Some(pool) => pg::set_column(pool, name, "paused", paused).await,
+        None => {
+            let name = name.to_string();
+            db.call(move |c| update_and_get(c, &name, "paused = ?1", &[&paused]))
+                .await
+        }
+    };
+    db.broadcast_cache().invalidate(name);
+    r
 }
 
 /// Set (or clear with `None`) the waiting video path, relative to `data/waiting/`.
@@ -350,9 +410,167 @@ pub async fn set_waiting_video(
     name: &str,
     path: Option<String>,
 ) -> DbResult<Option<Broadcast>> {
-    let name = name.to_string();
-    db.call(move |c| update_and_get(c, &name, "waiting_video = ?1", &[&path]))
-        .await
+    let r = match db.pg() {
+        Some(pool) => pg::set_column(pool, name, "waiting_video", path).await,
+        None => {
+            let name = name.to_string();
+            db.call(move |c| update_and_get(c, &name, "waiting_video = ?1", &[&path]))
+                .await
+        }
+    };
+    db.broadcast_cache().invalidate(name);
+    r
+}
+
+/// PostgreSQL statements.
+mod pg {
+    use chrono::Utc;
+    use sqlx_core::row::Row;
+    use sqlx_postgres::PgRow;
+
+    use super::{Broadcast, BroadcastPatch, COLUMNS, NewBroadcast, generate_stream_key};
+    use crate::db::pg::q_dyn;
+    use crate::db::{DbResult, PgPool, fmt_ts, now_ts, parse_ts};
+
+    fn from_row(r: &PgRow) -> DbResult<Broadcast> {
+        Ok(Broadcast {
+            id: r.try_get(0)?,
+            name: r.try_get(1)?,
+            title: r.try_get(2)?,
+            description: r.try_get(3)?,
+            stream_key: r.try_get(4)?,
+            record: r.try_get(5)?,
+            enable_flv: r.try_get(6)?,
+            enable_hls: r.try_get(7)?,
+            enable_dash: r.try_get(8)?,
+            paused: r.try_get(9)?,
+            waiting_video: r.try_get(10)?,
+            waiting_text: r.try_get(11)?,
+            created_at: parse_ts(&r.try_get::<String, _>(12)?),
+            updated_at: parse_ts(&r.try_get::<String, _>(13)?),
+            enable_webrtc: r.try_get(14)?,
+        })
+    }
+
+    pub async fn list(pool: &PgPool) -> DbResult<Vec<Broadcast>> {
+        q_dyn(format!(
+            "SELECT {COLUMNS} FROM broadcasts ORDER BY created_at DESC, name"
+        ))
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(from_row)
+        .collect()
+    }
+
+    /// `column`: `name` | `stream_key` | `id`.
+    pub async fn find(pool: &PgPool, column: &str, value: &str) -> DbResult<Option<Broadcast>> {
+        q_dyn(format!(
+            "SELECT {COLUMNS} FROM broadcasts WHERE {column} = $1"
+        ))
+        .bind(value.to_string())
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(from_row)
+        .transpose()
+    }
+
+    pub async fn insert(pool: &PgPool, new: &NewBroadcast) -> DbResult<Broadcast> {
+        let ts = fmt_ts(&Utc::now());
+        let row = q_dyn(format!(
+            "INSERT INTO broadcasts (id, name, title, description, stream_key, record, enable_flv, \
+             enable_hls, enable_dash, paused, waiting_video, waiting_text, created_at, updated_at, \
+             enable_webrtc) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, NULL, $10, $11, $11, $12) \
+             RETURNING {COLUMNS}"
+        ))
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(new.name.clone())
+        .bind(new.title.clone())
+        .bind(new.description.clone())
+        .bind(generate_stream_key())
+        .bind(new.record)
+        .bind(new.enable_flv)
+        .bind(new.enable_hls)
+        .bind(new.enable_dash)
+        .bind(new.waiting_text.clone())
+        .bind(ts)
+        .bind(new.enable_webrtc)
+        .fetch_one(pool)
+        .await?;
+        from_row(&row)
+    }
+
+    pub async fn update(
+        pool: &PgPool,
+        name: &str,
+        p: &BroadcastPatch,
+    ) -> DbResult<Option<Broadcast>> {
+        // COALESCE keeps the current value for the fields absent from the patch.
+        q_dyn(format!(
+            "UPDATE broadcasts SET title = COALESCE($2, title), \
+             description = COALESCE($3, description), record = COALESCE($4, record), \
+             enable_flv = COALESCE($5, enable_flv), enable_hls = COALESCE($6, enable_hls), \
+             enable_dash = COALESCE($7, enable_dash), waiting_text = COALESCE($8, waiting_text), \
+             enable_webrtc = COALESCE($9, enable_webrtc), updated_at = $10 \
+             WHERE name = $1 RETURNING {COLUMNS}"
+        ))
+        .bind(name.to_string())
+        .bind(p.title.clone())
+        .bind(p.description.clone())
+        .bind(p.record)
+        .bind(p.enable_flv)
+        .bind(p.enable_hls)
+        .bind(p.enable_dash)
+        .bind(p.waiting_text.clone())
+        .bind(p.enable_webrtc)
+        .bind(now_ts())
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(from_row)
+        .transpose()
+    }
+
+    /// `UPDATE broadcasts SET <column> = $2, updated_at = now WHERE name = $1`.
+    /// `column` is a constant of this module's callers.
+    pub async fn set_column<T>(
+        pool: &PgPool,
+        name: &str,
+        column: &'static str,
+        value: T,
+    ) -> DbResult<Option<Broadcast>>
+    where
+        T: for<'q> sqlx_core::encode::Encode<'q, sqlx_postgres::Postgres>
+            + sqlx_core::types::Type<sqlx_postgres::Postgres>
+            + Send
+            + 'static,
+    {
+        q_dyn(format!(
+            "UPDATE broadcasts SET {column} = $2, updated_at = $3 WHERE name = $1 RETURNING {COLUMNS}"
+        ))
+        .bind(name.to_string())
+        .bind(value)
+        .bind(now_ts())
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(from_row)
+        .transpose()
+    }
+
+    pub async fn delete(pool: &PgPool, name: &str) -> DbResult<Option<Broadcast>> {
+        q_dyn(format!(
+            "DELETE FROM broadcasts WHERE name = $1 RETURNING {COLUMNS}"
+        ))
+        .bind(name.to_string())
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(from_row)
+        .transpose()
+    }
 }
 
 #[cfg(test)]
@@ -393,9 +611,7 @@ mod tests {
         assert_ne!(k, generate_stream_key());
     }
 
-    #[tokio::test]
-    async fn crud_roundtrip() {
-        let db = Db::open_in_memory().unwrap();
+    async fn crud_roundtrip_body(db: Db) {
         let b = create(&db, NewBroadcast::new("show", "Show"))
             .await
             .unwrap();
@@ -451,8 +667,53 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // Lookups by id bypass the cache.
+        assert_eq!(find_by_id(&db, &b.id).await.unwrap().unwrap().name, "show");
+        assert!(name_exists(&db, "show").await.unwrap());
+        // Patch keeps the fields that are not part of it.
+        let kept = update(
+            &db,
+            "show",
+            BroadcastPatch {
+                description: Some("d".into()),
+                record: Some(true),
+                waiting_text: Some("w".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (
+                kept.title.as_str(),
+                kept.description.as_str(),
+                kept.waiting_text.as_str()
+            ),
+            ("New", "d", "w")
+        );
+        assert!(kept.record && kept.paused && !kept.enable_dash && kept.enable_flv);
+        let cleared = set_waiting_video(&db, "show", None).await.unwrap().unwrap();
+        assert!(cleared.waiting_video.is_none());
+        assert!(set_paused(&db, "missing", true).await.unwrap().is_none());
+        assert!(regenerate_key(&db, "missing").await.unwrap().is_none());
+
+        // Ordering: newest first.
+        let second = create(&db, NewBroadcast::new("zz", "Zz")).await.unwrap();
+        let names: Vec<String> = list(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        if second.created_at > b.created_at {
+            assert_eq!(names, ["zz", "show"]);
+        }
+        assert!(delete(&db, "zz").await.unwrap().is_some());
+
         assert!(delete(&db, "show").await.unwrap().is_some());
         assert!(find_by_name(&db, "show").await.unwrap().is_none());
         assert!(delete(&db, "show").await.unwrap().is_none());
     }
+    crate::db::testkit::dual_db_test!(crud_roundtrip, crud_roundtrip_body);
 }
