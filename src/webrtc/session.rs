@@ -276,9 +276,13 @@ pub fn negotiate(offer: &str, o: &NegotiateOptions<'_>) -> Result<Negotiated, Ne
     pc.add_local_candidate(RTCIceCandidateInit::default())
         .map_err(internal)?;
 
-    let answer = pc
-        .create_answer(None)
-        .map_err(|e| NegotiateError::BadOffer(e.to_string()))?;
+    let answer = pc.create_answer(None).map_err(|e| match e {
+        // Our sender has no codec in common with the offer (no usable H.264).
+        rtc::shared::error::Error::ErrSenderWithNoCodecs => NegotiateError::Unsupported(
+            "the offer has no H.264 video with packetization-mode=1".into(),
+        ),
+        e => NegotiateError::BadOffer(e.to_string()),
+    })?;
     pc.set_local_description(now, answer).map_err(internal)?;
     let answer = pc
         .local_description()
@@ -581,4 +585,202 @@ pub async fn run(t: SessionTask) -> EndReason {
     drop(d.viewer.take());
     drop(slot);
     reason
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use rtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
+
+    /// A browser-like offerer: default codecs, recvonly video (+ audio).
+    fn client_offer(video_codecs: &[(&str, u8, &str)], audio: bool) -> (RTCPeerConnection, String) {
+        let mut me = MediaEngine::default();
+        for (mime, pt, fmtp) in video_codecs {
+            me.register_codec(
+                RTCRtpCodecParameters {
+                    rtp_codec: RTCRtpCodec {
+                        mime_type: (*mime).into(),
+                        clock_rate: 90_000,
+                        channels: 0,
+                        sdp_fmtp_line: (*fmtp).into(),
+                        rtcp_feedback: vec![],
+                    },
+                    payload_type: *pt,
+                },
+                RtpCodecKind::Video,
+            )
+            .unwrap();
+        }
+        me.register_codec(
+            RTCRtpCodecParameters {
+                rtp_codec: RTCRtpCodec {
+                    mime_type: MIME_TYPE_OPUS.into(),
+                    clock_rate: 48_000,
+                    channels: 2,
+                    sdp_fmtp_line: "minptime=10;useinbandfec=1".into(),
+                    rtcp_feedback: vec![],
+                },
+                payload_type: 111,
+            },
+            RtpCodecKind::Audio,
+        )
+        .unwrap();
+        let mut pc = RTCPeerConnectionBuilder::new()
+            .with_media_engine(me)
+            .build(Instant::now())
+            .unwrap();
+        let recvonly = || {
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                streams: vec![],
+                send_encodings: vec![],
+            })
+        };
+        pc.add_transceiver_from_kind(RtpCodecKind::Video, recvonly())
+            .unwrap();
+        if audio {
+            pc.add_transceiver_from_kind(RtpCodecKind::Audio, recvonly())
+                .unwrap();
+        }
+        let offer = pc.create_offer(None).unwrap();
+        pc.set_local_description(Instant::now(), offer.clone())
+            .unwrap();
+        (pc, offer.sdp)
+    }
+
+    fn options<'a>(candidates: &'a [SocketAddr], audio: bool) -> NegotiateOptions<'a> {
+        NegotiateOptions {
+            ice_lite: true,
+            ufrag: "rmsUfrag0123",
+            pwd: "rmsPassword0123456789abcdef",
+            candidates,
+            audio,
+            profile: Some(VideoProfile {
+                profile_idc: 0x64,
+                constraints: 0,
+                level_idc: 0x1f,
+            }),
+            stream_id: "rms-test",
+        }
+    }
+
+    const H264_CB: (&str, u8, &str) = (
+        MIME_TYPE_H264,
+        109,
+        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+    );
+    const H264_HIGH: (&str, u8, &str) = (
+        MIME_TYPE_H264,
+        112,
+        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64001f",
+    );
+
+    #[test]
+    fn negotiates_a_browser_like_offer() {
+        let (mut client, offer) = client_offer(&[H264_CB, H264_HIGH], true);
+        assert!(crate::webrtc::whep::validate_offer(offer.as_bytes()).is_ok());
+        let cands: Vec<SocketAddr> = vec!["203.0.113.7:8443".parse().unwrap()];
+        let n = negotiate(&offer, &options(&cands, true)).unwrap();
+        for needle in [
+            "a=ice-lite",
+            "a=ice-ufrag:rmsUfrag0123",
+            "203.0.113.7 8443 typ host",
+            "a=end-of-candidates",
+            "a=sendonly",
+            "H264/90000",
+            "opus/48000/2",
+            "a=msid:rms-test",
+        ] {
+            assert!(
+                n.answer.contains(needle),
+                "answer lacks {needle}:\n{}",
+                n.answer
+            );
+        }
+        // The stream is High profile and the offer has it: its payload type is used.
+        assert_eq!(n.video.payload_type, 112);
+        assert_eq!(n.audio.map(|a| a.payload_type), Some(111));
+        assert_ne!(n.video.ssrc, n.audio.unwrap().ssrc);
+        client
+            .set_remote_description(
+                Instant::now(),
+                RTCSessionDescription::answer(n.answer).unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn video_only_when_audio_is_unavailable() {
+        let (_client, offer) = client_offer(&[H264_CB], true);
+        let cands: Vec<SocketAddr> = vec!["203.0.113.7:8443".parse().unwrap()];
+        let n = negotiate(&offer, &options(&cands, false)).unwrap();
+        assert!(n.audio.is_none());
+        assert_eq!(n.video.payload_type, 109, "Constrained Baseline fallback");
+        let audio_section = n.answer.split("m=audio").nth(1).unwrap_or_default();
+        assert!(
+            audio_section.starts_with(" 0 "),
+            "audio rejected:\n{}",
+            n.answer
+        );
+    }
+
+    #[test]
+    fn offers_without_h264_are_unsupported() {
+        let (_client, offer) = client_offer(&[("video/VP8", 96, "")], false);
+        let cands: Vec<SocketAddr> = vec!["127.0.0.1:8443".parse().unwrap()];
+        let r = negotiate(&offer, &options(&cands, false));
+        assert!(
+            matches!(r, Err(NegotiateError::Unsupported(_))),
+            "{:?}",
+            r.as_ref().map(|n| n.answer.clone()).err()
+        );
+        // H.264 offered only with packetization-mode=0 (no FU-A): unusable too.
+        let (_client, offer) = client_offer(
+            &[(
+                MIME_TYPE_H264,
+                127,
+                "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f",
+            )],
+            false,
+        );
+        assert!(matches!(
+            negotiate(&offer, &options(&cands, false)),
+            Err(NegotiateError::Unsupported(_))
+        ));
+        assert!(matches!(
+            negotiate("v=0\r\ngarbage", &options(&cands, false)),
+            Err(NegotiateError::BadOffer(_))
+        ));
+    }
+
+    #[test]
+    fn packets_are_stamped_per_session() {
+        let mut s = SenderInfo {
+            id: RTCRtpSenderId::default(),
+            ssrc: 0xdead_beef,
+            payload_type: 109,
+            seq: u16::MAX,
+        };
+        let shared = rtp::Packet {
+            header: rtp::header::Header {
+                version: 2,
+                marker: true,
+                payload_type: 0,
+                sequence_number: 1234,
+                timestamp: 777,
+                ssrc: 0,
+                ..Default::default()
+            },
+            payload: Bytes::from_static(&[0x65, 1, 2]),
+        };
+        let a = s.stamp(shared.clone());
+        let b = s.stamp(shared.clone());
+        assert_eq!((a.header.ssrc, a.header.payload_type), (0xdead_beef, 109));
+        assert_eq!(a.header.sequence_number, u16::MAX);
+        assert_eq!(b.header.sequence_number, 0, "wraps");
+        // Timestamp, marker and payload are shared, untouched.
+        assert_eq!((b.header.timestamp, b.header.marker), (777, true));
+        assert_eq!(b.payload, shared.payload);
+    }
 }
