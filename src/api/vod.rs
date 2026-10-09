@@ -697,6 +697,16 @@ async fn source(
 // Public handlers
 // ---------------------------------------------------------------------------
 
+/// `url?v=<ready_at ms>` for a ready item: the master playlist, MPD and poster are
+/// cached for 60 s, so the player asks for the output of the current transcode (a
+/// re-transcode keeps the same paths). Unchanged for items that are not ready.
+fn revision_url(url: &str, item: &VodItem) -> String {
+    match item.ready_at.filter(|_| item.is_ready()) {
+        Some(t) => format!("{url}?v={}", t.timestamp_millis()),
+        None => url.to_string(),
+    }
+}
+
 async fn public_info(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -712,10 +722,10 @@ async fn public_info(
             .vod
             .poster_path(&item.id)
             .is_file()
-            .then(|| urls.poster.clone()),
+            .then(|| revision_url(&urls.poster, &item)),
         sources: PublicVodSources {
-            hls: ready.then(|| urls.hls.clone()),
-            dash: ready.then(|| urls.dash.clone()),
+            hls: ready.then(|| revision_url(&urls.hls, &item)),
+            dash: ready.then(|| revision_url(&urls.dash, &item)),
         },
         renditions: item.renditions.iter().map(PublicRendition::from).collect(),
         id: item.id,
@@ -751,7 +761,7 @@ async fn public_list(
                         .vod
                         .poster_path(&i.id)
                         .is_file()
-                        .then(|| urls.poster.clone()),
+                        .then(|| revision_url(&urls.poster, &i)),
                     watch_url: urls.watch,
                     id: i.id,
                     title: i.title,
@@ -803,6 +813,7 @@ mod tests {
         );
         it.status = status.into();
         it.created_at = db::parse_ts(created);
+        it.ready_at = (status == repo::STATUS_READY).then(|| db::parse_ts(created));
         it.source_name = "Clip finale.mp4".into();
         repo::insert(&state.db, &it).await.unwrap();
         it
@@ -964,7 +975,14 @@ mod tests {
             p["sources"]["hls"]
                 .as_str()
                 .unwrap()
-                .ends_with("/hls/master.m3u8")
+                .contains("/hls/master.m3u8?v="),
+            "{p}"
+        );
+        assert!(
+            p["sources"]["dash"]
+                .as_str()
+                .unwrap()
+                .contains("/dash/manifest.mpd?v=")
         );
         assert_eq!(p["ui_language"], "it");
         let (st, pl) = send(&state, public("/api/v1/public/vod")).await;

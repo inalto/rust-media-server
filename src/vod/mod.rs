@@ -252,6 +252,20 @@ impl VodManager {
         }
     }
 
+    /// Shutdown: the jobs see the cancelled shutdown token (their tokens are children of
+    /// it); give them up to `timeout` to kill ffmpeg, clean up and put their item back
+    /// in the queue (startup re-queues anything still `processing` anyway).
+    pub async fn shutdown(&self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.jobs_running() > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(jobs = self.jobs_running(), "VOD jobs did not stop in time");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Wait (up to `timeout`) until the job of `id` has stopped.
     pub async fn wait_stopped(&self, id: &str, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;

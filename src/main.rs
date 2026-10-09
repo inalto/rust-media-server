@@ -270,6 +270,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         tracing::warn!("RTMP ingest did not stop in time");
     }
     state.recorder.shutdown().await;
+    state.vod.shutdown(Duration::from_secs(5)).await;
     tracing::info!("bye");
     Ok(())
 }
