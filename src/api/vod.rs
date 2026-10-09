@@ -654,6 +654,10 @@ async fn retranscode(
     tracing::info!(id = %updated.id, ladder = %ladder, "video on demand re-queued");
     state.vod.changed(&updated.id);
     state.vod.wake();
+    // The old output of a bucket file's encoding no longer counts.
+    if let Some(bucket) = &updated.bucket_id {
+        crate::storage::recount(&state, bucket).await;
+    }
     let base = BaseUrl::from_request(&state.config, &headers);
     Ok(Json(vod_view(&state, &base, updated)))
 }
