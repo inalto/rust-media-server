@@ -1,0 +1,29 @@
+# Single-node deployment. Put Nginx Proxy Manager (or any TLS reverse proxy) in front of :8080
+# (see deploy/nginx-proxy-manager.md); expose 1935/tcp (RTMP from OBS) and 8443/udp (WebRTC) directly.
+services:
+  rms:
+    image: rms:latest
+    build: .
+    container_name: rms
+    restart: unless-stopped
+    ports:
+      - "8080:8080"        # HTTP: dashboard, API, player, HLS/DASH/FLV (proxy this one)
+      - "1935:1935"        # RTMP ingest from OBS
+      - "8443:8443/udp"    # WebRTC (WHEP) — must reach the container directly, not via the proxy
+    volumes:
+      - rms-data:/data     # SQLite DB, recordings, waiting videos, VOD
+    environment:
+      RMS_ADMIN_TOKEN: "change-me-to-a-long-random-string"
+      RMS_SERVER_PUBLIC_URL: "https://stream.example.com"   # public URL seen by viewers (behind the proxy)
+      RMS_SERVER_TRUST_PROXY: "true"                         # honour X-Forwarded-* from the proxy
+      RMS_WEBRTC_PUBLIC_IP: "203.0.113.10"                   # public IP advertised in ICE candidates (NAT)
+      # RMS_WEBRTC_ENABLED: "false"                          # disable WebRTC if 8443/udp cannot be exposed
+      # RMS_LOG_LEVEL: "info"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/v1/public/ui"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  rms-data:
