@@ -1,32 +1,62 @@
-//! SQLite persistence (`data/rms.sqlite`, WAL mode).
+//! Persistence: SQLite (single node, `data/rms.sqlite`, WAL mode) or PostgreSQL
+//! (cluster mode, `cluster.database_url`).
 //!
-//! [`Db`] wraps a single `rusqlite::Connection` behind a mutex; [`Db::call`] runs a
-//! closure on tokio's blocking pool so SQLite never blocks the async runtime.
-//! Repositories live in the sub-modules and expose `async fn(&Db, ...)` helpers.
+//! [`Db`] is a cheap-to-clone handle on one of the two backends:
+//! - **SQLite** (default): a single `rusqlite::Connection` behind a mutex; [`Db::call`]
+//!   runs a closure on tokio's blocking pool so SQLite never blocks the async runtime.
+//! - **PostgreSQL** ([`Db::connect_postgres`]): an async `sqlx` pool (dynamic queries
+//!   only, no compile-time macros); schema and migrations in [`pg`].
+//!
+//! Repositories live in the sub-modules and expose `async fn(&Db, ...)` helpers that
+//! dispatch on the backend: the SQLite statement and the PostgreSQL statement of each
+//! operation sit side by side (`?N` placeholders vs `$N`, `INSERT OR REPLACE` vs
+//! `ON CONFLICT`, `strftime`/`julianday` vs epoch columns and `EXTRACT`, `0/1` vs
+//! `BOOLEAN`).
+//!
+//! The handle also carries the **node tag** written into the `node_id` columns
+//! ([`Db::node_id`]: empty on a single node, `cluster.node_id` in cluster mode) and the
+//! in-memory broadcasts cache ([`Db::broadcast_cache`]).
 //!
 //! All timestamps are stored as RFC 3339 UTC strings with millisecond precision
-//! (`2026-10-08T14:00:00.000Z`), which also sort lexicographically.
+//! (`2026-10-08T14:00:00.000Z`), which also sort lexicographically (PostgreSQL text
+//! columns use `COLLATE "C"`). Exceptions (cluster bookkeeping, DB clock): `nodes`,
+//! `live_streams`, `singleton_tasks` and the `lease_until` columns are `TIMESTAMPTZ` on
+//! PostgreSQL (RFC 3339 text on SQLite); `viewer_samples.ts_epoch` holds the Unix second
+//! of `ts` on both.
 
 pub mod broadcasts;
+pub mod cache;
+pub mod cluster;
 pub mod metrics;
+pub mod nodes;
+pub mod pg;
 pub mod recordings;
 pub mod settings;
 pub mod stream_sessions;
+#[cfg(test)]
+pub(crate) mod testkit;
 pub mod vod;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::Connection;
 
 pub use broadcasts::Broadcast;
+pub use cache::BroadcastCache;
 pub use recordings::Recording;
+
+/// The PostgreSQL connection pool type.
+pub type PgPool = sqlx_postgres::PgPool;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Postgres(#[from] sqlx_core::Error),
     #[error("database task failed: {0}")]
     Task(String),
     #[error("{0}")]
@@ -42,6 +72,7 @@ impl DbError {
                 rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                     | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
             ),
+            DbError::Postgres(sqlx_core::Error::Database(e)) => e.is_unique_violation(),
             _ => false,
         }
     }
@@ -49,21 +80,61 @@ impl DbError {
 
 pub type DbResult<T> = Result<T, DbError>;
 
+/// Which database a [`Db`] talks to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Sqlite,
+    Postgres,
+}
+
+impl BackendKind {
+    /// `"sqlite"` | `"postgres"` (`GET /system` → `cluster.backend`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendKind::Sqlite => "sqlite",
+            BackendKind::Postgres => "postgres",
+        }
+    }
+}
+
+#[derive(Clone)]
+enum Backend {
+    Sqlite(Arc<Mutex<Connection>>),
+    Postgres(PgPool),
+}
+
+/// Cache lifetime of a broadcast row on PostgreSQL: other nodes write the same table and
+/// (until the NOTIFY listener of phase 7C-2 invalidates entries) only the TTL bounds how
+/// long a change made elsewhere stays invisible here. SQLite has a single writer (this
+/// process), so its entries never expire.
+pub const PG_BROADCAST_CACHE_TTL: Duration = Duration::from_secs(5);
+
 /// Async handle to the database. Cheap to clone.
 #[derive(Clone)]
 pub struct Db {
-    conn: Arc<Mutex<Connection>>,
+    backend: Backend,
+    /// Value of the `node_id` columns written by this process.
+    node_id: Arc<str>,
+    broadcasts: Arc<BroadcastCache>,
 }
 
 impl Db {
-    /// Open (creating if needed) the database file and run migrations.
+    fn new(backend: Backend, cache_ttl: Option<Duration>) -> Db {
+        Db {
+            backend,
+            node_id: Arc::from(""),
+            broadcasts: Arc::new(BroadcastCache::new(cache_ttl)),
+        }
+    }
+
+    /// Open (creating if needed) the SQLite database file and run migrations.
     /// Synchronous: call at startup before serving requests.
     pub fn open(path: &Path) -> DbResult<Db> {
         let conn = Connection::open(path)?;
         Self::init(conn, true)
     }
 
-    /// In-memory database with the full schema (tests).
+    /// In-memory SQLite database with the full schema (tests).
     pub fn open_in_memory() -> DbResult<Db> {
         let conn = Connection::open_in_memory()?;
         Self::init(conn, false)
@@ -77,18 +148,112 @@ impl Db {
         }
         conn.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=OFF;")?;
         migrate(&mut conn)?;
-        Ok(Db {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        Ok(Db::new(Backend::Sqlite(Arc::new(Mutex::new(conn))), None))
     }
 
-    /// Run `f` with exclusive access to the connection on a blocking thread.
+    /// Connect to PostgreSQL (`postgres://user:pass@host:port/db`) and apply the
+    /// migrations (serialized across nodes by an advisory lock, see [`pg::migrate`]).
+    pub async fn connect_postgres(url: &str) -> DbResult<Db> {
+        let options: sqlx_postgres::PgConnectOptions = url
+            .parse()
+            .map_err(|e: sqlx_core::Error| DbError::Other(format!("invalid database URL: {e}")))?;
+        Self::connect_postgres_with(options).await
+    }
+
+    /// [`Self::connect_postgres`] with explicit connection options (e.g. a
+    /// `search_path` for the integration tests).
+    pub async fn connect_postgres_with(options: sqlx_postgres::PgConnectOptions) -> DbResult<Db> {
+        let options = options.application_name("rms");
+        let pool = sqlx_postgres::PgPoolOptions::new()
+            .max_connections(16)
+            .min_connections(1)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_with(options)
+            .await?;
+        pg::migrate(&pool).await?;
+        Ok(Db::new(
+            Backend::Postgres(pool),
+            Some(PG_BROADCAST_CACHE_TTL),
+        ))
+    }
+
+    /// Tag written into the `node_id` columns (`viewer_samples`, `viewer_sessions`,
+    /// `stream_sessions`, `recordings`, `vod_items.claimed_by`). Empty by default (single
+    /// node); `main.rs` sets `cluster.node_id` in cluster mode.
+    pub fn with_node_id(mut self, node_id: &str) -> Db {
+        self.node_id = Arc::from(node_id);
+        self
+    }
+
+    /// See [`Self::with_node_id`].
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    pub fn backend(&self) -> BackendKind {
+        match self.backend {
+            Backend::Sqlite(_) => BackendKind::Sqlite,
+            Backend::Postgres(_) => BackendKind::Postgres,
+        }
+    }
+
+    /// The PostgreSQL pool (`None` on SQLite).
+    pub fn pg(&self) -> Option<&PgPool> {
+        match &self.backend {
+            Backend::Postgres(pool) => Some(pool),
+            Backend::Sqlite(_) => None,
+        }
+    }
+
+    /// In-memory cache in front of `broadcasts::find_by_name` / `find_by_key`
+    /// (invalidated by every write of `db::broadcasts` and `db::settings`; the cluster
+    /// NOTIFY listener invalidates it for writes made by other nodes).
+    pub fn broadcast_cache(&self) -> &BroadcastCache {
+        &self.broadcasts
+    }
+
+    /// Cheap liveness probe (`SELECT 1`), bounded by `timeout`.
+    pub async fn ping(&self, timeout: Duration) -> bool {
+        let probe = async {
+            match &self.backend {
+                Backend::Postgres(pool) => {
+                    sqlx_core::query::query::<sqlx_postgres::Postgres>("SELECT 1")
+                        .execute(pool)
+                        .await
+                        .is_ok()
+                }
+                Backend::Sqlite(_) => self
+                    .call(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?))
+                    .await
+                    .is_ok(),
+            }
+        };
+        tokio::time::timeout(timeout, probe).await.unwrap_or(false)
+    }
+
+    /// Close the PostgreSQL pool (graceful shutdown); no-op on SQLite.
+    pub async fn close(&self) {
+        if let Backend::Postgres(pool) = &self.backend {
+            pool.close().await;
+        }
+    }
+
+    /// Run `f` with exclusive access to the SQLite connection on a blocking thread.
+    /// SQLite only: on PostgreSQL it returns an error (repositories dispatch with
+    /// [`Self::pg`] first).
     pub async fn call<F, T>(&self, f: F) -> DbResult<T>
     where
         F: FnOnce(&mut Connection) -> DbResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = Arc::clone(&self.conn);
+        let conn = match &self.backend {
+            Backend::Sqlite(conn) => Arc::clone(conn),
+            Backend::Postgres(_) => {
+                return Err(DbError::Other(
+                    "Db::call is only available on the SQLite backend".into(),
+                ));
+            }
+        };
         tokio::task::spawn_blocking(move || {
             let mut guard = conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             f(&mut guard)
@@ -99,7 +264,7 @@ impl Db {
 }
 
 /// Current schema version (stored in `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Schema v1 = ARCHITECTURE.md §7, verbatim.
 const SCHEMA_V1: &str = r#"
@@ -145,8 +310,35 @@ CREATE TABLE IF NOT EXISTS vod_items (
 CREATE INDEX IF NOT EXISTS idx_vod_status ON vod_items(status, created_at);
 "#;
 
+/// Schema v4 (phase 7C-1, docs/CLUSTER.md §3.2): node tags, epoch seconds of the
+/// samples, VOD/recording leases and the cluster tables. SQLite keeps the
+/// `(broadcast_id, ts)` primary key of `viewer_samples` (a single node writes it);
+/// PostgreSQL uses `(broadcast_id, node_id, ts)`.
+const SCHEMA_V4: &str = r#"
+ALTER TABLE viewer_samples ADD COLUMN node_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE viewer_samples ADD COLUMN ts_epoch INTEGER;
+UPDATE viewer_samples SET ts_epoch = CAST(strftime('%s', ts) AS INTEGER) WHERE ts_epoch IS NULL;
+ALTER TABLE viewer_sessions ADD COLUMN node_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE stream_sessions ADD COLUMN node_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE recordings ADD COLUMN node_id TEXT;
+ALTER TABLE recordings ADD COLUMN lease_until TEXT;
+ALTER TABLE vod_items ADD COLUMN claimed_by TEXT;
+ALTER TABLE vod_items ADD COLUMN lease_until TEXT;
+ALTER TABLE vod_items ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE vod_items ADD COLUMN storage_node TEXT;
+CREATE TABLE IF NOT EXISTS nodes (
+  node_id TEXT PRIMARY KEY, advertise_url TEXT NOT NULL, whep_url TEXT, version TEXT NOT NULL,
+  started_at TEXT NOT NULL, heartbeat TEXT NOT NULL, live_streams INTEGER NOT NULL DEFAULT 0,
+  viewers INTEGER NOT NULL DEFAULT 0, draining INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS live_streams (
+  name TEXT PRIMARY KEY, node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL, started_at TEXT NOT NULL, heartbeat TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS singleton_tasks (
+  name TEXT PRIMARY KEY, leased_by TEXT NOT NULL DEFAULT '', leased_until TEXT NOT NULL DEFAULT '');
+"#;
+
 /// Apply pending migrations. Later schema changes append a new `if version < N` block
-/// and bump [`SCHEMA_VERSION`].
+/// and bump [`SCHEMA_VERSION`] (and add the same change to [`pg::MIGRATIONS`]).
 pub fn migrate(conn: &mut Connection) -> DbResult<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
@@ -169,6 +361,13 @@ pub fn migrate(conn: &mut Connection) -> DbResult<()> {
         tx.execute_batch("PRAGMA user_version = 3")?;
         tx.commit()?;
         tracing::info!("database schema migrated to version 3");
+    }
+    if version < 4 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V4)?;
+        tx.execute_batch("PRAGMA user_version = 4")?;
+        tx.commit()?;
+        tracing::info!("database schema migrated to version 4");
     }
     Ok(())
 }
@@ -216,11 +415,60 @@ mod tests {
             "viewer_samples",
             "viewer_sessions",
             "vod_items",
+            "nodes",
+            "live_streams",
+            "singleton_tasks",
         ] {
             assert!(tables.iter().any(|x| x == t), "missing table {t}");
         }
         // Idempotent.
         db.call(migrate).await.unwrap();
+        assert_eq!(db.backend(), BackendKind::Sqlite);
+        assert_eq!(db.node_id(), "");
+        assert!(db.ping(Duration::from_secs(1)).await);
+    }
+
+    #[test]
+    fn migration_v3_to_v4_backfills_epoch_and_node_columns() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 3").unwrap();
+        conn.execute(
+            "INSERT INTO viewer_samples (broadcast_id, ts, total, flv, ws_flv, hls, dash, webrtc) \
+             VALUES ('b', '2026-10-08T10:00:02.500Z', 3, 3, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vod_items (id, title, source_path, status, ladder, created_at, updated_at) \
+             VALUES ('v', 'V', 'v/source.mp4', 'processing', 'standard', 'x', 'x')",
+            [],
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        let (epoch, node): (i64, String) = conn
+            .query_row(
+                "SELECT ts_epoch, node_id FROM viewer_samples WHERE broadcast_id = 'b'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(epoch, parse_ts("2026-10-08T10:00:02.500Z").timestamp());
+        assert_eq!(node, "");
+        let (claimed, attempts): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT claimed_by, attempts FROM vod_items WHERE id = 'v'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((claimed, attempts), (None, 0));
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
     }
 
     #[test]

@@ -27,6 +27,10 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
+# PostgreSQL backend (cluster mode). The `sqlx` facade cannot be used next to rusqlite:
+# its optional `sqlx-sqlite` pins another `libsqlite3-sys` (`links = "sqlite3"` conflict).
+sqlx-core = { version = "0.9.0", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "chrono"] }
+sqlx-postgres = { version = "0.9.0", default-features = false, features = ["chrono"] }
 thiserror = "2.0.21"
 tokio = { version = "1.53.2", features = ["full"] }
 tokio-util = { version = "0.7.19", features = ["io", "rt"] }

@@ -54,6 +54,21 @@ expect "admin API without token -> 401" 401 "$BASE/api/v1/broadcasts"
 expect "GET /system" 200 "${AUTH[@]}" "$BASE/api/v1/system"
 contains "system has version" '"version"'
 contains "system has webrtc status" '"webrtc":{'
+contains "system has webrtc public_port" '"public_port":'
+# Liveness (no auth) and cluster status: single node = SQLite, cluster = PostgreSQL.
+expect "GET /healthz (no auth)" 200 "$BASE/healthz"
+contains "healthz has node_id" '"node_id":"'
+contains "healthz database reachable" '"db":true'
+CLUSTER=false; grep -q '"cluster":true' "$TMP" && CLUSTER=true
+expect "GET /system (cluster section)" 200 "${AUTH[@]}" "$BASE/api/v1/system"
+contains "system cluster.enabled=$CLUSTER" "\"cluster\":{\"enabled\":$CLUSTER"
+if [[ "$CLUSTER" == true ]]; then
+  contains "cluster backend postgres" '"backend":"postgres"'
+  contains "cluster lists a live node" '"alive":true'
+else
+  contains "single node backend sqlite" '"backend":"sqlite"'
+  contains "single node lists no nodes" '"nodes":\[\]'
+fi
 expect "GET /broadcasts" 200 "${AUTH[@]}" "$BASE/api/v1/broadcasts"
 expect "POST /broadcasts invalid name -> 400" 400 "${AUTH[@]}" -H 'Content-Type: application/json' -d '{"title":"x","name":"Bad Name"}' "$BASE/api/v1/broadcasts"
 expect "POST /broadcasts missing title -> 400" 400 "${AUTH[@]}" -H 'Content-Type: application/json' -d '{"name":"x"}' "$BASE/api/v1/broadcasts"

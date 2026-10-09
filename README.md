@@ -56,7 +56,7 @@ Chiavi principali:
 |---|---|---|
 | `server.http_bind` | `0.0.0.0:8080` | dashboard, API, player, HLS/DASH/FLV |
 | `server.public_url` | vuoto | URL pubblico (es. `https://stream.example.com`) usato nei link e negli embed; se vuoto deriva dall'header `Host` |
-| `server.trust_proxy` | `false` | usa `X-Forwarded-For` per l'IP degli spettatori dietro reverse proxy |
+| `server.trust_proxy` | `false` | IP degli spettatori dietro reverse proxy: `X-Real-IP`, altrimenti l'**ultimo** elemento di `X-Forwarded-For` (quello aggiunto dal proxy) |
 | `rtmp.bind` | `0.0.0.0:1935` | porta RTMP per OBS |
 | `rtmp.max_connections` | `256` | connessioni RTMP simultanee ammesse |
 | `hls.part_duration` | `0.5` | durata delle part LL-HLS (s) |
@@ -68,6 +68,7 @@ Chiavi principali:
 | `ffmpeg.path` | vuoto | percorso di ffmpeg; vuoto = cerca nel PATH |
 | `webrtc.enabled` | `true` | uscita WebRTC via WHEP (`/whep/<nome>`) |
 | `webrtc.udp_port` | `8443` | **unica porta UDP** per tutte le sessioni WebRTC (ICE, DTLS, SRTP): va aperta in ingresso (`8443/udp`); non passa dal reverse proxy |
+| `webrtc.public_port` | `0` | porta annunciata nei candidati ICE quando il NAT inoltra una porta pubblica diversa (es. più nodi dietro un solo IP: pubblica `8444` → `8443` del nodo); `0` = `udp_port` |
 | `webrtc.public_ip` | `[]` | IP pubblici IPv4 annunciati ai browser (candidati ICE). Vuoto = indirizzi delle interfacce locali: va bene in LAN o su un server con IP pubblico diretto. **Dietro NAT 1:1** (VM cloud con IP elastico, router con port forwarding di `8443/udp`) indicare l'IP pubblico, es. `["203.0.113.7"]` (variabile: `RMS_WEBRTC_PUBLIC_IP=203.0.113.7`) |
 | `webrtc.ice_lite` | `true` | ICE-lite: il server risponde solo ai controlli di connettività (ha un indirizzo raggiungibile) |
 | `webrtc.max_sessions` | `100` | sessioni WebRTC simultanee (oltre: `503`, il player passa a HTTP-FLV) |
@@ -85,12 +86,26 @@ Chiavi principali:
 | `vod.default_ladder` | `standard` | ladder usata quando non se ne sceglie una |
 | `vod.keep_source` | `true` | conserva il file originale (serve per ricodificare e per scaricarlo) |
 | `vod.ladders` | `standard`, `mobile`, `single` | elenco delle ladder `[[vod.ladders]]`: vedi [Video on demand](#video-on-demand) |
+| `cluster.enabled` | `false` | modalità cluster (anteprima): vedi sotto |
 
 **Lingua dell'interfaccia.** Dashboard e player sono in italiano (predefinito) o in inglese: si sceglie
 nella dashboard in *Impostazioni → Lingua e tema* (oppure `PATCH /api/v1/settings {"ui_language":"en"}`), vale
 subito per le dashboard aperte e per i testi del player incorporato (badge di attesa/pausa, pulsanti, testo
 di attesa predefinito: «La diretta inizierà a breve» / «The live stream will start shortly»). I testi di
 attesa personalizzati restano come sono. Un singolo embed può forzare la lingua con `?lang=it|en`.
+
+**Modalità cluster (anteprima).** Con `[cluster] enabled = true` più istanze condividono un database
+**PostgreSQL** (`cluster.database_url`) al posto di SQLite: dirette, impostazioni, metriche (sommate fra i
+nodi), registrazioni e coda dei video on demand (con lease per nodo). Ogni nodo si registra nella tabella
+`nodes` con un heartbeat; *Impostazioni → Cluster* e `GET /api/v1/system` mostrano i nodi attivi. Servono
+`cluster.node_id` (default: nome host), `cluster.advertise_url`, `cluster.internal_secret` (≥ 32 caratteri)
+e `server.admin_token` uguale su tutti i nodi. Per ora ogni stream si guarda solo dal nodo che riceve
+l'RTMP (il relay fra nodi arriva nella fase successiva): architettura e limiti in
+[docs/CLUSTER.md](docs/CLUSTER.md). Senza `[cluster]` nulla cambia (SQLite, nodo singolo).
+
+**Controllo di salute.** `GET /healthz` (pubblico) risponde `200` con `{"node_id", "cluster", "db",
+"live_streams", "version"}` finché il server è in servizio, anche se il database non risponde (`"db": false`),
+e `503` durante l'arresto: lo usano l'`HEALTHCHECK` del Dockerfile, il compose e i load balancer.
 
 **Tema chiaro/scuro.** Il tema predefinito di dashboard e player (*Sistema*, che segue il dispositivo, *Chiaro* o *Scuro*) si sceglie in *Impostazioni → Lingua e tema* (oppure `PATCH /api/v1/settings {"ui_theme":"light"}`); ogni browser può cambiarlo per sé con il pulsante sole/luna in alto nella dashboard e un singolo embed può forzarlo con `?theme=light|dark|system`.
 
@@ -259,7 +274,8 @@ src/packager/      muxer CMAF, store, playlist HLS, MPD DASH
 src/recorder/      registrazione FLV → MP4 src/metrics/    tracker spettatori, campionatore
 src/api/           REST + SSE (axum)       src/web/        dashboard e player (statici incorporati)
 src/vod/           video on demand: probe, ladder, ffmpeg in un passaggio, playlist HLS/MPD, job, inbox, playback
-src/db/            SQLite (rusqlite)       docs/           architettura, protocolli, API
+src/db/            SQLite (rusqlite) o PostgreSQL (sqlx)    src/cluster/  registro nodi, /healthz
+docs/              architettura, protocolli, API, cluster
 ```
 
 ## Limiti noti e roadmap
@@ -267,7 +283,8 @@ src/db/            SQLite (rusqlite)       docs/           architettura, protoco
 - Il packager LL-HLS/LL-DASH impacchetta solo **H.264 + AAC**; HEVC/AV1 (Enhanced RTMP) passano solo via HTTP-FLV/WS-FLV.
 - WebRTC: solo video H.264 senza B-frame (HEVC/AV1 → `415`, il player usa un'altra sorgente); solo IPv4; nessun TURN né trickle ICE; un nuovo spettatore parte dal keyframe successivo; senza ffmpeg niente audio.
 - Dirette senza transcoding/ABR: la qualità è quella inviata da OBS (consigliati 2–6 Mbit/s CBR, keyframe 2 s). L'ABR c'è per i video on demand.
-- Video on demand: solo encoder H.264 (gli encoder hardware NVENC/QSV/VAAPI sono previsti ma non verificati in questo ambiente); niente anteprime sulla barra di avanzamento né sottotitoli; più istanze possono condividere `data/vod` e il database (le codifiche vengono prese in carico in modo atomico), ma un riavvio rimette in coda anche le codifiche di un'altra istanza.
+- Video on demand: solo encoder H.264 (gli encoder hardware NVENC/QSV/VAAPI sono previsti ma non verificati in questo ambiente); niente anteprime sulla barra di avanzamento né sottotitoli; più istanze condividono la coda delle codifiche solo in modalità cluster (PostgreSQL, lease per nodo).
+- Modalità cluster in anteprima: registro dei nodi e database condiviso, ma niente relay fra nodi né eventi fra nodi (fasi successive in `docs/CLUSTER.md` §3.12).
 - Safari nativo e HTTP/2 non sono stati verificati in questo ambiente (vedi `docs/ARCHITECTURE.md` §15).
 - Prossimi passi previsti: ingest SRT/WHIP, token per gli spettatori, TURN/IPv6 per WebRTC.
 

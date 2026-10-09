@@ -253,6 +253,26 @@ export const it = {
   'system.rtcUnavailableReason': 'non disponibile: {error}',
   'system.rtcStatus': 'porta UDP {port} · {sessions} sessioni',
   'system.rtcVideoOnly': 'solo video (manca ffmpeg)',
+  'system.rtcPublicPort': 'annunciata come {port}',
+
+  // Settings: cluster panel (app.js)
+  'settings.cluster': 'Cluster',
+  'cluster.mode': 'Modalità',
+  'cluster.single': 'nodo singolo',
+  'cluster.enabled': 'cluster (anteprima)',
+  'cluster.backend': 'Database',
+  'cluster.nodeId': 'Questo nodo',
+  'cluster.singleHint': 'Per eseguire più istanze con un database PostgreSQL condiviso vedi la sezione [cluster] della configurazione e docs/CLUSTER.md.',
+  'cluster.colNode': 'Nodo',
+  'cluster.colAddress': 'Indirizzo interno',
+  'cluster.colHeartbeat': 'Ultimo segnale',
+  'cluster.colLive': 'In diretta',
+  'cluster.alive': 'attivo',
+  'cluster.dead': 'non risponde',
+  'cluster.draining': 'in uscita',
+  'cluster.ago': '{duration} fa',
+  'cluster.thisNode': 'questo nodo',
+  'cluster.noNodes': 'Nessun nodo registrato.',
 
   // Broadcast detail: header and navigation
   'detail.notFound': 'Diretta non trovata',
@@ -876,6 +896,26 @@ export const en = {
   'system.rtcUnavailableReason': 'not available: {error}',
   'system.rtcStatus': 'UDP port {port} · {sessions} sessions',
   'system.rtcVideoOnly': 'video only (ffmpeg missing)',
+  'system.rtcPublicPort': 'advertised as {port}',
+
+  // Settings: cluster panel (app.js)
+  'settings.cluster': 'Cluster',
+  'cluster.mode': 'Mode',
+  'cluster.single': 'single node',
+  'cluster.enabled': 'cluster (preview)',
+  'cluster.backend': 'Database',
+  'cluster.nodeId': 'This node',
+  'cluster.singleHint': 'To run several instances sharing a PostgreSQL database see the [cluster] section of the configuration and docs/CLUSTER.md.',
+  'cluster.colNode': 'Node',
+  'cluster.colAddress': 'Internal address',
+  'cluster.colHeartbeat': 'Last heartbeat',
+  'cluster.colLive': 'Live',
+  'cluster.alive': 'alive',
+  'cluster.dead': 'not responding',
+  'cluster.draining': 'draining',
+  'cluster.ago': '{duration} ago',
+  'cluster.thisNode': 'this node',
+  'cluster.noNodes': 'No registered node.',
 
   // Broadcast detail: header and navigation
   'detail.notFound': 'Live stream not found',

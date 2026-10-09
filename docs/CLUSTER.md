@@ -1,6 +1,6 @@
 # Esecuzione multi-istanza: studio e architettura
 
-> **Stato: studio e proposta.** Nulla di quanto segue è implementato in rms 0.1.0 (single-node: SQLite, hub in memoria, un listener RTMP). Verificato il 2026-10-09. Convenzioni: **[V]** fatto verificato su fonte (numero tra parentesi quadre, elenco in §8), **[S]** stima da misurare, **[P]** proposta di progetto; le citazioni tra «» sono traduzioni nostre, quelle in inglese sono letterali. Riferimenti al codice: `docs/ARCHITECTURE.md` (§4 hub e tracker, §5 ingest, §6 egress, §7 schema, §14 packager, §16 WebRTC) e `docs/API.md` §6. Setup di Nginx Proxy Manager: `deploy/nginx-proxy-manager.md`.
+> **Stato: studio e proposta; fasi 1–2 di §3.12 realizzate in 7C-1** (backend PostgreSQL, registro dei nodi, `/healthz`, prerequisiti: ARCHITECTURE.md §20). Il resto non è ancora implementato (hub in memoria, nessun relay fra nodi). Verificato il 2026-10-09. Convenzioni: **[V]** fatto verificato su fonte (numero tra parentesi quadre, elenco in §8), **[S]** stima da misurare, **[P]** proposta di progetto; le citazioni tra «» sono traduzioni nostre, quelle in inglese sono letterali. Riferimenti al codice: `docs/ARCHITECTURE.md` (§4 hub e tracker, §5 ingest, §6 egress, §7 schema, §14 packager, §16 WebRTC) e `docs/API.md` §6. Setup di Nginx Proxy Manager: `deploy/nginx-proxy-manager.md`.
 
 ## 0. Sintesi
 
@@ -16,7 +16,7 @@
 | 4 | «S3-compatibile, es. MinIO» | **MinIO community è archiviato** (read-only dal 25/04/2026) | [32] (§6) |
 | 5 | NPM: `proxy_set_header Connection ""` | Inefficace nell'Advanced tab e, se funzionasse, romperebbe WS-FLV | Template NPM 2.16.0, regola di ereditarietà di `proxy_set_header` [39][40] |
 | 6 | NPM «con upstream multipli via config custom» | **Non fattibile** | Il template NPM scrive sempre `host:porta` nel `proxy_pass`; con una porta esplicita nginx non riconosce un gruppo `upstream` (variabili: passa al resolver DNS; `proxy_pass` statico: errore) [39][40] (§4) |
-| 7 | `trust_proxy` e primo elemento di `X-Forwarded-For` | **Falsificabile dietro NPM** | NPM manda `$proxy_add_x_forwarded_for` (accoda all'header del client), rms legge il *primo* elemento (`metrics::client_ip`). HAProxy: «il server deve usare l'ultima occorrenza» [30]. Usare `X-Real-IP` o l'ultimo hop fidato |
+| 7 | `trust_proxy` e primo elemento di `X-Forwarded-For` | **Falsificabile dietro NPM** | NPM manda `$proxy_add_x_forwarded_for` (accoda all'header del client), rms leggeva il *primo* elemento (`metrics::client_ip`). HAProxy: «il server deve usare l'ultima occorrenza» [30]. **Corretto in 7C-1:** `X-Real-IP`, poi l'ultimo elemento |
 | 8 | `/internal/*` protetto da shared secret | Insufficiente da solo | NPM/HAProxy inoltrano `/`: le rotte interne sarebbero raggiungibili da Internet. Listener separato + blocco sul proxy (§3.1) |
 | 9 | «Redis già presente su questo host» | Non risolve il problema | È 6.2.22 su `127.0.0.1:6379` (supportato fino al 2027-04-01 [15]) e non sostituisce il database SQL: sarebbero due dipendenze (§2.3) |
 | 10 | Relay +0,1–0,5 s | Limite superiore plausibile | In LAN [S] decine di ms; il costo vero è l'avvio a freddo del primo spettatore su un edge (§2.6) |
@@ -229,7 +229,7 @@ GROUP BY bucket ORDER BY bucket;
 
 ### 3.8 WebRTC / WHEP
 
-- Ogni nodo ha un proprio endpoint UDP raggiungibile: `webrtc.public_ip` del nodo e una porta propria. rms annuncia `public_ip:udp_port` con la porta su cui è in ascolto (config, API.md §4.5): dietro un NAT con più nodi e un solo IP pubblico servono porte diverse e *uguali* dentro e fuori (8443, 8444, …). Un `webrtc.public_port` toglierebbe il vincolo (aggiunta da fare).
+- Ogni nodo ha un proprio endpoint UDP raggiungibile: `webrtc.public_ip` del nodo e una porta propria. rms annuncia `public_ip:public_port` (API.md §4.5): con `webrtc.public_port` (fatto in 7C-1; 0 = `udp_port`) dietro un NAT con più nodi e un solo IP pubblico la porta esterna (8443, 8444, …) può differire da quella interna.
 - Il `POST /whep/{name}` può arrivare a qualunque nodo (dopo relay lazy dell'hub locale). Le risorse `DELETE /whep/{name}/{session}` e `OPTIONS` sono per nodo: oggi un `DELETE` su un altro nodo dà `404` e la sessione viene chiusa dopo ≈ 15 s dal rilevamento ICE (ARCH §16). Proposta: prefisso del nodo nell'id di sessione (`n2-<uuid>`) e instradamento nell'LB (§4), oppure inoltro interno.
 - Il draft WHEP-04 prevede il bilanciamento con **`307 Temporary Redirect`** (non 301/302) e `503` con `Retry-After` in caso di sovraccarico [28]: un nodo senza UDP raggiungibile o saturo può rimandare il client a un nodo con `nodes.whep_url`. Da provare nei browser (redirect cross-origin con `Content-Type: application/sdp`); preferibile restare sullo stesso hostname e instradare nell'LB.
 - Nodi senza UDP raggiungibile: `webrtc.enabled=false`; il POST dà `403` e il player passa a FLV/HLS. Meglio non mandarglieli proprio (backend `rms_whep` solo con i nodi WebRTC, §4).
@@ -237,7 +237,7 @@ GROUP BY bucket ORDER BY bucket;
 
 ### 3.9 Salute e drain
 
-- `GET /healthz` (pubblico, senza auth) [P]: 200 con `{"node_id", "cluster": true, "db": true|false, "live_streams": n}`; **liveness**, non dipende dal DB (se il DB è giù l'LB non deve togliere tutti i nodi, il data plane funziona). 503 solo in drain o durante l'arresto. Finché non esiste, l'health check usa `GET /api/v1/public/ui` (lo usa già il `HEALTHCHECK` del Dockerfile).
+- `GET /healthz` (pubblico, senza auth; **fatto in 7C-1**): 200 con `{"node_id", "cluster", "db": true|false, "live_streams", "version", "draining"}`; **liveness**, non dipende dal DB (se il DB è giù l'LB non deve togliere tutti i nodi, il data plane funziona). 503 solo in drain o durante l'arresto. Lo usano l'`HEALTHCHECK` del Dockerfile e il compose.
 - Drain: `SIGTERM` o `POST /internal/drain` → `nodes.draining=true`, `/healthz` 503, nessun nuovo relay, le connessioni attive finiscono.
 
 ### 3.10 Cosa resta per-nodo
@@ -282,19 +282,19 @@ sempre   reaper (un nodo qualsiasi): DELETE nodes/live_streams scaduti; vod_item
 
 ### 3.12 Fasi di realizzazione
 
-1. Trait `Store` + `SqliteStore` (nessun cambio funzionale). 2. `PgStore`, migrazioni con lock, cache `broadcasts`, `nodes`, `/healthz`. 3. `live_streams`, NOTIFY, listener con resync, listener interno `/internal/*`. 4. Relay FLV (client HTTP), metriche per nodo. 5. VOD con lease, file condivisi/fetch interno. 6. WebRTC per nodo (`public_port`, prefisso sessione). 7. B/C per HLS/DASH, S3 (roadmap).
+1. Trait `Store` + `SqliteStore` (nessun cambio funzionale). — **Fatto (7C-1):** `db::Db` con due backend (enum, non trait) e le stesse firme dei repository; SQLite invariato. 2. `PgStore`, migrazioni con lock, cache `broadcasts`, `nodes`, `/healthz`. — **Fatto (7C-1):** PostgreSQL via sqlx (migrazioni sotto `pg_advisory_xact_lock`), cache `broadcasts` con invalidazione locale, registro `nodes` con heartbeat/reaper, `/healthz`; anche `node_id` nelle tabelle, lease VOD, task singleton, `public_port`, IP dal proxy (ARCHITECTURE.md §20). 3. `live_streams`, NOTIFY, listener con resync, listener interno `/internal/*`. 4. Relay FLV (client HTTP), metriche per nodo. 5. VOD con lease, file condivisi/fetch interno. 6. WebRTC per nodo (`public_port`, prefisso sessione). 7. B/C per HLS/DASH, S3 (roadmap).
 
 ## 4. Load balancer e ingest
 
 - **NPM da solo non bilancia.** La UI ha un solo `Forward Hostname / IP` e una sola porta; il template genera `proxy_pass $forward_scheme://$server:$port$request_uri`. In nginx un gruppo `upstream` si trova solo se la porta è assente: con le variabili e una porta esplicita il nome va al resolver DNS, con un `proxy_pass` statico c'è l'errore `upstream "x" may not have port N` [39][40]; un nome che risolve più IP farebbe round-robin *per richiesta*, senza health check e senza stickiness (rompe LL-HLS). Schema: **Internet → NPM (TLS) → HAProxy → rms1..N**, con NPM che punta a `lb:8080`.
-- **HAProxy** [30]: `balance leastconn`, `option httpchk` su `/healthz`, `timeout client/server/tunnel` ≥ 1 h (FLV, SSE e WS-FLV sono connessioni lunghe), nessuna compressione. `/hls/` e `/dash/` con `balance hdr(X-Real-IP)` + `hash-type consistent` (§3.5-A; senza l'header HAProxy ripiega su roundrobin [30]). Il profilo Low-Latency di HLS richiede HTTP/2 o HTTP/3 verso il player [29]: «HTTP/2 Support» su NPM, oppure `alpn h2,http/1.1` se TLS termina su HAProxy. Se HAProxy sta dietro NPM, `X-Real-IP` (impostato da NPM a `$remote_addr`) è l'IP reale; `balance source` darebbe a tutti l'IP di NPM. `option forwardfor` *accoda* un header e il server deve usare l'ultima occorrenza [30]: poiché rms usa la prima, impostare `X-Forwarded-For` da `X-Real-IP` (esempio sotto).
+- **HAProxy** [30]: `balance leastconn`, `option httpchk` su `/healthz`, `timeout client/server/tunnel` ≥ 1 h (FLV, SSE e WS-FLV sono connessioni lunghe), nessuna compressione. `/hls/` e `/dash/` con `balance hdr(X-Real-IP)` + `hash-type consistent` (§3.5-A; senza l'header HAProxy ripiega su roundrobin [30]). Il profilo Low-Latency di HLS richiede HTTP/2 o HTTP/3 verso il player [29]: «HTTP/2 Support» su NPM, oppure `alpn h2,http/1.1` se TLS termina su HAProxy. Se HAProxy sta dietro NPM, `X-Real-IP` (impostato da NPM a `$remote_addr`) è l'IP reale; `balance source` darebbe a tutti l'IP di NPM. `option forwardfor` *accoda* un header e il server deve usare l'ultima occorrenza [30]: rms (da 7C-1) usa `X-Real-IP` e poi l'ultimo elemento; l'esempio sotto riscrive comunque `X-Forwarded-For` da `X-Real-IP`.
 - **Alternative:** nginx con `upstream`, Traefik, LB cloud. Qualsiasi LB va bene se: health check HTTP, timeout lunghi, nessun buffering/compressione, hash per IP su `/hls/` e `/dash/`.
 - **Niente sticky per FLV, WS-FLV, SSE, `POST /whep`**: sono per connessione.
 - **RTMP (1935/tcp).** Due modi. (1) Hostname dedicato `ingest.example.com` verso un solo nodo o un VIP (keepalived): semplice, un publisher vede sempre lo stesso nodo. (2) TCP LB (HAProxy `mode tcp`, o uno **Stream** di NPM verso `lb:1935`): la chiave finisce su un nodo arbitrario, cosa che il relay e `live_streams` gestiscono; si perde l'IP del publisher (rms vede l'LB; il PROXY protocol non è supportato dal listener).
 - **WebRTC.** Non passa da NPM né dall'LB HTTP: UDP per nodo con `public_ip`/porta propri (§3.8). Alternative: TURN, oppure WHEP disattivato (il player cade su FLV/HLS da solo, ARCH §16).
 
 ```
-# haproxy.cfg (estratto) — dietro NPM; senza /healthz usare uri /api/v1/public/ui
+# haproxy.cfg (estratto) — dietro NPM
 global
     log stdout format raw local0
 defaults
@@ -372,7 +372,7 @@ x-rms: &rms
   restart: unless-stopped
   depends_on: { db: { condition: service_healthy } }
   volumes: [ "shared:/data" ]            # su più host: volume NFS (§6)
-  healthcheck: { test: ["CMD","curl","-fsS","http://127.0.0.1:8080/healthz"], interval: 10s, timeout: 3s, retries: 3 }   # finché /healthz non esiste: /api/v1/public/ui
+  healthcheck: { test: ["CMD","curl","-fsS","http://127.0.0.1:8080/healthz"], interval: 10s, timeout: 3s, retries: 3 }
 x-env: &env
   RMS_ADMIN_TOKEN: ${RMS_ADMIN_TOKEN:?}            # identico su tutti i nodi
   RMS_SERVER_PUBLIC_URL: https://stream.example.com
@@ -403,7 +403,7 @@ services:
 volumes: { shared: {}, pgdata: {} }
 ```
 
-Con Podman: `podman-compose -f docker-compose.cluster.yml up -d`. Le variabili `RMS_CLUSTER_*` sono proposte (§3.1).
+Con Podman: `podman-compose -f docker-compose.cluster.yml up -d`. Le variabili `RMS_CLUSTER_*` esistono da 7C-1 (§3.1); serve anche `RMS_CLUSTER_ADVERTISE_URL` per nodo.
 
 ## 6. Storage condiviso (registrazioni, VOD, video d'attesa)
 

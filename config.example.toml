@@ -46,6 +46,7 @@ path = ""                  # empty = search PATH
 [webrtc]                   # WebRTC egress via WHEP: POST /whep/<name>
 enabled = true
 udp_port = 8443            # ONE UDP port for every session: open it in the firewall (not proxied by nginx/Caddy)
+public_port = 0            # port advertised in the ICE candidates when NAT maps another one (public 8444 -> 8443); 0 = udp_port
 public_ip = []             # e.g. ["203.0.113.7"] behind 1:1 NAT (cloud VM); empty = local interface addresses
 ice_lite = true
 max_sessions = 100
@@ -96,3 +97,15 @@ renditions = [
 
 [log]
 level = "info"             # RUST_LOG overrides
+
+[cluster]                  # multi-instance mode (preview, docs/CLUSTER.md): PostgreSQL instead of SQLite
+enabled = false            # false = single node (SQLite, nothing below is used)
+node_id = ""               # unique and stable per node; empty = host name (RMS_CLUSTER_NODE_ID)
+database_url = ""          # postgres://rms:PASSWORD@db:5432/rms (RMS_CLUSTER_DATABASE_URL)
+advertise_url = ""         # internal URL of this node reachable by the others, e.g. http://rms1:8081
+internal_bind = "0.0.0.0:8081"  # listener of /internal/* (never expose it through the public proxy)
+internal_secret = ""       # >= 32 random characters, identical on every node (RMS_CLUSTER_INTERNAL_SECRET)
+heartbeat_secs = 5         # node registry heartbeat
+node_ttl_secs = 15         # a node without heartbeat for this long is dead (>= 2 x heartbeat_secs)
+relay_idle_secs = 30       # stop an edge relay without local viewers after this long
+# In cluster mode server.admin_token (RMS_ADMIN_TOKEN) is mandatory and identical on every node.

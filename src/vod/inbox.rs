@@ -9,6 +9,10 @@
 //! with the title taken from its name (`_` → space, no extension). Files that cannot be
 //! imported (unsupported type, ffprobe error, no video stream) are moved to
 //! `inbox/_failed/` with a `<name>.error.txt` next to them.
+//!
+//! In cluster mode only one node scans a shared inbox at a time: each scan first takes
+//! or renews the `vod-inbox` singleton lease (`db::cluster::try_lease`, a no-op on
+//! SQLite); a node that does not hold it forgets its observations and skips the scan.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -112,6 +116,12 @@ impl InboxScanner {
             }
         }
         ready
+    }
+
+    /// Forget every observation (another node scans the inbox meanwhile).
+    pub fn reset(&mut self) {
+        self.seen.clear();
+        self.stuck.clear();
     }
 
     /// Remember a file that failed and could not be moved to `_failed/`.
@@ -278,11 +288,37 @@ pub async fn run(mgr: Arc<VodManager>, shutdown: CancellationToken) {
     prepare(&root, &ladders).await;
     tracing::info!(task = "vod-inbox", dir = %root.display(), "watching the VOD inbox");
     let interval = Duration::from_secs(mgr.config.vod.scan_interval_secs.max(1));
+    // The holder renews the lease at every scan; another node takes over after 3 missed
+    // scans (at least 30 s).
+    let lease = (interval * 3).max(Duration::from_secs(30));
     let mut scanner = InboxScanner::new(root.clone(), ladders);
+    let mut leader = None;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = tokio::time::sleep(interval) => {}
+        }
+        let holds =
+            crate::db::cluster::try_lease(mgr.db(), crate::db::cluster::TASK_VOD_INBOX, lease)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::debug!(task = "vod-inbox", error = %e, "cannot take the inbox lease");
+                    false
+                });
+        if leader != Some(holds) {
+            // Leadership changes only matter (and are only logged) in cluster mode.
+            if mgr.db().pg().is_some() {
+                if holds {
+                    tracing::info!(task = "vod-inbox", "this node scans the VOD inbox");
+                } else {
+                    tracing::info!(task = "vod-inbox", "another node scans the VOD inbox");
+                }
+            }
+            leader = Some(holds);
+        }
+        if !holds {
+            scanner.reset();
+            continue;
         }
         let (s, ready) = match tokio::task::spawn_blocking(move || {
             let ready = scanner.scan();
@@ -324,6 +360,9 @@ pub async fn run(mgr: Arc<VodManager>, shutdown: CancellationToken) {
                 }
             }
         }
+    }
+    if leader == Some(true) {
+        let _ = crate::db::cluster::release(mgr.db(), crate::db::cluster::TASK_VOD_INBOX).await;
     }
     tracing::info!(task = "vod-inbox", "stopped");
 }

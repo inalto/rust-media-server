@@ -6,7 +6,10 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
+use sqlx_core::row::Row as _;
+use sqlx_postgres::PgRow;
 
+use super::pg::{get_u64, q, q_dyn};
 use super::{Db, DbResult, fmt_ts, parse_ts};
 
 /// `recordings.status` values.
@@ -68,13 +71,36 @@ fn size_i64(n: u64) -> i64 {
     n.min(i64::MAX as u64) as i64
 }
 
-/// Insert a row.
+/// Insert a row (tagged with [`Db::node_id`]: the node holding the file).
 pub async fn insert(db: &Db, rec: &Recording) -> DbResult<()> {
     let r = rec.clone();
+    let node = db.node_id().to_string();
+    if let Some(pool) = db.pg() {
+        q_dyn(format!(
+            "INSERT INTO recordings ({COLUMNS}, node_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
+        ))
+        .bind(r.id)
+        .bind(r.broadcast_id)
+        .bind(r.stream_session_id)
+        .bind(r.path)
+        .bind(r.format)
+        .bind(r.status)
+        .bind(fmt_ts(&r.started_at))
+        .bind(r.ended_at.as_ref().map(fmt_ts))
+        .bind(size_i64(r.size_bytes))
+        .bind(r.duration_secs)
+        .bind(r.error)
+        .bind(node)
+        .execute(pool)
+        .await?;
+        return Ok(());
+    }
     db.call(move |c| {
         c.execute(
             &format!(
-                "INSERT INTO recordings ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+                "INSERT INTO recordings ({COLUMNS}, node_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
             ),
             params![
                 r.id,
@@ -87,7 +113,8 @@ pub async fn insert(db: &Db, rec: &Recording) -> DbResult<()> {
                 r.ended_at.as_ref().map(fmt_ts),
                 size_i64(r.size_bytes),
                 r.duration_secs,
-                r.error
+                r.error,
+                node
             ],
         )?;
         Ok(())
@@ -99,6 +126,24 @@ pub async fn insert(db: &Db, rec: &Recording) -> DbResult<()> {
 /// of an existing row. Returns false when the row does not exist (e.g. deleted).
 pub async fn update(db: &Db, rec: &Recording) -> DbResult<bool> {
     let r = rec.clone();
+    if let Some(pool) = db.pg() {
+        let n = q(
+            "UPDATE recordings SET path = $2, format = $3, status = $4, ended_at = $5, \
+                   size_bytes = $6, duration_secs = $7, error = $8 WHERE id = $1",
+        )
+        .bind(r.id)
+        .bind(r.path)
+        .bind(r.format)
+        .bind(r.status)
+        .bind(r.ended_at.as_ref().map(fmt_ts))
+        .bind(size_i64(r.size_bytes))
+        .bind(r.duration_secs)
+        .bind(r.error)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        return Ok(n > 0);
+    }
     db.call(move |c| {
         let n = c.execute(
             "UPDATE recordings SET path = ?2, format = ?3, status = ?4, ended_at = ?5, size_bytes = ?6, \
@@ -122,6 +167,15 @@ pub async fn update(db: &Db, rec: &Recording) -> DbResult<bool> {
 /// Fetch one row.
 pub async fn get(db: &Db, id: &str) -> DbResult<Option<Recording>> {
     let id = id.to_string();
+    if let Some(pool) = db.pg() {
+        return q_dyn(format!("SELECT {COLUMNS} FROM recordings WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(pool)
+            .await?
+            .as_ref()
+            .map(pg_row)
+            .transpose();
+    }
     db.call(move |c| {
         Ok(c.query_row(
             &format!("SELECT {COLUMNS} FROM recordings WHERE id = ?1"),
@@ -136,6 +190,26 @@ pub async fn get(db: &Db, id: &str) -> DbResult<Option<Recording>> {
 /// List rows (all, or of one broadcast id), newest first.
 pub async fn list(db: &Db, broadcast_id: Option<&str>) -> DbResult<Vec<Recording>> {
     let bid = broadcast_id.map(str::to_string);
+    if let Some(pool) = db.pg() {
+        let rows = match bid {
+            Some(bid) => {
+                q_dyn(format!(
+                    "SELECT {COLUMNS} FROM recordings WHERE broadcast_id = $1 ORDER BY started_at DESC, id"
+                ))
+                .bind(bid)
+                .fetch_all(pool)
+                .await?
+            }
+            None => {
+                q_dyn(format!(
+                    "SELECT {COLUMNS} FROM recordings ORDER BY started_at DESC, id"
+                ))
+                .fetch_all(pool)
+                .await?
+            }
+        };
+        return rows.iter().map(pg_row).collect();
+    }
     db.call(move |c| {
         let rows = match bid {
             Some(bid) => {
@@ -157,14 +231,32 @@ pub async fn list(db: &Db, broadcast_id: Option<&str>) -> DbResult<Vec<Recording
     .await
 }
 
-/// Rows still `recording` or `processing` (crash recovery at startup), oldest first.
+/// Rows of **this node** still `recording` or `processing` (crash recovery at startup),
+/// oldest first. Rows written before node tags existed (`node_id` NULL) count as the
+/// single node's.
 pub async fn list_unfinished(db: &Db) -> DbResult<Vec<Recording>> {
-    db.call(|c| {
+    let node = db.node_id().to_string();
+    if let Some(pool) = db.pg() {
+        return q_dyn(format!(
+            "SELECT {COLUMNS} FROM recordings WHERE status IN ($1, $2) \
+             AND COALESCE(node_id, '') = $3 ORDER BY started_at"
+        ))
+        .bind(STATUS_RECORDING)
+        .bind(STATUS_PROCESSING)
+        .bind(node)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(pg_row)
+        .collect();
+    }
+    db.call(move |c| {
         let mut st = c.prepare(&format!(
-            "SELECT {COLUMNS} FROM recordings WHERE status IN (?1, ?2) ORDER BY started_at"
+            "SELECT {COLUMNS} FROM recordings WHERE status IN (?1, ?2) \
+             AND COALESCE(node_id, '') = ?3 ORDER BY started_at"
         ))?;
         let rows = st
-            .query_map([STATUS_RECORDING, STATUS_PROCESSING], from_row)?
+            .query_map(params![STATUS_RECORDING, STATUS_PROCESSING, node], from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     })
@@ -174,6 +266,17 @@ pub async fn list_unfinished(db: &Db) -> DbResult<Vec<Recording>> {
 /// Delete a row, returning it (the caller deletes the file).
 pub async fn delete(db: &Db, id: &str) -> DbResult<Option<Recording>> {
     let id = id.to_string();
+    if let Some(pool) = db.pg() {
+        return q_dyn(format!(
+            "DELETE FROM recordings WHERE id = $1 RETURNING {COLUMNS}"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(pg_row)
+        .transpose();
+    }
     db.call(move |c| {
         let tx = c.transaction()?;
         let rec = tx
@@ -190,6 +293,22 @@ pub async fn delete(db: &Db, id: &str) -> DbResult<Option<Recording>> {
         Ok(rec)
     })
     .await
+}
+
+fn pg_row(r: &PgRow) -> DbResult<Recording> {
+    Ok(Recording {
+        id: r.try_get(0)?,
+        broadcast_id: r.try_get(1)?,
+        stream_session_id: r.try_get(2)?,
+        path: r.try_get(3)?,
+        format: r.try_get(4)?,
+        status: r.try_get(5)?,
+        started_at: parse_ts(&r.try_get::<String, _>(6)?),
+        ended_at: r.try_get::<Option<String>, _>(7)?.map(|s| parse_ts(&s)),
+        size_bytes: get_u64(r, 8)?,
+        duration_secs: r.try_get(9)?,
+        error: r.try_get(10)?,
+    })
 }
 
 #[cfg(test)]
@@ -214,9 +333,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn crud() {
-        let db = Db::open_in_memory().unwrap();
+    async fn crud_body(db: Db) {
         let t0 = Utc::now();
         let a = rec("a", "b1", t0 - Duration::minutes(10));
         let b = rec("b", "b1", t0 - Duration::minutes(5));
@@ -263,10 +380,20 @@ mod tests {
             .map(|r| r.id)
             .collect();
         assert_eq!(unfinished, ["b", "c"]);
+        // Another node's unfinished rows are not this node's crash leftovers.
+        let other = db.clone().with_node_id("n2");
+        assert!(list_unfinished(&other).await.unwrap().is_empty());
+        let mut d = rec("d", "b1", t0 + Duration::minutes(1));
+        d.duration_secs = Some(1.5);
+        insert(&other, &d).await.unwrap();
+        assert_eq!(list_unfinished(&other).await.unwrap(), vec![d.clone()]);
+        assert_eq!(list_unfinished(&db).await.unwrap().len(), 2);
+        assert_eq!(delete(&db, "d").await.unwrap().unwrap(), d);
 
         assert_eq!(delete(&db, "a").await.unwrap().unwrap(), done);
         assert!(delete(&db, "a").await.unwrap().is_none());
         assert!(!update(&db, &done).await.unwrap());
         assert_eq!(list(&db, None).await.unwrap().len(), 2);
     }
+    crate::db::testkit::dual_db_test!(crud, crud_body);
 }

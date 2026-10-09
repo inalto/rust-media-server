@@ -537,6 +537,7 @@ function mountSettings(root) {
   });
 
   const systemBox = h('div', null, h('p', { class: 'muted' }, t('common.loading')));
+  const clusterBox = h('div', null, h('p', { class: 'muted' }, t('common.loading')));
   const overviewBox = h('div', null, h('p', { class: 'muted' }, t('common.loading')));
 
   function renderVideo() {
@@ -567,15 +568,68 @@ function mountSettings(root) {
     return h('dl', { class: 'kv' }, ...pairs.map(([k, v]) => [h('dt', null, k), h('dd', null, v)]));
   }
 
+  // Cluster panel: backend, this node and (cluster mode) the registered nodes, refreshed
+  // while the page is open.
+  let clusterTimer = null;
+  function renderCluster(c) {
+    if (!c) { setChildren(clusterBox); return; }
+    if (c.enabled && !clusterTimer) {
+      clusterTimer = setInterval(async () => {
+        if (document.hidden || destroyed) return;
+        try { const s = await api('/system'); if (!destroyed) renderCluster(s.cluster); } catch { /* next tick */ }
+      }, POLL_MS);
+      timers.push(clusterTimer);
+    }
+    const facts = kv([
+      [t('cluster.mode'), c.enabled ? t('cluster.enabled') : t('cluster.single')],
+      [t('cluster.backend'), c.backend === 'postgres' ? 'PostgreSQL' : 'SQLite'],
+      [t('cluster.nodeId'), h('span', { class: 'mono' }, c.node_id || '—')],
+    ]);
+    if (!c.enabled) {
+      setChildren(clusterBox, facts, h('p', { class: 'hint' }, t('cluster.singleHint')));
+      return;
+    }
+    const nodes = c.nodes || [];
+    const state = (n) => {
+      if (!n.alive) return h('span', { class: 'badge status-error' }, t('cluster.dead'));
+      if (n.draining) return h('span', { class: 'badge status-paused' }, t('cluster.draining'));
+      return h('span', { class: 'badge status-ok' }, t('cluster.alive'));
+    };
+    const ago = (v) => {
+      const ms = Date.now() - new Date(v).getTime();
+      return Number.isFinite(ms) ? t('cluster.ago', { duration: fmtDuration(Math.max(0, ms) / 1000) }) : '—';
+    };
+    setChildren(clusterBox, facts, nodes.length
+      ? h('div', { class: 'table-wrap' }, h('table', null,
+        h('thead', null, h('tr', null,
+          h('th', { scope: 'col' }, t('cluster.colNode')),
+          h('th', { scope: 'col' }, t('cluster.colAddress')),
+          h('th', { scope: 'col' }, t('cluster.colHeartbeat')),
+          h('th', { scope: 'col', class: 'num' }, t('cluster.colLive')),
+          h('th', { scope: 'col', class: 'num' }, t('common.viewers')),
+          h('th', { scope: 'col' }, t('common.status')))),
+        h('tbody', null, ...nodes.map((n) => h('tr', null,
+          h('td', null, h('span', { class: 'mono' }, n.node_id),
+            h('span', { class: 'muted small block' }, [n.node_id === c.node_id ? t('cluster.thisNode') : null, `v${n.version}`].filter(Boolean).join(' · '))),
+          h('td', null, h('span', { class: 'mono small' }, n.advertise_url)),
+          h('td', null, ago(n.heartbeat)),
+          h('td', { class: 'num' }, fmtInt(n.live_streams)),
+          h('td', { class: 'num' }, fmtInt(n.viewers)),
+          h('td', null, state(n)))))))
+      : h('p', { class: 'muted' }, t('cluster.noNodes')));
+  }
+
   async function loadSystem() {
     try {
       const s = await api('/system');
       if (destroyed) return;
       const ff = s.ffmpeg || {};
       const rtc = s.webrtc || {};
+      const rtcPublic = rtc.public_port && rtc.public_port !== rtc.udp_port ? t('system.rtcPublicPort', { port: rtc.public_port }) : null;
       const rtcLine = !rtc.enabled ? t('system.rtcDisabled')
         : !rtc.available ? (rtc.error ? t('system.rtcUnavailableReason', { error: rtc.error }) : t('system.unavailable'))
-          : [t('system.rtcStatus', { port: rtc.udp_port, sessions: fmtInt(rtc.sessions) }), rtc.audio ? null : t('system.rtcVideoOnly')].filter(Boolean).join(' · ');
+          : [t('system.rtcStatus', { port: rtc.udp_port, sessions: fmtInt(rtc.sessions) }), rtcPublic, rtc.audio ? null : t('system.rtcVideoOnly')].filter(Boolean).join(' · ');
+      renderCluster(s.cluster);
       setChildren(systemBox,
         ff.available ? null : h('div', { class: 'banner warn', role: 'alert' }, icon('alert'),
           h('div', null, h('strong', null, t('system.ffmpegMissingTitle')), t('system.ffmpegMissingText'))),
@@ -631,7 +685,8 @@ function mountSettings(root) {
       h('div', { class: 'grid-2' }, videoBox, h('div', { class: 'stack' }, upload, textForm))),
     section('set-overview', 'users', t('settings.overview'), overviewBox),
     vodSettingsPanel(),
-    section('set-system', 'server', t('settings.system'), systemBox)));
+    section('set-system', 'server', t('settings.system'), systemBox),
+    section('set-cluster', 'layers', t('settings.cluster'), clusterBox)));
 
   (async () => {
     try {

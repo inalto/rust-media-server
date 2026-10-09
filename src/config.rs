@@ -23,6 +23,7 @@ pub struct Config {
     pub log: LogConfig,
     pub webrtc: WebRtcConfig,
     pub vod: VodConfig,
+    pub cluster: ClusterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -153,6 +154,10 @@ pub struct WebRtcConfig {
     pub enabled: bool,
     /// Single UDP port shared by every WebRTC session (ICE, DTLS, SRTP).
     pub udp_port: u16,
+    /// Port advertised in the ICE candidates when it differs from `udp_port` (NAT port
+    /// mapping, e.g. several nodes behind one public IP: public 8444 → node port 8443).
+    /// `0` = same as `udp_port`.
+    pub public_port: u16,
     /// Public IPv4 addresses advertised as ICE host candidates (1:1 NAT, e.g. a cloud
     /// VM's elastic IP). Empty = the addresses of the local network interfaces.
     pub public_ip: Vec<String>,
@@ -168,11 +173,24 @@ pub struct WebRtcConfig {
     pub stun_server: String,
 }
 
+impl WebRtcConfig {
+    /// Port advertised to viewers (ICE host candidates): `public_port`, or `udp_port`
+    /// when it is 0.
+    pub fn advertised_port(&self) -> u16 {
+        if self.public_port != 0 {
+            self.public_port
+        } else {
+            self.udp_port
+        }
+    }
+}
+
 impl Default for WebRtcConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             udp_port: 8443,
+            public_port: 0,
             public_ip: Vec::new(),
             ice_lite: true,
             max_sessions: 100,
@@ -408,6 +426,165 @@ impl Default for VodConfig {
     }
 }
 
+/// Multi-instance mode (docs/CLUSTER.md §3.1). `enabled = false` (default) = single node:
+/// SQLite, no registry, no internal listener.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ClusterConfig {
+    pub enabled: bool,
+    /// Unique, stable node name (`[A-Za-z0-9._-]{1,64}`); empty = the host name.
+    pub node_id: String,
+    /// `postgres://user:password@host:5432/db` (required in cluster mode).
+    pub database_url: String,
+    /// Internal URL of this node reachable by the other nodes, e.g. `http://rms1:8081`.
+    pub advertise_url: String,
+    /// Listener of the internal routes (`/internal/*`), separate from the public one.
+    pub internal_bind: String,
+    /// Shared secret of the internal routes (≥ 32 characters, identical on every node).
+    pub internal_secret: String,
+    pub heartbeat_secs: u64,
+    /// A node (and its streams) is considered dead after this many seconds without
+    /// heartbeat.
+    pub node_ttl_secs: u64,
+    /// Stop a relay without local viewers after this many seconds (phase 7C-2).
+    pub relay_idle_secs: u64,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_id: String::new(),
+            database_url: String::new(),
+            advertise_url: String::new(),
+            internal_bind: "0.0.0.0:8081".into(),
+            internal_secret: String::new(),
+            heartbeat_secs: 5,
+            node_ttl_secs: 15,
+            relay_idle_secs: 30,
+        }
+    }
+}
+
+/// Secrets are redacted (the configuration may end up in logs).
+impl std::fmt::Debug for ClusterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterConfig")
+            .field("enabled", &self.enabled)
+            .field("node_id", &self.node_id)
+            .field("database_url", &redact_url_password(&self.database_url))
+            .field("advertise_url", &self.advertise_url)
+            .field("internal_bind", &self.internal_bind)
+            .field(
+                "internal_secret",
+                &if self.internal_secret.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("heartbeat_secs", &self.heartbeat_secs)
+            .field("node_ttl_secs", &self.node_ttl_secs)
+            .field("relay_idle_secs", &self.relay_idle_secs)
+            .finish()
+    }
+}
+
+/// `postgres://user:secret@host/db` → `postgres://user:***@host/db` (for logs).
+pub fn redact_url_password(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    match authority.rsplit_once('@') {
+        Some((userinfo, host)) => {
+            let user = userinfo.split(':').next().unwrap_or("");
+            if userinfo.contains(':') {
+                format!("{scheme}://{user}:***@{host}{path}")
+            } else {
+                format!("{scheme}://{user}@{host}{path}")
+            }
+        }
+        None => url.to_string(),
+    }
+}
+
+/// Host name of the machine (`/proc/sys/kernel/hostname`, then `$HOSTNAME`), `rms` when
+/// unknown. Default of `cluster.node_id`.
+pub fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "rms".to_string())
+}
+
+/// `[A-Za-z0-9._-]{1,64}`: node ids end up in URLs, session ids and log lines.
+pub fn is_valid_node_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+impl ClusterConfig {
+    /// Startup validation of cluster mode (no-op when disabled); clear messages naming
+    /// the offending key.
+    pub fn validate(&self, server: &ServerConfig) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !is_valid_node_id(&self.node_id) {
+            bail!(
+                "cluster.node_id {:?} is invalid: 1-64 characters among letters, digits, '.', '_', '-' (RMS_CLUSTER_NODE_ID)",
+                self.node_id
+            );
+        }
+        if !(self.database_url.starts_with("postgres://")
+            || self.database_url.starts_with("postgresql://"))
+        {
+            bail!(
+                "cluster.enabled requires cluster.database_url = postgres://user:password@host:5432/db (RMS_CLUSTER_DATABASE_URL)"
+            );
+        }
+        if !(self.advertise_url.starts_with("http://")
+            || self.advertise_url.starts_with("https://"))
+        {
+            bail!(
+                "cluster.enabled requires cluster.advertise_url, the internal URL of this node reachable by the others, e.g. http://rms1:8081 (RMS_CLUSTER_ADVERTISE_URL)"
+            );
+        }
+        self.internal_bind
+            .parse::<SocketAddr>()
+            .with_context(|| format!("invalid cluster.internal_bind {:?}", self.internal_bind))?;
+        if self.internal_secret.chars().count() < 32 {
+            bail!(
+                "cluster.internal_secret must be at least 32 characters, identical on every node (RMS_CLUSTER_INTERNAL_SECRET); e.g. `openssl rand -hex 32`"
+            );
+        }
+        if server.admin_token.is_empty() {
+            bail!(
+                "cluster.enabled requires server.admin_token (RMS_ADMIN_TOKEN), identical on every node: data/admin_token is per node and is not generated in cluster mode"
+            );
+        }
+        if self.heartbeat_secs == 0 {
+            bail!("cluster.heartbeat_secs must be at least 1");
+        }
+        if self.node_ttl_secs < 2 * self.heartbeat_secs {
+            bail!("cluster.node_ttl_secs must be at least twice cluster.heartbeat_secs");
+        }
+        if self.relay_idle_secs == 0 {
+            bail!("cluster.relay_idle_secs must be at least 1");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct FfmpegConfig {
@@ -510,6 +687,15 @@ impl Config {
         self.vod.encoder = self.vod.encoder.trim().to_string();
         self.vod.preset = self.vod.preset.trim().to_string();
         self.vod.default_ladder = self.vod.default_ladder.trim().to_string();
+        let c = &mut self.cluster;
+        c.node_id = c.node_id.trim().to_string();
+        if c.node_id.is_empty() {
+            c.node_id = hostname();
+        }
+        c.database_url = c.database_url.trim().to_string();
+        c.advertise_url = c.advertise_url.trim().trim_end_matches('/').to_string();
+        c.internal_bind = c.internal_bind.trim().to_string();
+        c.internal_secret = c.internal_secret.trim().to_string();
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -542,6 +728,7 @@ impl Config {
             bail!("webrtc.audio_bitrate_kbps must be between 6 and 510");
         }
         self.vod.validate()?;
+        self.cluster.validate(&self.server)?;
         Ok(())
     }
 
@@ -950,6 +1137,80 @@ mod tests {
         .unwrap();
         assert_eq!(c.vod.encoder, "h264_nvenc");
         assert_eq!(c.vod.max_parallel_jobs, 2);
+    }
+
+    #[test]
+    fn cluster_defaults_env_and_validation() {
+        let c = Config::default();
+        assert!(!c.cluster.enabled);
+        assert_eq!(c.cluster.internal_bind, "0.0.0.0:8081");
+        assert_eq!(
+            (
+                c.cluster.heartbeat_secs,
+                c.cluster.node_ttl_secs,
+                c.cluster.relay_idle_secs
+            ),
+            (5, 15, 30)
+        );
+        assert_eq!(c.webrtc.public_port, 0);
+        assert_eq!(c.webrtc.advertised_port(), 8443);
+        assert!(c.validate().is_ok(), "disabled cluster needs nothing");
+
+        let mut warnings = Vec::new();
+        let secret = "s".repeat(32);
+        let mut c = apply_env_overrides(
+            Config::default(),
+            vars(&[
+                ("RMS_CLUSTER_ENABLED", "true"),
+                ("RMS_CLUSTER_NODE_ID", " n1 "),
+                ("RMS_CLUSTER_DATABASE_URL", "postgres://rms:pw@db:5432/rms"),
+                ("RMS_CLUSTER_ADVERTISE_URL", "http://rms1:8081/"),
+                ("RMS_CLUSTER_INTERNAL_BIND", "127.0.0.1:18081"),
+                ("RMS_CLUSTER_INTERNAL_SECRET", &secret),
+                ("RMS_CLUSTER_HEARTBEAT_SECS", "2"),
+                ("RMS_CLUSTER_NODE_TTL_SECS", "6"),
+                ("RMS_ADMIN_TOKEN", "admin"),
+                ("RMS_WEBRTC_PUBLIC_PORT", "8444"),
+            ]),
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        c.normalize();
+        assert!(c.validate().is_ok(), "{:?}", c.validate());
+        assert_eq!(c.cluster.node_id, "n1");
+        assert_eq!(c.cluster.advertise_url, "http://rms1:8081");
+        assert_eq!(c.webrtc.advertised_port(), 8444);
+        // Secrets never reach Debug output.
+        let dbg = format!("{:?}", c.cluster);
+        assert!(!dbg.contains("pw@") && !dbg.contains(&secret), "{dbg}");
+        assert!(dbg.contains("postgres://rms:***@db:5432/rms"));
+
+        let invalid = |f: &dyn Fn(&mut Config)| {
+            let mut x = c.clone();
+            f(&mut x);
+            x.validate().unwrap_err().to_string()
+        };
+        assert!(invalid(&|x| x.cluster.database_url = "mysql://x".into()).contains("database_url"));
+        assert!(invalid(&|x| x.cluster.database_url.clear()).contains("RMS_CLUSTER_DATABASE_URL"));
+        assert!(invalid(&|x| x.cluster.advertise_url.clear()).contains("advertise_url"));
+        assert!(invalid(&|x| x.cluster.internal_secret = "short".into()).contains("32"));
+        assert!(invalid(&|x| x.server.admin_token.clear()).contains("admin_token"));
+        assert!(invalid(&|x| x.cluster.node_id = "a b".into()).contains("node_id"));
+        assert!(invalid(&|x| x.cluster.internal_bind = "nope".into()).contains("internal_bind"));
+        assert!(invalid(&|x| x.cluster.node_ttl_secs = 3).contains("node_ttl_secs"));
+        assert!(invalid(&|x| x.cluster.heartbeat_secs = 0).contains("heartbeat_secs"));
+
+        // An empty node id defaults to the host name.
+        let mut d = Config::default();
+        d.normalize();
+        assert_eq!(d.cluster.node_id, hostname());
+        assert!(!d.cluster.node_id.is_empty());
+        assert_eq!(
+            redact_url_password("postgresql://u@h/db"),
+            "postgresql://u@h/db"
+        );
+        assert_eq!(redact_url_password("garbage"), "garbage");
     }
 
     #[test]

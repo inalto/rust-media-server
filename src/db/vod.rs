@@ -3,13 +3,18 @@
 //! One row per video: the source file under `data/vod/<id>/`, its probe results, the
 //! transcoding status (`queued` → `processing` → `ready` | `failed`) and the renditions
 //! actually produced. Jobs are claimed with a conditional `UPDATE` (see [`claim`]) so
-//! several runners (threads, or instances sharing the database) never process the same
-//! item twice.
+//! several runners (threads, or nodes sharing the database) never process the same
+//! item twice. A claim records the node (`claimed_by`) and a lease (`lease_until`,
+//! renewed by the running job, docs/CLUSTER.md §3.7): `ready`/`failed` are only written
+//! by the lease holder, and expired leases are re-queued (`attempts` bounds the retries).
 
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
+use sqlx_core::row::Row as _;
+use sqlx_postgres::PgRow;
 
+use super::pg::{get_opt_u32, get_u32, get_u64, i64_of, q, q_dyn};
 use super::{Db, DbResult, fmt_ts, now_ts, parse_ts};
 
 /// `vod_items.status` values.
@@ -140,14 +145,57 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<VodItem> {
     })
 }
 
-fn i64_of(n: u64) -> i64 {
-    n.min(i64::MAX as u64) as i64
+/// Lease of a claimed job: renewed every [`LEASE_RENEW_SECS`] by the running job; a row
+/// whose lease expired is re-queued by any node ([`requeue_expired`]) or, for this
+/// node's own rows, at startup ([`requeue_interrupted`]).
+pub const LEASE_SECS: u64 = 60;
+/// Renewal period of a job lease (with the progress updates).
+pub const LEASE_RENEW_SECS: u64 = 15;
+/// A job interrupted (crash, lost lease) this many times is marked `failed` instead of
+/// being re-queued.
+pub const MAX_ATTEMPTS: i64 = 3;
+/// Error of an item that exhausted [`MAX_ATTEMPTS`].
+pub const TOO_MANY_ATTEMPTS: &str =
+    "transcoding interrupted too many times (node crashed or lost its lease)";
+
+/// SQLite lease deadline (`now + LEASE_SECS`, RFC 3339 text like every timestamp).
+fn sqlite_lease_until() -> String {
+    fmt_ts(&(Utc::now() + chrono::Duration::seconds(LEASE_SECS as i64)))
 }
 
 /// Insert a new row.
 pub async fn insert(db: &Db, item: &VodItem) -> DbResult<()> {
     let it = item.clone();
     let renditions = serde_json::to_string(&it.renditions).unwrap_or_else(|_| "[]".into());
+    if let Some(pool) = db.pg() {
+        q_dyn(format!(
+            "INSERT INTO vod_items ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+             $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)"
+        ))
+        .bind(it.id)
+        .bind(it.title)
+        .bind(it.description)
+        .bind(it.source_path)
+        .bind(it.source_name)
+        .bind(i64_of(it.source_size))
+        .bind(it.source_duration_secs)
+        .bind(it.source_width.map(i64::from))
+        .bind(it.source_height.map(i64::from))
+        .bind(it.source_codec)
+        .bind(it.origin)
+        .bind(it.status)
+        .bind(i64::from(it.progress))
+        .bind(it.ladder)
+        .bind(renditions)
+        .bind(it.error)
+        .bind(fmt_ts(&it.created_at))
+        .bind(fmt_ts(&it.updated_at))
+        .bind(it.ready_at.as_ref().map(fmt_ts))
+        .bind(i64_of(it.plays))
+        .execute(pool)
+        .await?;
+        return Ok(());
+    }
     db.call(move |c| {
         c.execute(
             &format!(
@@ -185,6 +233,9 @@ pub async fn insert(db: &Db, item: &VodItem) -> DbResult<()> {
 /// One row.
 pub async fn get(db: &Db, id: &str) -> DbResult<Option<VodItem>> {
     let id = id.to_string();
+    if let Some(pool) = db.pg() {
+        return pg_get(pool, &id).await;
+    }
     db.call(move |c| {
         Ok(c.query_row(
             &format!("SELECT {COLUMNS} FROM vod_items WHERE id = ?1"),
@@ -196,9 +247,38 @@ pub async fn get(db: &Db, id: &str) -> DbResult<Option<VodItem>> {
     .await
 }
 
+async fn pg_get(pool: &super::PgPool, id: &str) -> DbResult<Option<VodItem>> {
+    q_dyn(format!("SELECT {COLUMNS} FROM vod_items WHERE id = $1"))
+        .bind(id.to_string())
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(pg_row)
+        .transpose()
+}
+
 /// All rows (or those with `status`), newest first.
 pub async fn list(db: &Db, status: Option<&str>) -> DbResult<Vec<VodItem>> {
     let status = status.map(str::to_string);
+    if let Some(pool) = db.pg() {
+        let rows =
+            match status {
+                Some(s) => q_dyn(format!(
+                    "SELECT {COLUMNS} FROM vod_items WHERE status = $1 ORDER BY created_at DESC, id"
+                ))
+                .bind(s)
+                .fetch_all(pool)
+                .await?,
+                None => {
+                    q_dyn(format!(
+                        "SELECT {COLUMNS} FROM vod_items ORDER BY created_at DESC, id"
+                    ))
+                    .fetch_all(pool)
+                    .await?
+                }
+            };
+        return rows.iter().map(pg_row).collect();
+    }
     db.call(move |c| {
         let rows = match status {
             Some(s) => {
@@ -222,6 +302,17 @@ pub async fn list(db: &Db, status: Option<&str>) -> DbResult<Vec<VodItem>> {
 
 /// Ids of the `queued` items, oldest first (job order).
 pub async fn queued_ids(db: &Db, limit: usize) -> DbResult<Vec<String>> {
+    if let Some(pool) = db.pg() {
+        return q(
+            "SELECT id FROM vod_items WHERE status = 'queued' ORDER BY created_at, id LIMIT $1",
+        )
+        .bind(i64_of(limit as u64))
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|r| Ok(r.try_get::<String, _>(0)?))
+        .collect();
+    }
     db.call(move |c| {
         let mut st = c.prepare(
             "SELECT id FROM vod_items WHERE status = 'queued' ORDER BY created_at, id LIMIT ?1",
@@ -236,6 +327,13 @@ pub async fn queued_ids(db: &Db, limit: usize) -> DbResult<Vec<String>> {
 
 /// Number of items per status: `(queued, processing)`.
 pub async fn pending_counts(db: &Db) -> DbResult<(u64, u64)> {
+    if let Some(pool) = db.pg() {
+        let r = q("SELECT COUNT(*) FILTER (WHERE status = 'queued'), \
+                   COUNT(*) FILTER (WHERE status = 'processing') FROM vod_items")
+        .fetch_one(pool)
+        .await?;
+        return Ok((get_u64(&r, 0)?, get_u64(&r, 1)?));
+    }
     db.call(|c| {
         let count = |s: &str| -> rusqlite::Result<u64> {
             c.query_row(
@@ -250,15 +348,58 @@ pub async fn pending_counts(db: &Db) -> DbResult<(u64, u64)> {
     .await
 }
 
-/// Atomically take a `queued` item: `queued` → `processing`. False when another runner
-/// (or a delete) got there first.
+/// Atomically take a `queued` item: `queued` → `processing`, `claimed_by` = this node,
+/// lease for [`LEASE_SECS`], `attempts + 1`. False when another runner (or a delete)
+/// got there first (the conditional `UPDATE` is atomic on both backends).
 pub async fn claim(db: &Db, id: &str) -> DbResult<bool> {
-    let id = id.to_string();
+    let (id, node) = (id.to_string(), db.node_id().to_string());
+    if let Some(pool) = db.pg() {
+        let n = q("UPDATE vod_items SET status = 'processing', progress = 0, error = NULL, \
+                   updated_at = $2, claimed_by = $3, lease_until = now() + make_interval(secs => $4), \
+                   attempts = attempts + 1 WHERE id = $1 AND status = 'queued'")
+        .bind(id)
+        .bind(now_ts())
+        .bind(node)
+        .bind(LEASE_SECS as f64)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        return Ok(n == 1);
+    }
     db.call(move |c| {
         let n = c.execute(
-            "UPDATE vod_items SET status = 'processing', progress = 0, error = NULL, updated_at = ?2 \
+            "UPDATE vod_items SET status = 'processing', progress = 0, error = NULL, updated_at = ?2, \
+             claimed_by = ?3, lease_until = ?4, attempts = attempts + 1 \
              WHERE id = ?1 AND status = 'queued'",
-            params![id, now_ts()],
+            params![id, now_ts(), node, sqlite_lease_until()],
+        )?;
+        Ok(n == 1)
+    })
+    .await
+}
+
+/// Extend the lease of a job claimed by this node. False when the lease was lost (row
+/// deleted, re-queued after expiry, or claimed by another node).
+pub async fn renew_lease(db: &Db, id: &str) -> DbResult<bool> {
+    let (id, node) = (id.to_string(), db.node_id().to_string());
+    if let Some(pool) = db.pg() {
+        let n = q(
+            "UPDATE vod_items SET lease_until = now() + make_interval(secs => $3) \
+                   WHERE id = $1 AND status = 'processing' AND claimed_by = $2",
+        )
+        .bind(id)
+        .bind(node)
+        .bind(LEASE_SECS as f64)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        return Ok(n == 1);
+    }
+    db.call(move |c| {
+        let n = c.execute(
+            "UPDATE vod_items SET lease_until = ?3 \
+             WHERE id = ?1 AND status = 'processing' AND claimed_by = ?2",
+            params![id, node, sqlite_lease_until()],
         )?;
         Ok(n == 1)
     })
@@ -275,6 +416,22 @@ pub async fn set_source_info(
     codec: Option<String>,
 ) -> DbResult<bool> {
     let id = id.to_string();
+    if let Some(pool) = db.pg() {
+        let n = q(
+            "UPDATE vod_items SET source_duration_secs = $2, source_width = $3, \
+                   source_height = $4, source_codec = $5, updated_at = $6 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(duration)
+        .bind(width.map(i64::from))
+        .bind(height.map(i64::from))
+        .bind(codec)
+        .bind(now_ts())
+        .execute(pool)
+        .await?
+        .rows_affected();
+        return Ok(n == 1);
+    }
     db.call(move |c| {
         let n = c.execute(
             "UPDATE vod_items SET source_duration_secs = ?2, source_width = ?3, source_height = ?4, \
@@ -286,74 +443,158 @@ pub async fn set_source_info(
     .await
 }
 
-/// Progress of a `processing` item (0-100).
+/// Progress of a `processing` item claimed by this node (0-100); also renews the lease.
 pub async fn set_progress(db: &Db, id: &str, progress: u32) -> DbResult<bool> {
-    let id = id.to_string();
+    let (id, node) = (id.to_string(), db.node_id().to_string());
+    if let Some(pool) = db.pg() {
+        let n = q("UPDATE vod_items SET progress = $2, updated_at = $3, \
+                   lease_until = now() + make_interval(secs => $5) \
+                   WHERE id = $1 AND status = 'processing' AND claimed_by = $4")
+        .bind(id)
+        .bind(i64::from(progress.min(100)))
+        .bind(now_ts())
+        .bind(node)
+        .bind(LEASE_SECS as f64)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        return Ok(n == 1);
+    }
     db.call(move |c| {
         let n = c.execute(
-            "UPDATE vod_items SET progress = ?2, updated_at = ?3 WHERE id = ?1 AND status = 'processing'",
-            params![id, progress.min(100), now_ts()],
+            "UPDATE vod_items SET progress = ?2, updated_at = ?3, lease_until = ?5 \
+             WHERE id = ?1 AND status = 'processing' AND claimed_by = ?4",
+            params![id, progress.min(100), now_ts(), node, sqlite_lease_until()],
         )?;
         Ok(n == 1)
     })
     .await
 }
 
-/// `processing` → `ready` with the produced renditions. False when the row is gone or
-/// no longer `processing` (deleted / re-queued meanwhile).
+/// `processing` → `ready` with the produced renditions, only while this node holds the
+/// claim. False when the row is gone, no longer `processing` (deleted / re-queued
+/// meanwhile) or claimed by another node (lease lost: the result is discarded).
 pub async fn mark_ready(db: &Db, id: &str, renditions: &[Rendition]) -> DbResult<bool> {
-    let id = id.to_string();
+    let (id, node) = (id.to_string(), db.node_id().to_string());
     let json = serde_json::to_string(renditions).unwrap_or_else(|_| "[]".into());
+    if let Some(pool) = db.pg() {
+        let n = q(
+            "UPDATE vod_items SET status = 'ready', progress = 100, renditions_json = $2, \
+                   error = NULL, updated_at = $3, ready_at = $3, lease_until = NULL \
+                   WHERE id = $1 AND status = 'processing' AND claimed_by = $4",
+        )
+        .bind(id)
+        .bind(json)
+        .bind(now_ts())
+        .bind(node)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        return Ok(n == 1);
+    }
     db.call(move |c| {
         let now = now_ts();
         let n = c.execute(
             "UPDATE vod_items SET status = 'ready', progress = 100, renditions_json = ?2, error = NULL, \
-             updated_at = ?3, ready_at = ?3 WHERE id = ?1 AND status = 'processing'",
-            params![id, json, now],
+             updated_at = ?3, ready_at = ?3, lease_until = NULL \
+             WHERE id = ?1 AND status = 'processing' AND claimed_by = ?4",
+            params![id, json, now, node],
         )?;
         Ok(n == 1)
     })
     .await
 }
 
-/// `processing` → `failed` with an error message.
+/// `processing` → `failed` with an error message (only while this node holds the claim).
 pub async fn mark_failed(db: &Db, id: &str, error: &str) -> DbResult<bool> {
-    let id = id.to_string();
-    let error = error.to_string();
+    let (id, node, error) = (id.to_string(), db.node_id().to_string(), error.to_string());
+    if let Some(pool) = db.pg() {
+        let n = q(
+            "UPDATE vod_items SET status = 'failed', error = $2, renditions_json = '[]', \
+                   updated_at = $3, lease_until = NULL \
+                   WHERE id = $1 AND status = 'processing' AND claimed_by = $4",
+        )
+        .bind(id)
+        .bind(error)
+        .bind(now_ts())
+        .bind(node)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        return Ok(n == 1);
+    }
     db.call(move |c| {
         let n = c.execute(
-            "UPDATE vod_items SET status = 'failed', error = ?2, renditions_json = '[]', updated_at = ?3 \
-             WHERE id = ?1 AND status = 'processing'",
-            params![id, error, now_ts()],
+            "UPDATE vod_items SET status = 'failed', error = ?2, renditions_json = '[]', updated_at = ?3, \
+             lease_until = NULL WHERE id = ?1 AND status = 'processing' AND claimed_by = ?4",
+            params![id, error, now_ts(), node],
         )?;
         Ok(n == 1)
     })
     .await
 }
 
-/// `processing` → `queued` (job interrupted by a shutdown).
+/// `processing` → `queued` (job of this node interrupted by a shutdown). A graceful
+/// interruption does not count as an attempt.
 pub async fn unclaim(db: &Db, id: &str) -> DbResult<bool> {
-    let id = id.to_string();
+    let (id, node) = (id.to_string(), db.node_id().to_string());
+    if let Some(pool) = db.pg() {
+        let n = q(
+            "UPDATE vod_items SET status = 'queued', progress = 0, updated_at = $2, \
+                   claimed_by = NULL, lease_until = NULL, \
+                   attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END \
+                   WHERE id = $1 AND status = 'processing' AND claimed_by = $3",
+        )
+        .bind(id)
+        .bind(now_ts())
+        .bind(node)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        return Ok(n == 1);
+    }
     db.call(move |c| {
         let n = c.execute(
-            "UPDATE vod_items SET status = 'queued', progress = 0, updated_at = ?2 \
-             WHERE id = ?1 AND status = 'processing'",
-            params![id, now_ts()],
+            "UPDATE vod_items SET status = 'queued', progress = 0, updated_at = ?2, \
+             claimed_by = NULL, lease_until = NULL, \
+             attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END \
+             WHERE id = ?1 AND status = 'processing' AND claimed_by = ?3",
+            params![id, now_ts(), node],
         )?;
         Ok(n == 1)
     })
     .await
 }
 
-/// Re-queue a `ready` / `failed` / `queued` item with `ladder` (re-transcode). Returns the
-/// updated row; `None` when it does not exist or is `processing`.
+/// Re-queue a `ready` / `failed` / `queued` item with `ladder` (re-transcode; the attempt
+/// counter starts over). Returns the updated row; `None` when it does not exist or is
+/// `processing`.
 pub async fn requeue(db: &Db, id: &str, ladder: &str) -> DbResult<Option<VodItem>> {
     let id = id.to_string();
     let ladder = ladder.to_string();
+    if let Some(pool) = db.pg() {
+        let n = q(
+            "UPDATE vod_items SET status = 'queued', progress = 0, ladder = $2, \
+                   renditions_json = '[]', error = NULL, ready_at = NULL, updated_at = $3, \
+                   claimed_by = NULL, lease_until = NULL, attempts = 0 \
+                   WHERE id = $1 AND status != 'processing'",
+        )
+        .bind(id.clone())
+        .bind(ladder)
+        .bind(now_ts())
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Ok(None);
+        }
+        return pg_get(pool, &id).await;
+    }
     db.call(move |c| {
         let n = c.execute(
             "UPDATE vod_items SET status = 'queued', progress = 0, ladder = ?2, renditions_json = '[]', \
-             error = NULL, ready_at = NULL, updated_at = ?3 WHERE id = ?1 AND status != 'processing'",
+             error = NULL, ready_at = NULL, updated_at = ?3, claimed_by = NULL, lease_until = NULL, \
+             attempts = 0 WHERE id = ?1 AND status != 'processing'",
             params![id, ladder, now_ts()],
         )?;
         if n == 0 {
@@ -369,13 +610,82 @@ pub async fn requeue(db: &Db, id: &str, ladder: &str) -> DbResult<Option<VodItem
     .await
 }
 
-/// Startup: items left `processing` by a previous run go back to `queued`.
+/// SET clause shared by the re-queue of interrupted jobs: back to `queued`, or `failed`
+/// once [`MAX_ATTEMPTS`] is reached. Parameters: `?1`/`$1` = updated_at, the attempt
+/// limit and the error text follow the WHERE parameters (see the callers).
+const REQUEUE_SET_SQLITE: &str = "status = CASE WHEN attempts >= ?3 THEN 'failed' ELSE 'queued' END, \
+     error = CASE WHEN attempts >= ?3 THEN ?4 ELSE error END, \
+     renditions_json = CASE WHEN attempts >= ?3 THEN '[]' ELSE renditions_json END, \
+     progress = 0, claimed_by = NULL, lease_until = NULL, updated_at = ?1";
+const REQUEUE_SET_PG: &str = "status = CASE WHEN attempts >= $3 THEN 'failed' ELSE 'queued' END, \
+     error = CASE WHEN attempts >= $3 THEN $4 ELSE error END, \
+     renditions_json = CASE WHEN attempts >= $3 THEN '[]' ELSE renditions_json END, \
+     progress = 0, claimed_by = NULL, lease_until = NULL, updated_at = $1";
+
+/// Startup: items left `processing` by a previous run **of this node** (or unclaimed, or
+/// whose lease expired) go back to `queued`, or to `failed` after [`MAX_ATTEMPTS`].
+/// Jobs of other live nodes (valid lease) are left alone. Returns the rows changed.
 pub async fn requeue_interrupted(db: &Db) -> DbResult<usize> {
-    db.call(|c| {
+    let node = db.node_id().to_string();
+    if let Some(pool) = db.pg() {
+        let n = q_dyn(format!(
+            "UPDATE vod_items SET {REQUEUE_SET_PG} WHERE status = 'processing' AND \
+             (claimed_by IS NULL OR claimed_by = $2 OR lease_until IS NULL OR lease_until < now())"
+        ))
+        .bind(now_ts())
+        .bind(node)
+        .bind(MAX_ATTEMPTS as i32)
+        .bind(TOO_MANY_ATTEMPTS)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        return Ok(n as usize);
+    }
+    db.call(move |c| {
+        let now = now_ts();
         Ok(c.execute(
-            "UPDATE vod_items SET status = 'queued', progress = 0, updated_at = ?1 WHERE status = 'processing'",
-            [now_ts()],
+            &format!(
+                "UPDATE vod_items SET {REQUEUE_SET_SQLITE} WHERE status = 'processing' AND \
+                 (claimed_by IS NULL OR claimed_by = ?2 OR lease_until IS NULL OR lease_until < ?1)"
+            ),
+            params![now, node, MAX_ATTEMPTS, TOO_MANY_ATTEMPTS],
         )?)
+    })
+    .await
+}
+
+/// Periodic (every node): jobs of **other** nodes whose lease expired (node dead or cut
+/// off from the database) go back to `queued` (or `failed` after [`MAX_ATTEMPTS`]).
+/// Returns the ids changed.
+pub async fn requeue_expired(db: &Db) -> DbResult<Vec<String>> {
+    let node = db.node_id().to_string();
+    if let Some(pool) = db.pg() {
+        return q_dyn(format!(
+            "UPDATE vod_items SET {REQUEUE_SET_PG} WHERE status = 'processing' AND \
+             lease_until < now() AND claimed_by IS DISTINCT FROM $2 RETURNING id"
+        ))
+        .bind(now_ts())
+        .bind(node)
+        .bind(MAX_ATTEMPTS as i32)
+        .bind(TOO_MANY_ATTEMPTS)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|r| Ok(r.try_get::<String, _>(0)?))
+        .collect();
+    }
+    db.call(move |c| {
+        let now = now_ts();
+        let mut st = c.prepare(&format!(
+            "UPDATE vod_items SET {REQUEUE_SET_SQLITE} WHERE status = 'processing' AND \
+             lease_until < ?1 AND (claimed_by IS NULL OR claimed_by != ?2) RETURNING id"
+        ))?;
+        let ids = st
+            .query_map(params![now, node, MAX_ATTEMPTS, TOO_MANY_ATTEMPTS], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
     })
     .await
 }
@@ -388,6 +698,21 @@ pub async fn update_meta(
     description: Option<String>,
 ) -> DbResult<Option<VodItem>> {
     let id = id.to_string();
+    if let Some(pool) = db.pg() {
+        return q_dyn(format!(
+            "UPDATE vod_items SET title = COALESCE($2, title), description = COALESCE($3, description), \
+             updated_at = $4 WHERE id = $1 RETURNING {COLUMNS}"
+        ))
+        .bind(id)
+        .bind(title)
+        .bind(description)
+        .bind(now_ts())
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(pg_row)
+        .transpose();
+    }
     db.call(move |c| {
         let tx = c.transaction()?;
         let n = tx.execute(
@@ -414,6 +739,15 @@ pub async fn update_meta(
 /// `plays += 1`; returns the new count (`None` when the row does not exist).
 pub async fn increment_plays(db: &Db, id: &str) -> DbResult<Option<u64>> {
     let id = id.to_string();
+    if let Some(pool) = db.pg() {
+        return q("UPDATE vod_items SET plays = plays + 1 WHERE id = $1 RETURNING plays")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?
+            .as_ref()
+            .map(|r| get_u64(r, 0))
+            .transpose();
+    }
     db.call(move |c| {
         Ok(c.query_row(
             "UPDATE vod_items SET plays = plays + 1 WHERE id = ?1 RETURNING plays",
@@ -430,6 +764,18 @@ pub async fn increment_plays(db: &Db, id: &str) -> DbResult<Option<u64>> {
 /// Returns the deleted row; `Err`-free `None` when missing or refused.
 pub async fn delete(db: &Db, id: &str, allow_processing: bool) -> DbResult<Option<VodItem>> {
     let id = id.to_string();
+    if let Some(pool) = db.pg() {
+        return q_dyn(format!(
+            "DELETE FROM vod_items WHERE id = $1 AND ($2 OR status != 'processing') RETURNING {COLUMNS}"
+        ))
+        .bind(id)
+        .bind(allow_processing)
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(pg_row)
+        .transpose();
+    }
     db.call(move |c| {
         let tx = c.transaction()?;
         let item = tx
@@ -454,6 +800,14 @@ pub async fn delete(db: &Db, id: &str, allow_processing: bool) -> DbResult<Optio
 
 /// Ids of every row (orphan directory sweep at startup).
 pub async fn all_ids(db: &Db) -> DbResult<Vec<String>> {
+    if let Some(pool) = db.pg() {
+        return q("SELECT id FROM vod_items")
+            .fetch_all(pool)
+            .await?
+            .iter()
+            .map(|r| Ok(r.try_get::<String, _>(0)?))
+            .collect();
+    }
     db.call(|c| {
         let mut st = c.prepare("SELECT id FROM vod_items")?;
         let rows = st
@@ -462,6 +816,32 @@ pub async fn all_ids(db: &Db) -> DbResult<Vec<String>> {
         Ok(rows)
     })
     .await
+}
+
+fn pg_row(r: &PgRow) -> DbResult<VodItem> {
+    let renditions: String = r.try_get(14)?;
+    Ok(VodItem {
+        id: r.try_get(0)?,
+        title: r.try_get(1)?,
+        description: r.try_get(2)?,
+        source_path: r.try_get(3)?,
+        source_name: r.try_get(4)?,
+        source_size: get_u64(r, 5)?,
+        source_duration_secs: r.try_get(6)?,
+        source_width: get_opt_u32(r, 7)?,
+        source_height: get_opt_u32(r, 8)?,
+        source_codec: r.try_get(9)?,
+        origin: r.try_get(10)?,
+        status: r.try_get(11)?,
+        progress: get_u32(r, 12)?.min(100),
+        ladder: r.try_get(13)?,
+        renditions: serde_json::from_str(&renditions).unwrap_or_default(),
+        error: r.try_get(15)?,
+        created_at: parse_ts(&r.try_get::<String, _>(16)?),
+        updated_at: parse_ts(&r.try_get::<String, _>(17)?),
+        ready_at: r.try_get::<Option<String>, _>(18)?.map(|s| parse_ts(&s)),
+        plays: get_u64(r, 19)?,
+    })
 }
 
 #[cfg(test)]
@@ -483,9 +863,7 @@ mod tests {
         it
     }
 
-    #[tokio::test]
-    async fn lifecycle() {
-        let db = Db::open_in_memory().unwrap();
+    async fn lifecycle_body(db: Db) {
         let a = item("a", "2026-10-09T10:00:00.000Z");
         let b = item("b", "2026-10-09T11:00:00.000Z");
         let c = item("c", "2026-10-09T12:00:00.000Z");
@@ -618,4 +996,91 @@ mod tests {
         all.sort();
         assert_eq!(all, ["a", "b"]);
     }
+    crate::db::testkit::dual_db_test!(lifecycle, lifecycle_body);
+
+    async fn attempts(db: &Db, id: &str) -> i64 {
+        crate::db::testkit::scalar_i64(
+            db,
+            &format!("SELECT CAST(attempts AS BIGINT) FROM vod_items WHERE id = '{id}'"),
+        )
+        .await
+    }
+
+    /// docs/CLUSTER.md §3.7: claim with lease, renewal, ready only by the holder,
+    /// re-queue of expired leases, attempts limit.
+    async fn leases_body(db: Db) {
+        let n1 = db.clone().with_node_id("n1");
+        let n2 = db.clone().with_node_id("n2");
+        insert(&db, &item("a", "2026-10-09T10:00:00.000Z"))
+            .await
+            .unwrap();
+        insert(&db, &item("b", "2026-10-09T11:00:00.000Z"))
+            .await
+            .unwrap();
+
+        assert!(claim(&n1, "a").await.unwrap());
+        assert_eq!(attempts(&db, "a").await, 1);
+        assert!(renew_lease(&n1, "a").await.unwrap());
+        assert!(!renew_lease(&n2, "a").await.unwrap(), "not the holder");
+        assert!(set_progress(&n1, "a", 10).await.unwrap());
+        assert!(!set_progress(&n2, "a", 20).await.unwrap());
+        // A valid lease of another node survives this node's startup and sweeps.
+        assert_eq!(requeue_interrupted(&n2).await.unwrap(), 0);
+        assert!(requeue_expired(&n2).await.unwrap().is_empty());
+        assert!(!mark_ready(&n2, "a", &[]).await.unwrap(), "only the holder");
+        assert!(
+            !mark_failed(&n2, "a", "x").await.unwrap(),
+            "only the holder"
+        );
+        assert!(!unclaim(&n2, "a").await.unwrap(), "only the holder");
+
+        // n1 dies: its lease expires and n2 re-queues the job.
+        crate::db::testkit::execute(
+            &db,
+            "UPDATE vod_items SET lease_until = NULL WHERE id = 'a'",
+        )
+        .await;
+        assert_eq!(
+            requeue_interrupted(&n2).await.unwrap(),
+            1,
+            "no lease = orphan"
+        );
+        assert_eq!(get(&db, "a").await.unwrap().unwrap().status, STATUS_QUEUED);
+        assert!(claim(&n2, "a").await.unwrap());
+        assert_eq!(attempts(&db, "a").await, 2);
+        // The old holder can no longer finish it.
+        assert!(!mark_ready(&n1, "a", &[]).await.unwrap());
+        // Expired lease (DB clock on PostgreSQL, wall clock on SQLite).
+        let expire = if db.pg().is_some() {
+            "UPDATE vod_items SET lease_until = now() - interval '1 second' WHERE id = 'a'"
+        } else {
+            "UPDATE vod_items SET lease_until = '2000-01-01T00:00:00.000Z' WHERE id = 'a'"
+        };
+        crate::db::testkit::execute(&db, expire).await;
+        assert!(
+            requeue_expired(&n2).await.unwrap().is_empty(),
+            "own rows: startup only"
+        );
+        assert_eq!(requeue_expired(&n1).await.unwrap(), ["a"]);
+        assert!(claim(&n1, "a").await.unwrap());
+        assert_eq!(attempts(&db, "a").await, 3);
+        // Graceful shutdown does not count as an attempt.
+        assert!(unclaim(&n1, "a").await.unwrap());
+        assert_eq!(attempts(&db, "a").await, 2);
+        assert!(claim(&n1, "a").await.unwrap());
+        // Third crash of n1: failed instead of queued.
+        assert_eq!(requeue_interrupted(&n1).await.unwrap(), 1);
+        let failed = get(&db, "a").await.unwrap().unwrap();
+        assert_eq!(failed.status, STATUS_FAILED);
+        assert_eq!(failed.error.as_deref(), Some(TOO_MANY_ATTEMPTS));
+        // A re-transcode starts over.
+        requeue(&db, "a", "mobile").await.unwrap().unwrap();
+        assert_eq!(attempts(&db, "a").await, 0);
+
+        // The holder finishes normally.
+        assert!(claim(&n2, "b").await.unwrap());
+        assert!(mark_ready(&n2, "b", &[]).await.unwrap());
+        assert_eq!(get(&db, "b").await.unwrap().unwrap().status, STATUS_READY);
+    }
+    crate::db::testkit::dual_db_test!(leases, leases_body);
 }

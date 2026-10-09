@@ -45,10 +45,17 @@ pub enum TokenSource {
     Generated,
 }
 
-/// Resolve the admin token (see module docs). The data dir must exist.
+/// Resolve the admin token (see module docs). The data dir must exist. In cluster mode
+/// the token must come from the configuration (identical on every node): the per-node
+/// file is neither read nor generated.
 pub fn bootstrap_admin_token(config: &Config) -> anyhow::Result<(String, TokenSource)> {
     if !config.server.admin_token.is_empty() {
         return Ok((config.server.admin_token.clone(), TokenSource::Config));
+    }
+    if config.cluster.enabled {
+        anyhow::bail!(
+            "cluster mode requires server.admin_token (RMS_ADMIN_TOKEN), identical on every node"
+        );
     }
     let path = config.admin_token_path();
     if path.exists() {
@@ -246,6 +253,11 @@ mod tests {
             bootstrap_admin_token(&cfg).unwrap(),
             ("explicit".into(), TokenSource::Config)
         );
+        // Cluster mode never falls back to the per-node file.
+        let mut cluster = cfg.clone();
+        cluster.cluster.enabled = true;
+        cluster.server.admin_token.clear();
+        assert!(bootstrap_admin_token(&cluster).is_err());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

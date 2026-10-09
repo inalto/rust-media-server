@@ -176,6 +176,8 @@ pub struct ViewerTracker {
     /// Writes dropped because the queue was full (database far behind).
     db_dropped: AtomicU64,
     session_timeout: Duration,
+    /// `metrics.sample_interval_secs` (bucket used to add up the samples of several nodes).
+    sample_interval_secs: u64,
 }
 
 /// Guard for a connection-oriented viewer session; dropping it closes the session.
@@ -219,7 +221,13 @@ impl ViewerTracker {
             db_queue: Mutex::new(None),
             db_dropped: AtomicU64::new(0),
             session_timeout: Duration::from_secs(config.metrics.session_timeout_secs.max(1)),
+            sample_interval_secs: config.metrics.sample_interval_secs.max(1),
         })
+    }
+
+    /// `metrics.sample_interval_secs` (the samplers of all nodes use the same slots).
+    pub fn sample_interval_secs(&self) -> u64 {
+        self.sample_interval_secs
     }
 
     /// Spawn the reaper task expiring idle HLS/DASH sessions (every 5 s).
@@ -520,23 +528,28 @@ async fn session_writer(db: Db, mut rx: mpsc::Receiver<SessionWrite>) {
     tracing::debug!(task = "viewer-session-writer", "stopped");
 }
 
-/// Peer IP of a request: first `X-Forwarded-For` element or `X-Real-IP` when
-/// `trust_proxy` is set (and parseable), otherwise the socket address.
+/// Peer IP of a request. With `trust_proxy`: `X-Real-IP` (set by the proxy to the
+/// address it saw), else the **last** `X-Forwarded-For` element (the one appended by the
+/// trusted proxy; the first ones come from the client and can be forged), else the socket
+/// address. Without `trust_proxy` (or with unparseable headers): the socket address.
 pub fn client_ip(headers: &HeaderMap, peer: SocketAddr, trust_proxy: bool) -> IpAddr {
     if trust_proxy {
-        let forwarded = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .and_then(|v| v.trim().parse::<IpAddr>().ok());
-        if let Some(ip) = forwarded {
-            return ip;
-        }
         if let Some(ip) = headers
             .get("x-real-ip")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<IpAddr>().ok())
         {
+            return ip;
+        }
+        // Several headers count as one comma-separated list (RFC 9110 §5.3).
+        let last = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+            .rfind(|v| !v.is_empty());
+        if let Some(ip) = last.and_then(|v| v.parse::<IpAddr>().ok()) {
             return ip;
         }
     }
@@ -730,14 +743,32 @@ mod tests {
     #[test]
     fn client_ip_proxy_handling() {
         let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let ip = |h: &HeaderMap| client_ip(h, peer, true).to_string();
         let mut h = HeaderMap::new();
+        // Client-supplied 203.0.113.7, appended by the proxy: 10.0.0.1 (the last hop).
         h.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
-        assert_eq!(client_ip(&h, peer, false), peer.ip());
-        assert_eq!(client_ip(&h, peer, true).to_string(), "203.0.113.7");
+        assert_eq!(client_ip(&h, peer, false), peer.ip(), "untrusted proxy");
+        assert_eq!(ip(&h), "10.0.0.1", "last element, not the forgeable first");
+        h.insert("x-forwarded-for", " 198.51.100.9 , ".parse().unwrap());
+        assert_eq!(ip(&h), "198.51.100.9", "empty trailing element ignored");
+        // Several headers: the last one wins.
+        let mut multi = HeaderMap::new();
+        multi.append("x-forwarded-for", "1.1.1.1".parse().unwrap());
+        multi.append("x-forwarded-for", "2.2.2.2, 3.3.3.3".parse().unwrap());
+        assert_eq!(ip(&multi), "3.3.3.3");
+        // X-Real-IP wins over X-Forwarded-For.
         let mut h2 = HeaderMap::new();
         h2.insert("x-real-ip", "198.51.100.1".parse().unwrap());
-        assert_eq!(client_ip(&h2, peer, true).to_string(), "198.51.100.1");
-        h2.insert("x-forwarded-for", "garbage".parse().unwrap());
-        assert_eq!(client_ip(&h2, peer, true).to_string(), "198.51.100.1");
+        assert_eq!(ip(&h2), "198.51.100.1");
+        h2.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        assert_eq!(ip(&h2), "198.51.100.1");
+        // Garbage falls back: bad X-Real-IP -> X-Forwarded-For -> socket address.
+        let mut h3 = HeaderMap::new();
+        h3.insert("x-real-ip", "garbage".parse().unwrap());
+        h3.insert("x-forwarded-for", "2001:db8::1".parse().unwrap());
+        assert_eq!(ip(&h3), "2001:db8::1");
+        h3.insert("x-forwarded-for", "nope".parse().unwrap());
+        assert_eq!(client_ip(&h3, peer, true), peer.ip());
+        assert_eq!(client_ip(&HeaderMap::new(), peer, true), peer.ip());
     }
 }

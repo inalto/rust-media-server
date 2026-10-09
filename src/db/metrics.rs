@@ -5,8 +5,12 @@
 //! the sampler task (`metrics::sampler`).
 //!
 //! Read side (used by `GET /broadcasts/{name}/metrics[/summary]`): [`series`] (bucketed
-//! with **max** aggregation), [`peak`], [`sessions_total`], [`avg_watch_secs`] and
-//! [`stream_bytes_in`].
+//! with **max** per node, then **sum** over the nodes), [`peak`], [`sessions_total`],
+//! [`avg_watch_secs`] and [`stream_bytes_in`].
+//!
+//! Every row carries the writing node ([`Db::node_id`]: empty on a single node), so the
+//! crash recovery only touches this node's rows and the aggregates follow
+//! docs/CLUSTER.md §3.6; with one node the results are those of the per-bucket max.
 //!
 //! Timestamps are stored with [`fmt_ts`] (RFC 3339, milliseconds, `Z`), so range
 //! filters are plain lexicographic comparisons that use the `(broadcast_id, ts)` index.
@@ -14,7 +18,9 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
+use sqlx_core::row::Row as _;
 
+use super::pg::{get_u32, q, q_dyn};
 use super::{Db, DbResult, fmt_ts, parse_ts};
 use crate::metrics::{Protocol, ViewerCounts};
 
@@ -86,7 +92,8 @@ pub async fn close_viewer_session(db: &Db, id: &str, ended_at: DateTime<Utc>) ->
 }
 
 /// Apply `writes` in order, in one transaction (one savepoint per write: a failing
-/// write is logged and skipped without affecting the others).
+/// write is logged and skipped without affecting the others). Rows are tagged with
+/// [`Db::node_id`].
 ///
 /// The tracker funnels every open/close through a single ordered queue into this
 /// function: applying them in issue order is what guarantees that the close of a
@@ -96,12 +103,16 @@ pub async fn apply_session_writes(db: &Db, writes: Vec<SessionWrite>) -> DbResul
     if writes.is_empty() {
         return Ok(());
     }
+    let node = db.node_id().to_string();
+    if let Some(pool) = db.pg() {
+        return pg::apply_session_writes(pool, &node, &writes).await;
+    }
     db.call(move |c| {
         let mut tx = c.transaction()?;
         for w in &writes {
             let sp = tx.savepoint()?;
             let r = match w {
-                SessionWrite::Open(record) => open_session_row(&sp, record),
+                SessionWrite::Open(record) => open_session_row(&sp, record, &node),
                 SessionWrite::Close { id, ended_at } => sp
                     .execute(
                         "UPDATE viewer_sessions SET ended_at = ?2 WHERE id = ?1 AND ended_at IS NULL",
@@ -123,6 +134,7 @@ pub async fn apply_session_writes(db: &Db, writes: Vec<SessionWrite>) -> DbResul
 fn open_session_row(
     c: &rusqlite::Connection,
     record: &ViewerSessionRecord,
+    node: &str,
 ) -> rusqlite::Result<()> {
     let bid: Option<String> = c
         .query_row(
@@ -151,38 +163,57 @@ fn open_session_row(
         )?;
     }
     c.execute(
-        "INSERT INTO viewer_sessions (id, broadcast_id, protocol, ip, user_agent, started_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO viewer_sessions (id, broadcast_id, protocol, ip, user_agent, started_at, node_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             record.id,
             bid,
             record.protocol.as_str(),
             record.ip,
             record.user_agent,
-            started
+            started,
+            node
         ],
     )?;
     Ok(())
 }
 
-/// Crash recovery: close `viewer_sessions` rows left open by a previous process
-/// (`started_at < before`). The end time is approximated with the last non-zero
-/// sample of the broadcast taken during the session, or `started_at` when there is none.
+/// Crash recovery: close the `viewer_sessions` rows of **this node** left open by a
+/// previous process (`started_at < before`). The end time is approximated with the last
+/// non-zero sample of the broadcast taken by this node during the session, or
+/// `started_at` when there is none.
 pub async fn close_dangling_viewer_sessions(db: &Db, before: DateTime<Utc>) -> DbResult<usize> {
+    let node = db.node_id().to_string();
+    if let Some(pool) = db.pg() {
+        let n = q("UPDATE viewer_sessions SET ended_at = COALESCE(\
+               (SELECT MAX(s.ts) FROM viewer_samples s WHERE s.broadcast_id = viewer_sessions.broadcast_id \
+                AND s.node_id = viewer_sessions.node_id \
+                AND s.ts >= viewer_sessions.started_at AND s.ts < $1 AND s.total > 0), \
+               started_at) \
+             WHERE ended_at IS NULL AND started_at < $1 AND node_id = $2")
+        .bind(fmt_ts(&before))
+        .bind(node)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        return Ok(n as usize);
+    }
     db.call(move |c| {
         Ok(c.execute(
             "UPDATE viewer_sessions SET ended_at = COALESCE(\
                (SELECT MAX(s.ts) FROM viewer_samples s WHERE s.broadcast_id = viewer_sessions.broadcast_id \
+                AND s.node_id = viewer_sessions.node_id \
                 AND s.ts >= viewer_sessions.started_at AND s.ts < ?1 AND s.total > 0), \
                started_at) \
-             WHERE ended_at IS NULL AND started_at < ?1",
-            [fmt_ts(&before)],
+             WHERE ended_at IS NULL AND started_at < ?1 AND node_id = ?2",
+            params![fmt_ts(&before), node],
         )?)
     })
     .await
 }
 
-/// Insert one `viewer_samples` row (replacing a sample with the very same timestamp).
+/// Insert one `viewer_samples` row of this node (replacing a sample of this node with
+/// the very same timestamp).
 pub async fn insert_sample(
     db: &Db,
     broadcast_id: &str,
@@ -190,13 +221,37 @@ pub async fn insert_sample(
     counts: ViewerCounts,
 ) -> DbResult<()> {
     let bid = broadcast_id.to_string();
+    let node = db.node_id().to_string();
+    if let Some(pool) = db.pg() {
+        q("INSERT INTO viewer_samples (broadcast_id, node_id, ts, ts_epoch, total, flv, ws_flv, hls, dash, webrtc) \
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+           ON CONFLICT (broadcast_id, node_id, ts) DO UPDATE SET ts_epoch = excluded.ts_epoch, \
+           total = excluded.total, flv = excluded.flv, ws_flv = excluded.ws_flv, hls = excluded.hls, \
+           dash = excluded.dash, webrtc = excluded.webrtc")
+        .bind(bid)
+        .bind(node)
+        .bind(fmt_ts(&ts))
+        .bind(ts.timestamp())
+        .bind(i64::from(counts.total()))
+        .bind(i64::from(counts.flv))
+        .bind(i64::from(counts.ws_flv))
+        .bind(i64::from(counts.hls))
+        .bind(i64::from(counts.dash))
+        .bind(i64::from(counts.webrtc))
+        .execute(pool)
+        .await?;
+        return Ok(());
+    }
     db.call(move |c| {
         c.execute(
-            "INSERT OR REPLACE INTO viewer_samples (broadcast_id, ts, total, flv, ws_flv, hls, dash, webrtc) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO viewer_samples \
+             (broadcast_id, node_id, ts, ts_epoch, total, flv, ws_flv, hls, dash, webrtc) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 bid,
+                node,
                 fmt_ts(&ts),
+                ts.timestamp(),
                 counts.total(),
                 counts.flv,
                 counts.ws_flv,
@@ -212,6 +267,14 @@ pub async fn insert_sample(
 
 /// Retention: delete `viewer_samples` older than `cutoff`; returns deleted rows.
 pub async fn delete_samples_older_than(db: &Db, cutoff: DateTime<Utc>) -> DbResult<usize> {
+    if let Some(pool) = db.pg() {
+        let n = q("DELETE FROM viewer_samples WHERE ts < $1")
+            .bind(fmt_ts(&cutoff))
+            .execute(pool)
+            .await?
+            .rows_affected();
+        return Ok(n as usize);
+    }
     db.call(move |c| {
         Ok(c.execute(
             "DELETE FROM viewer_samples WHERE ts < ?1",
@@ -224,6 +287,14 @@ pub async fn delete_samples_older_than(db: &Db, cutoff: DateTime<Utc>) -> DbResu
 /// Retention: delete closed `viewer_sessions` that ended before `cutoff`; returns
 /// deleted rows (keeps the table bounded like the samples).
 pub async fn delete_sessions_older_than(db: &Db, cutoff: DateTime<Utc>) -> DbResult<usize> {
+    if let Some(pool) = db.pg() {
+        let n = q("DELETE FROM viewer_sessions WHERE ended_at IS NOT NULL AND ended_at < $1")
+            .bind(fmt_ts(&cutoff))
+            .execute(pool)
+            .await?
+            .rows_affected();
+        return Ok(n as usize);
+    }
     db.call(move |c| {
         Ok(c.execute(
             "DELETE FROM viewer_sessions WHERE ended_at IS NOT NULL AND ended_at < ?1",
@@ -234,7 +305,10 @@ pub async fn delete_sessions_older_than(db: &Db, cutoff: DateTime<Utc>) -> DbRes
 }
 
 /// Samples of `broadcast_id` in `[from, to)` grouped in buckets of `step_secs` aligned
-/// to the Unix epoch (`t` = bucket start), every column aggregated with `MAX`.
+/// to the Unix epoch (`t` = bucket start). Per column: the **max** of every node's
+/// samples in the bucket, then the **sum** over the nodes (docs/CLUSTER.md §3.6; the
+/// samplers of different nodes are not synchronized). With one node this is the plain
+/// per-bucket max.
 ///
 /// Sparse: buckets without samples are omitted (see `metrics::query` for the dense,
 /// zero-filled series served by the API). Sorted by `t`.
@@ -247,11 +321,44 @@ pub async fn series(
 ) -> DbResult<Vec<Point>> {
     let bid = broadcast_id.to_string();
     let step = step_secs.clamp(1, i64::MAX as u64) as i64;
+    if let Some(pool) = db.pg() {
+        return q(
+            "SELECT bucket, CAST(SUM(t) AS BIGINT), CAST(SUM(flv) AS BIGINT), \
+               CAST(SUM(ws_flv) AS BIGINT), CAST(SUM(hls) AS BIGINT), CAST(SUM(dash) AS BIGINT), \
+               CAST(SUM(webrtc) AS BIGINT) FROM ( \
+               SELECT (ts_epoch / $4) * $4 AS bucket, node_id, MAX(total) AS t, MAX(flv) AS flv, \
+                 MAX(ws_flv) AS ws_flv, MAX(hls) AS hls, MAX(dash) AS dash, MAX(webrtc) AS webrtc \
+               FROM viewer_samples WHERE broadcast_id = $1 AND ts >= $2 AND ts < $3 \
+               GROUP BY 1, 2) s \
+             GROUP BY bucket ORDER BY bucket",
+        )
+        .bind(bid)
+        .bind(fmt_ts(&from))
+        .bind(fmt_ts(&to))
+        .bind(step)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|r| {
+            Ok(Point {
+                t: DateTime::from_timestamp(r.try_get::<i64, _>(0)?, 0).unwrap_or_default(),
+                total: get_u32(r, 1)?,
+                flv: get_u32(r, 2)?,
+                ws_flv: get_u32(r, 3)?,
+                hls: get_u32(r, 4)?,
+                dash: get_u32(r, 5)?,
+                webrtc: get_u32(r, 6)?,
+            })
+        })
+        .collect();
+    }
     db.call(move |c| {
         let mut st = c.prepare(
-            "SELECT (CAST(strftime('%s', ts) AS INTEGER) / ?4) * ?4 AS bucket, \
-               MAX(total), MAX(flv), MAX(ws_flv), MAX(hls), MAX(dash), MAX(webrtc) \
-             FROM viewer_samples WHERE broadcast_id = ?1 AND ts >= ?2 AND ts < ?3 \
+            "SELECT bucket, SUM(t), SUM(flv), SUM(ws_flv), SUM(hls), SUM(dash), SUM(webrtc) FROM ( \
+               SELECT (ts_epoch / ?4) * ?4 AS bucket, node_id, MAX(total) AS t, MAX(flv) AS flv, \
+                 MAX(ws_flv) AS ws_flv, MAX(hls) AS hls, MAX(dash) AS dash, MAX(webrtc) AS webrtc \
+               FROM viewer_samples WHERE broadcast_id = ?1 AND ts >= ?2 AND ts < ?3 \
+               GROUP BY bucket, node_id) \
              GROUP BY bucket ORDER BY bucket",
         )?;
         let rows = st
@@ -273,22 +380,90 @@ pub async fn series(
     .await
 }
 
-/// Highest sampled `total` in `[from, to)` and when it was first reached.
+/// Highest total in `[from, to)` and when it was first reached.
+///
+/// The total of an instant is the sum over the nodes of their samples, matched by
+/// epoch-aligned buckets of `bucket_secs` (the sampling interval: every node samples in
+/// the middle of the same wall-clock slots) with the max per node within a bucket
+/// (docs/CLUSTER.md §3.6: peak = max of the sum, not the sum of the maxima). `at` is
+/// the earliest sample of the winning bucket where a node reached its bucket maximum.
+/// With one node this is exactly the highest sample and its timestamp.
 pub async fn peak(
     db: &Db,
     broadcast_id: &str,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
+    bucket_secs: u64,
 ) -> DbResult<Option<(u32, DateTime<Utc>)>> {
     let bid = broadcast_id.to_string();
+    let step = bucket_secs.clamp(1, i64::MAX as u64) as i64;
+    let (from_s, to_s) = (fmt_ts(&from), fmt_ts(&to));
+    if let Some(pool) = db.pg() {
+        let Some(row) = q("SELECT bucket, CAST(SUM(t) AS BIGINT) AS total FROM ( \
+               SELECT (ts_epoch / $4) * $4 AS bucket, node_id, MAX(total) AS t \
+               FROM viewer_samples WHERE broadcast_id = $1 AND ts >= $2 AND ts < $3 \
+               GROUP BY 1, 2) s \
+             GROUP BY bucket ORDER BY total DESC, bucket ASC LIMIT 1")
+        .bind(bid.clone())
+        .bind(from_s.clone())
+        .bind(to_s.clone())
+        .bind(step)
+        .fetch_optional(pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let (bucket, total): (i64, i64) = (row.try_get(0)?, row.try_get(1)?);
+        let at: Option<String> = q("SELECT MIN(v.ts) FROM viewer_samples v JOIN ( \
+               SELECT node_id, MAX(total) AS t FROM viewer_samples \
+               WHERE broadcast_id = $1 AND ts >= $2 AND ts < $3 AND ts_epoch >= $4 AND ts_epoch < $4 + $5 \
+               GROUP BY node_id) m ON v.node_id = m.node_id AND v.total = m.t \
+             WHERE v.broadcast_id = $1 AND v.ts >= $2 AND v.ts < $3 \
+               AND v.ts_epoch >= $4 AND v.ts_epoch < $4 + $5")
+        .bind(bid)
+        .bind(from_s)
+        .bind(to_s)
+        .bind(bucket)
+        .bind(step)
+        .fetch_one(pool)
+        .await?
+        .try_get(0)?;
+        return Ok(Some((
+            crate::db::pg::u32_of(total),
+            at.map(|s| parse_ts(&s))
+                .unwrap_or_else(|| DateTime::from_timestamp(bucket, 0).unwrap_or_default()),
+        )));
+    }
     db.call(move |c| {
-        Ok(c.query_row(
-            "SELECT total, ts FROM viewer_samples WHERE broadcast_id = ?1 AND ts >= ?2 AND ts < ?3 \
-             ORDER BY total DESC, ts ASC LIMIT 1",
-            params![bid, fmt_ts(&from), fmt_ts(&to)],
-            |r| Ok((r.get::<_, u32>(0)?, parse_ts(&r.get::<_, String>(1)?))),
-        )
-        .optional()?)
+        let best: Option<(i64, i64)> = c
+            .query_row(
+                "SELECT bucket, SUM(t) AS total FROM ( \
+                   SELECT (ts_epoch / ?4) * ?4 AS bucket, node_id, MAX(total) AS t \
+                   FROM viewer_samples WHERE broadcast_id = ?1 AND ts >= ?2 AND ts < ?3 \
+                   GROUP BY bucket, node_id) \
+                 GROUP BY bucket ORDER BY total DESC, bucket ASC LIMIT 1",
+                params![bid, from_s, to_s, step],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((bucket, total)) = best else {
+            return Ok(None);
+        };
+        let at: Option<String> = c.query_row(
+            "SELECT MIN(v.ts) FROM viewer_samples v JOIN ( \
+               SELECT node_id, MAX(total) AS t FROM viewer_samples \
+               WHERE broadcast_id = ?1 AND ts >= ?2 AND ts < ?3 AND ts_epoch >= ?4 AND ts_epoch < ?4 + ?5 \
+               GROUP BY node_id) m ON v.node_id = m.node_id AND v.total = m.t \
+             WHERE v.broadcast_id = ?1 AND v.ts >= ?2 AND v.ts < ?3 \
+               AND v.ts_epoch >= ?4 AND v.ts_epoch < ?4 + ?5",
+            params![bid, from_s, to_s, bucket, step],
+            |r| r.get(0),
+        )?;
+        Ok(Some((
+            total.clamp(0, u32::MAX as i64) as u32,
+            at.map(|s| parse_ts(&s))
+                .unwrap_or_else(|| DateTime::from_timestamp(bucket, 0).unwrap_or_default()),
+        )))
     })
     .await
 }
@@ -296,8 +471,10 @@ pub async fn peak(
 /// Sessions overlapping `[from, to)`: started before `to` and not ended before `from`.
 const OVERLAP: &str =
     "broadcast_id = ?1 AND started_at < ?3 AND (ended_at IS NULL OR ended_at >= ?2)";
+const PG_OVERLAP: &str =
+    "broadcast_id = $1 AND started_at < $3 AND (ended_at IS NULL OR ended_at >= $2)";
 
-/// Number of viewer sessions (all protocols) overlapping `[from, to)`.
+/// Number of viewer sessions (all protocols, all nodes) overlapping `[from, to)`.
 pub async fn sessions_total(
     db: &Db,
     broadcast_id: &str,
@@ -305,6 +482,18 @@ pub async fn sessions_total(
     to: DateTime<Utc>,
 ) -> DbResult<u64> {
     let bid = broadcast_id.to_string();
+    if let Some(pool) = db.pg() {
+        let n: i64 = q_dyn(format!(
+            "SELECT COUNT(*) FROM viewer_sessions WHERE {PG_OVERLAP}"
+        ))
+        .bind(bid)
+        .bind(fmt_ts(&from))
+        .bind(fmt_ts(&to))
+        .fetch_one(pool)
+        .await?
+        .try_get(0)?;
+        return Ok(n.max(0) as u64);
+    }
     db.call(move |c| {
         let n: i64 = c.query_row(
             &format!("SELECT COUNT(*) FROM viewer_sessions WHERE {OVERLAP}"),
@@ -326,6 +515,22 @@ pub async fn avg_watch_secs(
     now: DateTime<Utc>,
 ) -> DbResult<f64> {
     let bid = broadcast_id.to_string();
+    if let Some(pool) = db.pg() {
+        let avg: Option<f64> = q_dyn(format!(
+            "SELECT CAST(AVG(GREATEST(0.0, EXTRACT(EPOCH FROM \
+               (CAST(COALESCE(ended_at, $4) AS TIMESTAMPTZ) - CAST(started_at AS TIMESTAMPTZ))))) \
+               AS DOUBLE PRECISION) \
+             FROM viewer_sessions WHERE {PG_OVERLAP}"
+        ))
+        .bind(bid)
+        .bind(fmt_ts(&from))
+        .bind(fmt_ts(&to))
+        .bind(fmt_ts(&now))
+        .fetch_one(pool)
+        .await?
+        .try_get(0)?;
+        return Ok(avg.unwrap_or(0.0));
+    }
     db.call(move |c| {
         let avg: Option<f64> = c.query_row(
             &format!(
@@ -340,9 +545,9 @@ pub async fn avg_watch_secs(
     .await
 }
 
-/// Bytes received in the *closed* live periods (`stream_sessions`) overlapping
-/// `[from, to)`. The open period of a live stream has `bytes_in = 0` in the database
-/// until it ends: callers add the live counter.
+/// Bytes received in the *closed* live periods (`stream_sessions`, all nodes)
+/// overlapping `[from, to)`. The open period of a live stream has `bytes_in = 0` in the
+/// database until it ends: callers add the live counter.
 pub async fn stream_bytes_in(
     db: &Db,
     broadcast_id: &str,
@@ -350,6 +555,19 @@ pub async fn stream_bytes_in(
     to: DateTime<Utc>,
 ) -> DbResult<u64> {
     let bid = broadcast_id.to_string();
+    if let Some(pool) = db.pg() {
+        let n: Option<i64> = q(
+            "SELECT CAST(SUM(bytes_in) AS BIGINT) FROM stream_sessions WHERE broadcast_id = $1 \
+             AND started_at < $3 AND ended_at IS NOT NULL AND ended_at >= $2",
+        )
+        .bind(bid)
+        .bind(fmt_ts(&from))
+        .bind(fmt_ts(&to))
+        .fetch_one(pool)
+        .await?
+        .try_get(0)?;
+        return Ok(n.unwrap_or(0).max(0) as u64);
+    }
     db.call(move |c| {
         let n: Option<i64> = c.query_row(
             "SELECT SUM(bytes_in) FROM stream_sessions WHERE broadcast_id = ?1 AND started_at < ?3 \
@@ -360,6 +578,85 @@ pub async fn stream_bytes_in(
         Ok(n.unwrap_or(0).max(0) as u64)
     })
     .await
+}
+
+/// PostgreSQL statements of the session writer.
+mod pg {
+    use sqlx_core::connection::Connection as _;
+    use sqlx_core::row::Row as _;
+    use sqlx_postgres::PgConnection;
+
+    use super::{SessionWrite, ViewerSessionRecord};
+    use crate::db::pg::q;
+    use crate::db::{DbResult, PgPool, fmt_ts};
+
+    pub async fn apply_session_writes(
+        pool: &PgPool,
+        node: &str,
+        writes: &[SessionWrite],
+    ) -> DbResult<()> {
+        let mut tx = pool.begin().await?;
+        for w in writes {
+            let mut sp = (*tx).begin().await?;
+            let r = match w {
+                SessionWrite::Open(record) => open_session_row(&mut sp, record, node).await,
+                SessionWrite::Close { id, ended_at } => {
+                    q("UPDATE viewer_sessions SET ended_at = $2 WHERE id = $1 AND ended_at IS NULL")
+                        .bind(id.clone())
+                        .bind(fmt_ts(ended_at))
+                        .execute(&mut *sp)
+                        .await
+                        .map(|_| ())
+                        .map_err(Into::into)
+                }
+            };
+            match r {
+                Ok(()) => sp.commit().await?,
+                Err(e) => {
+                    tracing::warn!(error = %e, write = ?w, "viewer session write failed");
+                    sp.rollback().await?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn open_session_row(
+        c: &mut PgConnection,
+        record: &ViewerSessionRecord,
+        node: &str,
+    ) -> DbResult<()> {
+        let bid: Option<String> = q("SELECT id FROM broadcasts WHERE name = $1")
+            .bind(record.broadcast_name.clone())
+            .fetch_optional(&mut *c)
+            .await?
+            .map(|r| r.try_get(0))
+            .transpose()?;
+        let Some(bid) = bid else {
+            return Ok(());
+        };
+        let started = fmt_ts(&record.started_at);
+        let archived = format!("{}:{}", record.id, uuid::Uuid::new_v4().simple());
+        q("UPDATE viewer_sessions SET id = $2, ended_at = COALESCE(ended_at, $3) WHERE id = $1")
+            .bind(record.id.clone())
+            .bind(archived)
+            .bind(started.clone())
+            .execute(&mut *c)
+            .await?;
+        q("INSERT INTO viewer_sessions (id, broadcast_id, protocol, ip, user_agent, started_at, node_id) \
+           VALUES ($1, $2, $3, $4, $5, $6, $7)")
+        .bind(record.id.clone())
+        .bind(bid)
+        .bind(record.protocol.as_str())
+        .bind(record.ip.clone())
+        .bind(record.user_agent.clone())
+        .bind(started)
+        .bind(node.to_string())
+        .execute(&mut *c)
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -381,14 +678,10 @@ mod tests {
     }
 
     async fn count_rows(db: &Db, sql: &'static str) -> i64 {
-        db.call(move |c| Ok(c.query_row(sql, [], |r| r.get(0))?))
-            .await
-            .unwrap()
+        crate::db::testkit::scalar_i64(db, sql).await
     }
 
-    #[tokio::test]
-    async fn viewer_sessions_roundtrip_and_reuse() {
-        let db = Db::open_in_memory().unwrap();
+    async fn viewer_sessions_roundtrip_and_reuse_body(db: Db) {
         let b = broadcasts::create(&db, NewBroadcast::new("show", "Show"))
             .await
             .unwrap();
@@ -455,11 +748,25 @@ mod tests {
                 .unwrap(),
             0.0
         );
+        // Retention of closed sessions.
+        assert_eq!(
+            delete_sessions_older_than(&db, t0 + Duration::seconds(100))
+                .await
+                .unwrap(),
+            1,
+            "the archived session ended at +60 s"
+        );
+        assert_eq!(
+            count_rows(&db, "SELECT COUNT(*) FROM viewer_sessions").await,
+            1
+        );
     }
+    crate::db::testkit::dual_db_test!(
+        viewer_sessions_roundtrip_and_reuse,
+        viewer_sessions_roundtrip_and_reuse_body
+    );
 
-    #[tokio::test]
-    async fn open_sessions_count_up_to_now_and_dangling_are_closed() {
-        let db = Db::open_in_memory().unwrap();
+    async fn open_sessions_count_up_to_now_and_dangling_are_closed_body(db: Db) {
         let b = broadcasts::create(&db, NewBroadcast::new("live", "Live"))
             .await
             .unwrap();
@@ -492,14 +799,48 @@ mod tests {
             .unwrap();
         // Sessions opened after `before` are left alone.
         assert_eq!(close_dangling_viewer_sessions(&db, t0).await.unwrap(), 0);
+        // Another node's open session is not dangling for this node.
+        let other = db.clone().with_node_id("n2");
+        insert_viewer_session(
+            &other,
+            ViewerSessionRecord {
+                id: "f2".into(),
+                broadcast_name: "live".into(),
+                protocol: Protocol::Flv,
+                ip: None,
+                user_agent: None,
+                started_at: t0,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(close_dangling_viewer_sessions(&db, now).await.unwrap(), 1);
+        assert_eq!(
+            count_rows(
+                &db,
+                "SELECT COUNT(*) FROM viewer_sessions WHERE id = 'f2' AND ended_at IS NULL"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            close_dangling_viewer_sessions(&other, now).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            close_dangling_viewer_sessions(&other, now).await.unwrap(),
+            0
+        );
         let avg = avg_watch_secs(&db, &b.id, t0, now, now).await.unwrap();
-        assert!((avg - 10.0).abs() < 0.01, "avg = {avg}");
+        // f1: 10 s (last non-zero sample of this node); f2: no sample of n2 -> 0 s.
+        assert!((avg - 5.0).abs() < 0.01, "avg = {avg}");
     }
+    crate::db::testkit::dual_db_test!(
+        open_sessions_count_up_to_now_and_dangling_are_closed,
+        open_sessions_count_up_to_now_and_dangling_are_closed_body
+    );
 
-    #[tokio::test]
-    async fn series_buckets_with_max_and_peak() {
-        let db = Db::open_in_memory().unwrap();
+    async fn series_buckets_with_max_and_peak_body(db: Db) {
         let t0 = ts("2026-10-08T10:00:00.000Z");
         // Samples at +2.5 s, +7.5 s, ... (one per 5 s slot).
         let values = [(1, 0), (3, 1), (2, 0), (0, 0), (5, 0), (4, 0)];
@@ -539,10 +880,15 @@ mod tests {
         .unwrap();
         assert_eq!(part.len(), 1);
 
-        let (v, at) = peak(&db, "b", t0, to).await.unwrap().unwrap();
+        let (v, at) = peak(&db, "b", t0, to, 5).await.unwrap().unwrap();
         assert_eq!(v, 5);
         assert_eq!(at, t0 + Duration::milliseconds(22_500));
-        assert!(peak(&db, "nobody", t0, to).await.unwrap().is_none());
+        assert!(peak(&db, "nobody", t0, to, 5).await.unwrap().is_none());
+        // Same timestamp again: replaced, not duplicated.
+        insert_sample(&db, "b", t0 + Duration::milliseconds(2500), counts(2, 0))
+            .await
+            .unwrap();
+        assert_eq!(series(&db, "b", t0, to, 5).await.unwrap()[0].total, 2);
 
         // Retention.
         assert_eq!(
@@ -553,11 +899,46 @@ mod tests {
         );
         assert_eq!(series(&db, "b", t0, to, 5).await.unwrap().len(), 4);
     }
+    crate::db::testkit::dual_db_test!(
+        series_buckets_with_max_and_peak,
+        series_buckets_with_max_and_peak_body
+    );
 
-    #[tokio::test]
-    async fn bytes_in_of_closed_periods() {
+    /// docs/CLUSTER.md §3.6: max per (node, bucket), then sum; peak = max of the sum.
+    async fn several_nodes_are_summed_body(db: Db) {
+        let t0 = ts("2026-10-08T10:00:00.000Z");
+        let n1 = db.clone().with_node_id("n1");
+        let n2 = db.clone().with_node_id("n2");
+        // Bucket [0, 5): n1 samples 3 then 4 (max 4), n2 samples 2 -> 6.
+        insert_sample(&n1, "b", t0 + Duration::milliseconds(1000), counts(3, 0))
+            .await
+            .unwrap();
+        insert_sample(&n1, "b", t0 + Duration::milliseconds(2500), counts(4, 0))
+            .await
+            .unwrap();
+        insert_sample(&n2, "b", t0 + Duration::milliseconds(2510), counts(1, 1))
+            .await
+            .unwrap();
+        // Bucket [5, 10): only n1 with 5 -> 5 (the sum of the maxima would be 5 + 2 = 7).
+        insert_sample(&n1, "b", t0 + Duration::milliseconds(7500), counts(5, 0))
+            .await
+            .unwrap();
+        let to = t0 + Duration::seconds(10);
+        let p = series(&db, "b", t0, to, 5).await.unwrap();
+        assert_eq!(p.len(), 2);
+        assert_eq!((p[0].total, p[0].flv, p[0].hls), (6, 5, 1));
+        assert_eq!(p[1].total, 5);
+        let p10 = series(&db, "b", t0, to, 10).await.unwrap();
+        assert_eq!(p10.len(), 1);
+        assert_eq!(p10[0].total, 5 + 2);
+        let (v, at) = peak(&db, "b", t0, to, 5).await.unwrap().unwrap();
+        assert_eq!(v, 6);
+        assert_eq!(at, t0 + Duration::milliseconds(2500));
+    }
+    crate::db::testkit::dual_db_test!(several_nodes_are_summed, several_nodes_are_summed_body);
+
+    async fn bytes_in_of_closed_periods_body(db: Db) {
         use crate::db::stream_sessions::{self, StreamSessionEnd};
-        let db = Db::open_in_memory().unwrap();
         let t0 = Utc::now() - Duration::minutes(30);
         let id = stream_sessions::open(&db, "b", t0, None).await.unwrap();
         stream_sessions::close(
@@ -588,4 +969,5 @@ mod tests {
             0
         );
     }
+    crate::db::testkit::dual_db_test!(bytes_in_of_closed_periods, bytes_in_of_closed_periods_body);
 }
