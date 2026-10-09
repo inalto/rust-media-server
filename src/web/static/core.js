@@ -1,14 +1,16 @@
 // rms dashboard — shared helpers: DOM, icons, API client, formatting, dialogs,
 // clipboard, uploads with progress, event bus and the broadcast store.
-// Vanilla ES module, no build step (see index.html).
+// Vanilla ES module, no build step (see index.html). User-visible texts come from
+// i18n.js (t()).
 
 import { mockEnabled, mockResponse } from './mock.js';
+import { t, formatNumber, formatDate, formatBytes, formatDuration } from './i18n.js';
 
 // ---------------------------------------------------------------------------
 // DOM
 // ---------------------------------------------------------------------------
 
-/** Create an element: h('button', {class: 'btn', onclick: fn}, 'Testo', child...). */
+/** Create an element: h('button', {class: 'btn', onclick: fn}, 'Text', child...). */
 export function h(tag, attrs, ...children) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
@@ -189,37 +191,39 @@ export async function api(path, { method = 'GET', body, signal } = {}) {
   return data;
 }
 
+// Server error messages (English) → user-facing text in the UI language.
 const ERROR_TRANSLATIONS = [
-  [/broadcast not found/i, 'Diretta non trovata.'],
-  [/already exists/i, 'Esiste già una diretta con questo nome.'],
-  [/title must not be empty/i, 'Il titolo è obbligatorio.'],
-  [/name must match/i, "Nome non valido: usa solo lettere minuscole, cifre, '-' e '_' (max 64 caratteri)."],
-  [/name cannot be changed/i, 'Il nome di una diretta non si può cambiare.'],
-  [/too long/i, 'Testo troppo lungo.'],
-  [/already being recorded/i, 'La registrazione è già in corso.'],
-  [/not being recorded/i, 'Nessuna registrazione in corso.'],
-  [/not live/i, 'La diretta non è attiva in questo momento.'],
-  [/larger than the upload limit/i, 'Il file supera la dimensione massima consentita.'],
-  [/ffmpeg not available/i, 'ffmpeg non è disponibile sul server: carica un file MP4 (H.264/AAC).'],
-  [/unsupported file type/i, 'Formato non supportato: carica un video MP4, MOV, M4V, WebM, MKV o AVI.'],
-  [/could not process the video/i, 'Impossibile elaborare il video: il file è danneggiato o non contiene una traccia video valida.'],
-  [/timed out/i, 'Elaborazione del video troppo lunga: interrotta.'],
-  [/file is empty/i, 'Il file caricato è vuoto.'],
-  [/could not find a free name/i, 'Impossibile generare un nome libero: indicane uno.'],
+  [/broadcast not found/i, () => t('error.broadcastNotFound')],
+  [/already exists/i, () => t('error.alreadyExists')],
+  [/title must not be empty/i, () => t('error.titleRequired')],
+  [/name must match/i, () => t('error.invalidName')],
+  [/name cannot be changed/i, () => t('error.nameImmutable')],
+  [/too long/i, () => t('error.tooLong')],
+  [/already being recorded/i, () => t('error.alreadyRecording')],
+  [/not being recorded/i, () => t('error.notRecording')],
+  [/not live/i, () => t('error.notLive')],
+  [/larger than the upload limit/i, () => t('error.fileTooLarge')],
+  [/ffmpeg not available/i, () => t('error.noFfmpeg')],
+  [/unsupported file type/i, () => t('error.unsupportedType')],
+  [/could not process the video/i, () => t('error.cannotProcess')],
+  [/timed out/i, () => t('error.timedOut')],
+  [/file is empty/i, () => t('error.emptyFile')],
+  [/could not find a free name/i, () => t('error.noFreeName')],
+  [/ui_language must be/i, () => t('error.invalidLanguage')],
 ];
 
-/** Italian, user-facing description of an error. */
+/** User-facing description of an error, in the UI language. */
 export function describeError(err) {
-  if (!err) return 'Errore sconosciuto.';
-  if (err.name === 'AbortError') return 'Operazione annullata.';
-  if (!(err instanceof ApiError)) return 'Errore imprevisto: ' + (err.message || err);
-  if (err.status === 0) return 'Impossibile contattare il server. Controlla la connessione.';
-  if (err.status === 401) return 'Sessione scaduta: accedi di nuovo.';
-  if (err.status === 501) return 'Funzione non ancora disponibile in questa versione del server.';
-  for (const [re, it] of ERROR_TRANSLATIONS) if (re.test(err.message)) return it;
-  if (err.status === 413) return 'Il file supera la dimensione massima consentita.';
-  if (err.status >= 500) return `Errore del server (${err.status}). Riprova tra poco.`;
-  return `Richiesta non riuscita (${err.status}): ${err.message}`;
+  if (!err) return t('error.unknown');
+  if (err.name === 'AbortError') return t('error.aborted');
+  if (!(err instanceof ApiError)) return t('error.unexpected', { message: err.message || err });
+  if (err.status === 0) return t('error.network');
+  if (err.status === 401) return t('error.sessionExpired');
+  if (err.status === 501) return t('error.notImplemented');
+  for (const [re, text] of ERROR_TRANSLATIONS) if (re.test(err.message)) return text();
+  if (err.status === 413) return t('error.fileTooLarge');
+  if (err.status >= 500) return t('error.server', { status: err.status });
+  return t('error.request', { status: err.status, message: err.message });
 }
 
 /**
@@ -255,66 +259,43 @@ export function uploadFile(path, file, { onProgress, onSent } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Formatting (Italian locale)
+// Formatting (UI language locale, see i18n.js)
 // ---------------------------------------------------------------------------
 
-const nf1 = new Intl.NumberFormat('it-IT', { maximumFractionDigits: 1 });
-const nf0 = new Intl.NumberFormat('it-IT', { maximumFractionDigits: 0 });
+const TIME = { hour: '2-digit', minute: '2-digit' };
+const DAY_MONTH = { day: '2-digit', month: '2-digit' };
 
-export const fmtInt = (n) => (n == null || !Number.isFinite(Number(n)) ? '—' : nf0.format(n));
+export const fmtInt = (n) => formatNumber(n, { maximumFractionDigits: 0 });
 
-export function fmtBytes(n) {
-  if (n == null || !Number.isFinite(Number(n))) return '—';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let v = Number(n);
-  let i = 0;
-  while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
-  return `${i === 0 ? nf0.format(v) : nf1.format(v)} ${units[i]}`;
-}
+export const fmtBytes = formatBytes;
 
 export function fmtBitrate(kbps) {
   if (kbps == null || !Number.isFinite(kbps)) return '—';
-  return kbps >= 1000 ? `${nf1.format(kbps / 1000)} Mbit/s` : `${nf0.format(kbps)} kbit/s`;
+  return kbps >= 1000 ? `${formatNumber(kbps / 1000, { maximumFractionDigits: 1 })} Mbit/s` : `${formatNumber(kbps)} kbit/s`;
 }
 
-export function fmtDuration(secs) {
-  if (secs == null || !Number.isFinite(Number(secs))) return '—';
-  let s = Math.max(0, Math.round(Number(secs)));
-  const d = Math.floor(s / 86400); s -= d * 86400;
-  const hh = Math.floor(s / 3600); s -= hh * 3600;
-  const mm = Math.floor(s / 60); s -= mm * 60;
-  if (d) return `${d} g ${hh} h`;
-  if (hh) return `${hh} h ${String(mm).padStart(2, '0')} min`;
-  if (mm) return `${mm} min ${String(s).padStart(2, '0')} s`;
-  return `${s} s`;
-}
-
-const dtf = new Intl.DateTimeFormat('it-IT', { dateStyle: 'short', timeStyle: 'medium' });
-const tf = new Intl.DateTimeFormat('it-IT', { hour: '2-digit', minute: '2-digit' });
-const dmf = new Intl.DateTimeFormat('it-IT', { day: '2-digit', month: '2-digit' });
+export const fmtDuration = formatDuration;
 
 const toDate = (v) => (v instanceof Date ? v : new Date(v));
 export function fmtDateTime(v) {
   if (!v) return '—';
-  const d = toDate(v);
-  return Number.isNaN(d.getTime()) ? '—' : dtf.format(d);
+  return formatDate(v);
 }
 export function fmtTime(v) {
-  const d = toDate(v);
-  return Number.isNaN(d.getTime()) ? '—' : tf.format(d);
+  return formatDate(v, TIME);
 }
 /** "14:32" today, otherwise "07/10 14:32". */
 export function fmtWhen(v) {
   const d = toDate(v);
   if (Number.isNaN(d.getTime())) return '—';
   const today = new Date();
-  return d.toDateString() === today.toDateString() ? tf.format(d) : `${dmf.format(d)} ${tf.format(d)}`;
+  return d.toDateString() === today.toDateString() ? formatDate(d, TIME) : `${formatDate(d, DAY_MONTH)} ${formatDate(d, TIME)}`;
 }
-/** "da 12 min" since an instant. */
+/** "da 12 min" / "for 12 min" since an instant. */
 export function fmtSince(v) {
   const d = toDate(v);
   if (Number.isNaN(d.getTime())) return '';
-  return 'da ' + fmtDuration((Date.now() - d.getTime()) / 1000);
+  return t('time.since', { duration: fmtDuration((Date.now() - d.getTime()) / 1000) });
 }
 
 export const PROTOCOLS = [
@@ -325,12 +306,18 @@ export const PROTOCOLS = [
   { key: 'webrtc', label: 'WebRTC' },
 ];
 
-export const STATUS_LABELS = { live: 'In diretta', paused: 'In pausa', offline: 'Offline' };
+/** Label of a broadcast status (offline / live / paused). */
+export function statusLabel(status) {
+  if (status === 'live') return t('status.live');
+  if (status === 'paused') return t('status.paused');
+  if (status === 'offline') return t('status.offline');
+  return status || '—';
+}
 
 export function statusBadge(status) {
   return h('span', { class: `badge status-${status || 'offline'}` },
     status === 'live' ? h('span', { class: 'dot', 'aria-hidden': 'true' }) : null,
-    STATUS_LABELS[status] || status || '—');
+    statusLabel(status));
 }
 
 export function totalViewers(counts) {
@@ -369,7 +356,7 @@ export function toast(message, kind = 'info', timeout = 4500) {
   const el = h('div', { class: `toast toast-${kind}`, role: kind === 'error' ? 'alert' : 'status' },
     icon(kind === 'error' ? 'alert' : kind === 'success' ? 'check' : 'info'),
     h('span', null, message),
-    h('button', { type: 'button', class: 'toast-close', 'aria-label': 'Chiudi notifica', onclick: () => el.remove() }, icon('x', 16)));
+    h('button', { type: 'button', class: 'toast-close', 'aria-label': t('toast.close'), onclick: () => el.remove() }, icon('x', 16)));
   region.append(el);
   if (timeout) setTimeout(() => el.remove(), timeout);
 }
@@ -382,7 +369,7 @@ export function modal({ title, onClose, wide = false }) {
   dlg.append(
     h('header', { class: 'modal-head' },
       h('h2', { id: titleId }, title),
-      h('button', { type: 'button', class: 'btn ghost icon-only', 'aria-label': 'Chiudi', onclick: () => dlg.close('cancel') }, icon('x'))),
+      h('button', { type: 'button', class: 'btn ghost icon-only', 'aria-label': t('common.close'), onclick: () => dlg.close('cancel') }, icon('x'))),
     bodyEl);
   dlg.addEventListener('close', () => { onClose && onClose(dlg.returnValue); dlg.remove(); });
   document.body.append(dlg);
@@ -391,11 +378,11 @@ export function modal({ title, onClose, wide = false }) {
 }
 
 /** Confirmation dialog → Promise<boolean>. */
-export function confirmDialog({ title, message, confirmLabel = 'Conferma', danger = false }) {
+export function confirmDialog({ title, message, confirmLabel = t('common.confirm'), danger = false }) {
   return new Promise((resolve) => {
     let ok = false;
     const dlg = modal({ title, onClose: () => resolve(ok) });
-    const cancel = h('button', { type: 'button', class: 'btn', onclick: () => dlg.close('cancel') }, 'Annulla');
+    const cancel = h('button', { type: 'button', class: 'btn', onclick: () => dlg.close('cancel') }, t('common.cancel'));
     const confirm = h('button', { type: 'button', class: 'btn ' + (danger ? 'danger' : 'primary'), onclick: () => { ok = true; dlg.close('ok'); } }, confirmLabel);
     dlg.body.append(
       ...(Array.isArray(message) ? message : [message]).map((m) => (m instanceof Node ? m : h('p', null, m))),
@@ -423,10 +410,10 @@ export async function copyText(text) {
 }
 
 /** Copy button: copies getText() and briefly shows a check mark. */
-export function copyButton(getText, label = 'Copia', { showLabel = false, cls = 'btn' } = {}) {
+export function copyButton(getText, label = t('common.copy'), { showLabel = false, cls = 'btn' } = {}) {
   const btn = iconButton('copy', label, async () => {
     const ok = await copyText(typeof getText === 'function' ? getText() : getText);
-    toast(ok ? 'Copiato negli appunti.' : 'Copia non riuscita: seleziona il testo e usa Ctrl+C.', ok ? 'success' : 'error', 2500);
+    toast(ok ? t('toast.copied') : t('toast.copyFailed'), ok ? 'success' : 'error', 2500);
     if (ok) {
       btn.querySelector('.icon').replaceWith(icon('check'));
       setTimeout(() => { const i = btn.querySelector('.icon'); if (i) i.replaceWith(icon('copy')); }, 1500);
@@ -441,18 +428,18 @@ export function copyField({ label, value, secret = false, extra = [], hint, mono
   const input = h('input', { id, type: secret ? 'password' : 'text', readonly: true, class: mono ? 'mono' : '', value: value || '', spellcheck: 'false', autocomplete: 'off', onfocus: (e) => e.target.select() });
   const buttons = [];
   if (secret) {
-    const toggle = h('button', { type: 'button', class: 'btn icon-only', 'aria-pressed': 'false', 'aria-label': 'Mostra chiave', title: 'Mostra chiave', 'aria-controls': id }, icon('eye'));
+    const toggle = h('button', { type: 'button', class: 'btn icon-only', 'aria-pressed': 'false', 'aria-label': t('field.showKey'), title: t('field.showKey'), 'aria-controls': id }, icon('eye'));
     toggle.addEventListener('click', () => {
       const show = input.type === 'password';
       input.type = show ? 'text' : 'password';
       toggle.setAttribute('aria-pressed', String(show));
-      toggle.setAttribute('aria-label', show ? 'Nascondi chiave' : 'Mostra chiave');
+      toggle.setAttribute('aria-label', show ? t('field.hideKey') : t('field.showKey'));
       toggle.title = toggle.getAttribute('aria-label');
       toggle.querySelector('.icon').replaceWith(icon(show ? 'eyeOff' : 'eye'));
     });
     buttons.push(toggle);
   }
-  buttons.push(copyButton(() => input.value, `Copia ${label.toLowerCase()}`));
+  buttons.push(copyButton(() => input.value, t('field.copyLabel', { label: label.toLowerCase() })));
   const wrap = h('div', { class: 'field' },
     h('label', { for: id }, label),
     h('div', { class: 'input-group' }, input, ...buttons, ...extra),
@@ -473,15 +460,15 @@ const VIDEO_EXT = ['mp4', 'mov', 'm4v', 'webm', 'mkv', 'avi'];
  * File picker + upload with progress bar. `getLimits()` → {maxMb, ffmpeg}.
  * `onDone(response)` receives the API response.
  */
-export function uploadWidget({ endpoint, getLimits, onDone, label = 'Carica un video' }) {
+export function uploadWidget({ endpoint, getLimits, onDone, label = t('upload.defaultLabel') }) {
   const inputId = uid('file');
   const statusId = uid('st');
   const input = h('input', { id: inputId, type: 'file', class: 'file-input', accept: 'video/mp4,video/quicktime,video/x-m4v,video/webm,video/x-matroska,video/x-msvideo,.mp4,.mov,.m4v,.webm,.mkv,.avi', 'aria-describedby': statusId });
-  const fileName = h('span', { class: 'file-name muted' }, 'Nessun file selezionato');
-  const pick = h('label', { for: inputId, class: 'btn' }, icon('folder'), h('span', null, 'Scegli file…'));
-  const send = h('button', { type: 'button', class: 'btn primary', disabled: true }, icon('upload'), h('span', null, 'Carica'));
-  const cancel = h('button', { type: 'button', class: 'btn', hidden: true }, 'Annulla');
-  const progress = h('progress', { max: '100', value: '0', hidden: true, 'aria-label': 'Avanzamento caricamento' });
+  const fileName = h('span', { class: 'file-name muted' }, t('upload.noFile'));
+  const pick = h('label', { for: inputId, class: 'btn' }, icon('folder'), h('span', null, t('upload.choose')));
+  const send = h('button', { type: 'button', class: 'btn primary', disabled: true }, icon('upload'), h('span', null, t('upload.send')));
+  const cancel = h('button', { type: 'button', class: 'btn', hidden: true }, t('common.cancel'));
+  const progress = h('progress', { max: '100', value: '0', hidden: true, 'aria-label': t('upload.progressLabel') });
   const status = h('p', { id: statusId, class: 'hint', 'aria-live': 'polite' });
   const limits = h('p', { class: 'hint' });
   const drop = h('div', { class: 'dropzone' },
@@ -493,18 +480,16 @@ export function uploadWidget({ endpoint, getLimits, onDone, label = 'Carica un v
 
   function renderLimits() {
     const { maxMb, ffmpeg } = getLimits();
-    const max = maxMb ? `Dimensione massima: ${fmtInt(maxMb)} MB.` : '';
-    limits.textContent = ffmpeg
-      ? `Formati: MP4, MOV, M4V, WebM, MKV, AVI. ${max} Il video viene convertito in MP4 H.264/AAC e viene creata un'immagine di anteprima.`
-      : `ffmpeg non è disponibile sul server: carica un file MP4 (H.264/AAC), verrà usato così com'è. ${max}`;
+    const max = maxMb ? t('upload.maxSize', { mb: fmtInt(maxMb) }) : '';
+    limits.textContent = ffmpeg ? t('upload.limitsFfmpeg', { max }) : t('upload.limitsNoFfmpeg', { max });
   }
 
   function validate(file) {
     const { maxMb, ffmpeg } = getLimits();
     const ext = (file.name.split('.').pop() || '').toLowerCase();
-    if (!VIDEO_EXT.includes(ext) && !(file.type || '').startsWith('video/')) return 'Formato non supportato: scegli un file video.';
-    if (!ffmpeg && ext !== 'mp4') return 'Senza ffmpeg sul server si possono caricare solo file MP4 (H.264/AAC).';
-    if (maxMb && file.size > maxMb * 1024 * 1024) return `Il file è troppo grande (${fmtBytes(file.size)}): il massimo è ${fmtInt(maxMb)} MB.`;
+    if (!VIDEO_EXT.includes(ext) && !(file.type || '').startsWith('video/')) return t('upload.unsupported');
+    if (!ffmpeg && ext !== 'mp4') return t('upload.mp4Only');
+    if (maxMb && file.size > maxMb * 1024 * 1024) return t('upload.tooLarge', { size: fmtBytes(file.size), max: fmtInt(maxMb) });
     return null;
   }
 
@@ -512,7 +497,7 @@ export function uploadWidget({ endpoint, getLimits, onDone, label = 'Carica un v
     const file = input.files && input.files[0];
     status.textContent = '';
     status.classList.remove('error');
-    if (!file) { fileName.textContent = 'Nessun file selezionato'; send.disabled = true; return; }
+    if (!file) { fileName.textContent = t('upload.noFile'); send.disabled = true; return; }
     fileName.textContent = `${file.name} (${fmtBytes(file.size)})`;
     const err = validate(file);
     if (err) { status.textContent = err; status.classList.add('error'); }
@@ -544,24 +529,24 @@ export function uploadWidget({ endpoint, getLimits, onDone, label = 'Carica un v
     progress.value = 0;
     progress.setAttribute('value', '0');
     status.classList.remove('error');
-    status.textContent = 'Caricamento: 0%';
+    status.textContent = t('upload.progressPct', { pct: 0 });
     current = uploadFile(endpoint, file, {
       onProgress(loaded, total) {
         const pct = total ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
         progress.value = pct;
-        status.textContent = `Caricamento: ${pct}% (${fmtBytes(loaded)} di ${fmtBytes(total)})`;
+        status.textContent = t('upload.progress', { pct, loaded: fmtBytes(loaded), total: fmtBytes(total) });
       },
       onSent() {
         progress.removeAttribute('value'); // indeterminate while the server converts
-        status.textContent = getLimits().ffmpeg ? 'File inviato. Conversione del video in corso…' : 'File inviato. Salvataggio in corso…';
+        status.textContent = getLimits().ffmpeg ? t('upload.converting') : t('upload.saving');
       },
     });
     try {
       const res = await current.promise;
-      status.textContent = 'Video di attesa aggiornato.';
-      toast('Video di attesa caricato.', 'success');
+      status.textContent = t('upload.done');
+      toast(t('upload.toastDone'), 'success');
       input.value = '';
-      fileName.textContent = 'Nessun file selezionato';
+      fileName.textContent = t('upload.noFile');
       onDone && onDone(res);
     } catch (e) {
       status.textContent = describeError(e);
@@ -613,12 +598,12 @@ export function flagFields(values = {}) {
       h('label', { for: id }, label, h('span', { id: hintId, class: 'hint' }, hint)));
   };
   return h('fieldset', { class: 'flags' },
-    h('legend', null, 'Opzioni'),
-    item('record', 'Registra automaticamente', 'La registrazione parte da sola quando arriva il segnale da OBS.', false),
-    item('enable_flv', 'HTTP-FLV e WebSocket-FLV', 'Latenza 1–2 s: la scelta predefinita del player su desktop e Android.', true),
-    item('enable_hls', 'LL-HLS', 'Necessario per iPhone/iPad e Safari; adatto alle CDN.', true),
-    item('enable_dash', 'LL-DASH', 'Alternativa standard per i player basati su MSE.', true),
-    item('enable_webrtc', 'WebRTC (WHEP)', 'Latenza sotto il secondo; il server deve avere la porta UDP WebRTC raggiungibile.', true));
+    h('legend', null, t('flags.legend')),
+    item('record', t('flags.record'), t('flags.recordHint'), false),
+    item('enable_flv', t('flags.flv'), t('flags.flvHint'), true),
+    item('enable_hls', t('flags.hls'), t('flags.hlsHint'), true),
+    item('enable_dash', t('flags.dash'), t('flags.dashHint'), true),
+    item('enable_webrtc', t('flags.webrtc'), t('flags.webrtcHint'), true));
 }
 
 export function readFlags(form) {
