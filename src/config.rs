@@ -448,6 +448,12 @@ pub struct ClusterConfig {
     pub node_ttl_secs: u64,
     /// Stop a relay without local viewers after this many seconds (phase 7C-2).
     pub relay_idle_secs: u64,
+    /// Public WHEP base of this node announced in `nodes.whep_url` (e.g.
+    /// `https://rms2.example.com/whep`); empty = `<server.public_url>/whep`.
+    pub whep_url: String,
+    /// A node without usable WebRTC answers `POST /whep/{name}` with `307` to another
+    /// node's `whep_url` (only to a base different from its own).
+    pub whep_redirect: bool,
 }
 
 impl Default for ClusterConfig {
@@ -462,6 +468,8 @@ impl Default for ClusterConfig {
             heartbeat_secs: 5,
             node_ttl_secs: 15,
             relay_idle_secs: 30,
+            whep_url: String::new(),
+            whep_redirect: true,
         }
     }
 }
@@ -486,6 +494,8 @@ impl std::fmt::Debug for ClusterConfig {
             .field("heartbeat_secs", &self.heartbeat_secs)
             .field("node_ttl_secs", &self.node_ttl_secs)
             .field("relay_idle_secs", &self.relay_idle_secs)
+            .field("whep_url", &self.whep_url)
+            .field("whep_redirect", &self.whep_redirect)
             .finish()
     }
 }
@@ -580,6 +590,11 @@ impl ClusterConfig {
         }
         if self.relay_idle_secs == 0 {
             bail!("cluster.relay_idle_secs must be at least 1");
+        }
+        if !self.whep_url.is_empty()
+            && !(self.whep_url.starts_with("http://") || self.whep_url.starts_with("https://"))
+        {
+            bail!("cluster.whep_url must start with http:// or https:// (RMS_CLUSTER_WHEP_URL)");
         }
         Ok(())
     }
@@ -696,6 +711,7 @@ impl Config {
         c.advertise_url = c.advertise_url.trim().trim_end_matches('/').to_string();
         c.internal_bind = c.internal_bind.trim().to_string();
         c.internal_secret = c.internal_secret.trim().to_string();
+        c.whep_url = c.whep_url.trim().trim_end_matches('/').to_string();
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {

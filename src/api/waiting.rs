@@ -557,7 +557,7 @@ async fn make_poster(ffmpeg: &FsPath, video: &FsPath, poster: &FsPath) -> bool {
 // ---------------------------------------------------------------------------
 
 fn changed(state: &AppState, name: &str) {
-    state.hub.emit(HubEvent::BroadcastUpdated {
+    state.hub.emit_shared(HubEvent::BroadcastUpdated {
         name: name.to_string(),
     });
 }
@@ -588,7 +588,7 @@ async fn upload_waiting_video(
     tracing::info!(broadcast = %b.name, video = %rel, "waiting video updated");
     changed(&state, &b.name);
     let ctx = ViewContext::load(&state, &headers).await?;
-    Ok(Json(ctx.view(&state, updated)))
+    Ok(Json(ctx.view(&state, updated).await))
 }
 
 /// `DELETE /broadcasts/{name}/waiting-video` → `BroadcastView` (the global default
@@ -612,7 +612,7 @@ async fn delete_waiting_video(
         None => b,
     };
     let ctx = ViewContext::load(&state, &headers).await?;
-    Ok(Json(ctx.view(&state, updated)))
+    Ok(Json(ctx.view(&state, updated).await))
 }
 
 #[cfg(test)]

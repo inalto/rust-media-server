@@ -72,9 +72,16 @@ impl AppState {
             p.config.clone(),
             p.db.clone(),
             events.clone(),
+            p.hub.outbox().clone(),
             ffmpeg.clone(),
         );
-        let cluster = ClusterNode::new(p.config.clone(), p.db.clone());
+        let cluster = ClusterNode::new(
+            p.config.clone(),
+            p.db.clone(),
+            p.hub.clone(),
+            p.tracker.clone(),
+            p.shutdown.clone(),
+        );
         AppState(Arc::new(Inner {
             config: p.config,
             db: p.db,
@@ -97,6 +104,23 @@ impl AppState {
 
     pub fn uptime(&self) -> Duration {
         self.started_at.elapsed()
+    }
+
+    /// Effective liveness of a broadcast (docs/CLUSTER.md §3.3): live in the local hub
+    /// or, in cluster mode, owned by another node.
+    pub fn is_live(&self, name: &str) -> bool {
+        self.cluster.is_live(name)
+    }
+
+    /// Viewers of `name` on every node (the local tracker on a single node).
+    pub fn viewer_counts(&self, name: &str) -> crate::metrics::ViewerCounts {
+        self.cluster.viewer_counts(name)
+    }
+
+    /// The local stream of `name`, relayed from its owner node when another node
+    /// publishes it (cluster mode).
+    pub async fn live_stream(&self, name: &str) -> Option<Arc<crate::hub::LiveStream>> {
+        self.cluster.live_stream(name).await
     }
 
     /// First line of `ffmpeg -version` (cached; `None` if unavailable).

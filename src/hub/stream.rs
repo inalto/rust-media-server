@@ -338,6 +338,32 @@ impl GopCache {
     }
 }
 
+/// Where the packets of a [`LiveStream`] come from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase", tag = "kind", content = "node")]
+pub enum StreamOrigin {
+    /// A publisher connected to this node (RTMP ingest): this node owns the stream.
+    #[default]
+    Local,
+    /// Relayed from the owner node (cluster mode, `cluster::relay`): no
+    /// `stream_sessions` row, no recording, never relayed again.
+    Remote(String),
+}
+
+impl StreamOrigin {
+    pub fn is_local(&self) -> bool {
+        matches!(self, StreamOrigin::Local)
+    }
+
+    /// The owner node of a relayed stream.
+    pub fn remote_node(&self) -> Option<&str> {
+        match self {
+            StreamOrigin::Local => None,
+            StreamOrigin::Remote(node) => Some(node),
+        }
+    }
+}
+
 /// Parameters for [`super::Hub::publish_start`].
 #[derive(Debug, Clone)]
 pub struct PublishInfo {
@@ -348,6 +374,10 @@ pub struct PublishInfo {
     /// Cancelled by [`LiveStream::kick`]; the ingest closes the publisher connection
     /// when it fires.
     pub kick: CancellationToken,
+    /// [`StreamOrigin::Local`] for publishers, `Remote(node)` for cluster relays.
+    pub origin: StreamOrigin,
+    /// Cluster mode: the `live_streams.session_id` claimed for this publish.
+    pub claim_id: Option<String>,
 }
 
 impl PublishInfo {
@@ -357,6 +387,8 @@ impl PublishInfo {
             publisher_addr: None,
             stream_session_id: None,
             kick: CancellationToken::new(),
+            origin: StreamOrigin::Local,
+            claim_id: None,
         }
     }
 }
@@ -368,6 +400,10 @@ pub struct LiveStream {
     pub started_at: DateTime<Utc>,
     pub publisher_addr: Option<SocketAddr>,
     pub stream_session_id: Option<String>,
+    /// Publisher on this node, or relay of another node's stream (cluster mode).
+    pub origin: StreamOrigin,
+    /// Cluster mode: `live_streams.session_id` of this publish.
+    pub claim_id: Option<String>,
     tx: broadcast::Sender<Arc<MediaPacket>>,
     gop: Mutex<GopCache>,
     info: RwLock<StreamInfo>,
@@ -385,6 +421,7 @@ impl std::fmt::Debug for LiveStream {
             .field("name", &self.name)
             .field("started_at", &self.started_at)
             .field("publisher_addr", &self.publisher_addr)
+            .field("origin", &self.origin)
             .finish_non_exhaustive()
     }
 }
@@ -398,6 +435,8 @@ impl LiveStream {
             started_at: Utc::now(),
             publisher_addr: info.publisher_addr,
             stream_session_id: info.stream_session_id,
+            origin: info.origin,
+            claim_id: info.claim_id,
             tx,
             gop: Mutex::new(GopCache::default()),
             info: RwLock::new(StreamInfo::default()),
@@ -486,6 +525,11 @@ impl LiveStream {
     /// Milliseconds since the last packet (or since start if none yet).
     pub fn idle_ms(&self) -> i64 {
         (Utc::now().timestamp_millis() - self.last_packet_ms.load(Ordering::Relaxed)).max(0)
+    }
+
+    /// A relay of another node's stream (cluster mode).
+    pub fn is_relay(&self) -> bool {
+        !self.origin.is_local()
     }
 
     /// Number of active packet receivers (FLV viewers, packager, recorder...).

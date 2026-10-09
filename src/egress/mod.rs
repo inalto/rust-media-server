@@ -49,9 +49,10 @@ pub(crate) async fn resolve_flv(
             "FLV playback is disabled for this broadcast",
         ));
     }
+    // Cluster mode: relayed from the owner node when it is published elsewhere.
     let stream = state
-        .hub
-        .get(name)
+        .live_stream(name)
+        .await
         .ok_or_else(|| ApiError::not_found("stream offline"))?;
     Ok((broadcast, stream))
 }

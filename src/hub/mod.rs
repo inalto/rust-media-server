@@ -5,6 +5,7 @@
 //! [`Hub::publish_end_stream`]; consumers (FLV egress, packager, recorder) call
 //! [`Hub::get`] + [`LiveStream::subscribe`] and watch [`Hub::subscribe_events`].
 
+pub mod flv_parser;
 pub mod packet;
 pub mod stream;
 
@@ -14,8 +15,9 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 pub use packet::{MediaPacket, PacketKind, flv_file_header, flv_tag_bytes};
-pub use stream::{GopCache, LiveStream, PublishInfo, StreamInfo};
+pub use stream::{GopCache, LiveStream, PublishInfo, StreamInfo, StreamOrigin};
 
+use crate::cluster::bus::{Notice, Outbox};
 use crate::metrics::ViewerCounts;
 
 /// Capacity of the hub event channel.
@@ -40,6 +42,10 @@ pub enum HubEvent {
     /// A video on demand item was created, changed (status, progress, title, plays) or
     /// deleted (admin SSE `vod` / `vod_deleted`). Not tied to a broadcast.
     VodChanged { id: String },
+    /// Cluster mode: a stream owned by another node started, ended or changed owner
+    /// (from the `rms_streams` NOTIFY or the reaper). The local hub is unchanged; the
+    /// SSE endpoints recompute the effective status.
+    RemoteStreamChanged { name: String },
 }
 
 impl HubEvent {
@@ -51,7 +57,8 @@ impl HubEvent {
             | HubEvent::StreamEnded { name }
             | HubEvent::Metadata { name }
             | HubEvent::ViewerCountChanged { name, .. }
-            | HubEvent::BroadcastUpdated { name } => name,
+            | HubEvent::BroadcastUpdated { name }
+            | HubEvent::RemoteStreamChanged { name } => name,
             HubEvent::SettingsChanged | HubEvent::VodChanged { .. } => "",
         }
     }
@@ -66,6 +73,9 @@ pub enum HubError {
 pub struct Hub {
     streams: RwLock<HashMap<String, Arc<LiveStream>>>,
     events: broadcast::Sender<HubEvent>,
+    /// Cluster NOTIFY queue (detached on a single node: [`Self::emit_shared`] is then
+    /// [`Self::emit`]).
+    outbox: Outbox,
 }
 
 impl Hub {
@@ -74,7 +84,13 @@ impl Hub {
         Arc::new(Self {
             streams: RwLock::new(HashMap::new()),
             events,
+            outbox: Outbox::default(),
         })
+    }
+
+    /// The cluster NOTIFY queue (attached by `cluster::bus` in cluster mode).
+    pub fn outbox(&self) -> &Outbox {
+        &self.outbox
     }
 
     /// Register a new live stream for broadcast `name` and emit `StreamStarted`.
@@ -187,9 +203,20 @@ impl Hub {
         self.streams.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Ask the ingest to disconnect the publisher of `name`. Returns false if not live.
+    /// Streams published on this node (relays of other nodes' streams excluded).
+    pub fn local_count(&self) -> usize {
+        self.streams
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|s| s.origin.is_local())
+            .count()
+    }
+
+    /// Ask the ingest to disconnect the publisher of `name`. Returns false if not live
+    /// here (a relay of another node's stream is not a publisher: false).
     pub fn kick(&self, name: &str) -> bool {
-        match self.get(name) {
+        match self.get(name).filter(|s| s.origin.is_local()) {
             Some(s) => {
                 tracing::info!(broadcast = %name, "kicking publisher");
                 s.kick();
@@ -211,6 +238,17 @@ impl Hub {
     pub fn emit(&self, event: HubEvent) {
         // No receivers is fine.
         let _ = self.events.send(event);
+    }
+
+    /// [`Self::emit`] a change made on this node (broadcast, settings, video on demand)
+    /// and, in cluster mode, queue the matching NOTIFY so the other nodes invalidate
+    /// their caches and re-emit the event locally. Events received from other nodes are
+    /// re-emitted with [`Self::emit`] only, so nothing loops.
+    pub fn emit_shared(&self, event: HubEvent) {
+        if let Some(notice) = Notice::for_event(&event) {
+            self.outbox.send(notice);
+        }
+        self.emit(event);
     }
 }
 

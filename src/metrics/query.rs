@@ -231,6 +231,15 @@ fn round_ms(secs: f64) -> f64 {
     (secs * 1000.0).round() / 1000.0
 }
 
+/// What the other nodes add to a [`summary`] (cluster mode; default on a single node).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RemoteLive {
+    /// Viewers on the other nodes (latest samples).
+    pub viewers: ViewerCounts,
+    /// Start and bytes received of the live period when another node publishes it.
+    pub stream: Option<(DateTime<Utc>, u64)>,
+}
+
 /// Summary of a broadcast over `[from, to)` (see [`Summary`]).
 pub async fn summary(
     db: &Db,
@@ -239,18 +248,25 @@ pub async fn summary(
     broadcast: &Broadcast,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
+    remote: RemoteLive,
 ) -> DbResult<Summary> {
     let now = Utc::now();
-    let current = tracker.counts(&broadcast.name);
-    let stream = hub.get(&broadcast.name);
+    let mut current = tracker.counts(&broadcast.name);
+    current.add(&remote.viewers);
+    // A relay is not a live period of this node: the owner's counters apply.
+    let local = hub
+        .get(&broadcast.name)
+        .filter(|s| s.origin.is_local())
+        .map(|s| (s.started_at, s.bytes_in()));
+    let live = local.or(remote.stream);
     let sampled = repo::peak(db, &broadcast.id, from, to, tracker.sample_interval_secs()).await?;
     let sessions_total = repo::sessions_total(db, &broadcast.id, from, to).await?;
     let avg = repo::avg_watch_secs(db, &broadcast.id, from, to, now).await?;
     let mut bytes_in = repo::stream_bytes_in(db, &broadcast.id, from, to).await?;
-    if let Some(s) = &stream
-        && s.started_at < to
+    if let Some((started_at, bytes)) = live
+        && started_at < to
     {
-        bytes_in += s.bytes_in();
+        bytes_in += bytes;
     }
     Ok(Summary {
         from,
@@ -259,7 +275,7 @@ pub async fn summary(
         peak: merge_peak(sampled, current.total(), now, from, to),
         sessions_total,
         avg_watch_secs: round_ms(avg),
-        live_since: stream.map(|s| s.started_at),
+        live_since: live.map(|(at, _)| at),
         bytes_in,
     })
 }
@@ -503,7 +519,9 @@ mod tests {
                 .unwrap();
         }
         let (from, to) = (now - Duration::hours(1), now + Duration::seconds(1));
-        let s = summary(&db, &hub, &tracker, &b, from, to).await.unwrap();
+        let s = summary(&db, &hub, &tracker, &b, from, to, RemoteLive::default())
+            .await
+            .unwrap();
         assert_eq!(
             s.peak,
             Some(Peak {
@@ -533,7 +551,9 @@ mod tests {
         let _v1 = tracker.open("sum", Protocol::Flv, ip, "a");
         let _v2 = tracker.open("sum", Protocol::Flv, ip, "b");
         let _v3 = tracker.open("sum", Protocol::WsFlv, ip, "c");
-        let s = summary(&db, &hub, &tracker, &b, from, to).await.unwrap();
+        let s = summary(&db, &hub, &tracker, &b, from, to, RemoteLive::default())
+            .await
+            .unwrap();
         assert_eq!(s.live_since, Some(stream.started_at));
         assert_eq!(s.bytes_in, 5);
         assert_eq!(s.current.total(), 3);

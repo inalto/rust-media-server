@@ -502,7 +502,8 @@ import { startVodPlayer } from './vod-player.js';
       return fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
     }).then(function (res) {
       var loc = res.headers.get('Location');
-      if (loc) sessionUrl = new URL(loc, endpoint).href;
+      // After a 307 (cluster: another node took the offer) the session lives there.
+      if (loc) sessionUrl = new URL(loc, res.url || endpoint).href;
       if (res.status !== 201) {
         return res.text().then(function (t) { throw new Error('WHEP ' + res.status + ' ' + t.slice(0, 200)); });
       }

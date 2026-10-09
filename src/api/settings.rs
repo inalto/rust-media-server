@@ -143,7 +143,7 @@ async fn patch_settings(
         tracing::info!(theme = theme.as_str(), "UI theme updated");
     }
     if text.is_some() || language.is_some() || theme.is_some() {
-        state.hub.emit(HubEvent::SettingsChanged);
+        state.hub.emit_shared(HubEvent::SettingsChanged);
     }
     Ok(Json(current(&state, &headers).await?))
 }
@@ -161,6 +161,7 @@ async fn upload_default_waiting_video(
         remove_video_files(&state, &prev).await;
     }
     tracing::info!(video = %rel, "default waiting video updated");
+    notify_settings(&state);
     Ok(Json(current(&state, &headers).await?))
 }
 
@@ -174,8 +175,17 @@ async fn delete_default_waiting_video(
             remove_video_files(&state, &prev).await;
         }
         tracing::info!("default waiting video removed");
+        notify_settings(&state);
     }
     Ok(Json(current(&state, &headers).await?))
+}
+
+/// Cluster mode: the other nodes clear their broadcasts cache and refresh their
+/// dashboards (`rms_settings`). No local event (unchanged single-node behaviour).
+fn notify_settings(state: &AppState) {
+    if let Some(n) = crate::cluster::bus::Notice::for_event(&HubEvent::SettingsChanged) {
+        state.hub.outbox().send(n);
+    }
 }
 
 #[cfg(test)]

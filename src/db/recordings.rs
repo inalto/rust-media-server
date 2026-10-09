@@ -187,6 +187,32 @@ pub async fn get(db: &Db, id: &str) -> DbResult<Option<Recording>> {
     .await
 }
 
+/// The node that wrote the file of recording `id` (`recordings.node_id`; `None` for
+/// unknown ids and rows written before node tags existed).
+pub async fn node_of(db: &Db, id: &str) -> DbResult<Option<String>> {
+    let id = id.to_string();
+    if let Some(pool) = db.pg() {
+        let row = q("SELECT node_id FROM recordings WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+        return Ok(match row {
+            Some(r) => r.try_get::<Option<String>, _>(0)?,
+            None => None,
+        }
+        .filter(|n| !n.is_empty()));
+    }
+    db.call(move |c| {
+        let node: Option<Option<String>> = c
+            .query_row("SELECT node_id FROM recordings WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(node.flatten().filter(|n| !n.is_empty()))
+    })
+    .await
+}
+
 /// List rows (all, or of one broadcast id), newest first.
 pub async fn list(db: &Db, broadcast_id: Option<&str>) -> DbResult<Vec<Recording>> {
     let bid = broadcast_id.map(str::to_string);

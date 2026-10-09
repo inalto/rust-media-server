@@ -580,6 +580,74 @@ pub async fn stream_bytes_in(
     .await
 }
 
+/// Live viewers of the *other* nodes (cluster mode, docs/CLUSTER.md §3.6): the latest
+/// sample of every (broadcast, node) newer than `since` (Unix seconds) and not written
+/// by `exclude_node`, summed per broadcast name. A node stops writing samples for a
+/// stream it no longer serves (final zero sample) and a dead node's samples age out.
+pub async fn recent_counts_of_other_nodes(
+    db: &Db,
+    exclude_node: &str,
+    since: i64,
+) -> DbResult<Vec<(String, ViewerCounts)>> {
+    let node = exclude_node.to_string();
+    let rows: Vec<(String, [i64; 5])> = if let Some(pool) = db.pg() {
+        q("SELECT b.name, s.flv, s.ws_flv, s.hls, s.dash, s.webrtc FROM ( \
+             SELECT DISTINCT ON (broadcast_id, node_id) broadcast_id, flv, ws_flv, hls, dash, webrtc \
+             FROM viewer_samples WHERE ts_epoch >= $1 AND node_id <> $2 \
+             ORDER BY broadcast_id, node_id, ts DESC) s \
+           JOIN broadcasts b ON b.id = s.broadcast_id")
+        .bind(since)
+        .bind(node)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|r| {
+            Ok((
+                r.try_get::<String, _>(0)?,
+                [
+                    r.try_get(1)?,
+                    r.try_get(2)?,
+                    r.try_get(3)?,
+                    r.try_get(4)?,
+                    r.try_get(5)?,
+                ],
+            ))
+        })
+        .collect::<DbResult<_>>()?
+    } else {
+        db.call(move |c| {
+            let mut st = c.prepare(
+                "SELECT b.name, v.flv, v.ws_flv, v.hls, v.dash, v.webrtc FROM viewer_samples v \
+                 JOIN broadcasts b ON b.id = v.broadcast_id \
+                 WHERE v.ts_epoch >= ?1 AND v.node_id <> ?2 AND v.ts = (SELECT MAX(w.ts) \
+                   FROM viewer_samples w WHERE w.broadcast_id = v.broadcast_id AND w.node_id = v.node_id)",
+            )?;
+            let rows = st
+                .query_map(params![since, node], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?],
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?
+    };
+    let mut sums: std::collections::BTreeMap<String, ViewerCounts> = Default::default();
+    for (name, [flv, ws_flv, hls, dash, webrtc]) in rows {
+        let u = |v: i64| v.clamp(0, u32::MAX as i64) as u32;
+        sums.entry(name).or_default().add(&ViewerCounts {
+            flv: u(flv),
+            ws_flv: u(ws_flv),
+            hls: u(hls),
+            dash: u(dash),
+            webrtc: u(webrtc),
+        });
+    }
+    Ok(sums.into_iter().filter(|(_, c)| c.total() > 0).collect())
+}
+
 /// PostgreSQL statements of the session writer.
 mod pg {
     use sqlx_core::connection::Connection as _;
@@ -936,6 +1004,59 @@ mod tests {
         assert_eq!(at, t0 + Duration::milliseconds(2500));
     }
     crate::db::testkit::dual_db_test!(several_nodes_are_summed, several_nodes_are_summed_body);
+
+    /// Live viewers of the other nodes: latest sample per (broadcast, node), own node
+    /// and old samples excluded, summed per broadcast name.
+    async fn recent_counts_of_other_nodes_body(db: Db) {
+        use crate::db::broadcasts::{self, NewBroadcast};
+        let b = broadcasts::create(&db, NewBroadcast::new("show", "Show"))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let n1 = db.clone().with_node_id("n1");
+        let n2 = db.clone().with_node_id("n2");
+        let n3 = db.clone().with_node_id("n3");
+        insert_sample(&n2, &b.id, now - Duration::seconds(8), counts(5, 0))
+            .await
+            .unwrap();
+        insert_sample(&n2, &b.id, now - Duration::seconds(3), counts(2, 1))
+            .await
+            .unwrap();
+        insert_sample(&n3, &b.id, now - Duration::seconds(2), counts(0, 4))
+            .await
+            .unwrap();
+        insert_sample(&n1, &b.id, now - Duration::seconds(1), counts(9, 9))
+            .await
+            .unwrap();
+        // A stale sample of another broadcast/node is ignored.
+        insert_sample(&n3, "gone", now - Duration::seconds(600), counts(7, 0))
+            .await
+            .unwrap();
+        let since = (now - Duration::seconds(20)).timestamp();
+        let got = recent_counts_of_other_nodes(&n1, "n1", since)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "show");
+        assert_eq!((got[0].1.flv, got[0].1.hls, got[0].1.total()), (2, 5, 7));
+        // n2 wrote a final zero sample: only n3 is left.
+        insert_sample(&n2, &b.id, now, counts(0, 0)).await.unwrap();
+        let got = recent_counts_of_other_nodes(&n1, "n1", since)
+            .await
+            .unwrap();
+        assert_eq!(got[0].1.total(), 4);
+        // Everything is too old.
+        assert!(
+            recent_counts_of_other_nodes(&n1, "n1", now.timestamp() + 60)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    crate::db::testkit::dual_db_test!(
+        recent_counts_of_other_nodes_test,
+        recent_counts_of_other_nodes_body
+    );
 
     async fn bytes_in_of_closed_periods_body(db: Db) {
         use crate::db::stream_sessions::{self, StreamSessionEnd};

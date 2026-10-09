@@ -43,7 +43,7 @@ use store::{SegmentStore, StoreParams};
 const FLAGS_TTL: Duration = Duration::from_secs(5);
 
 /// Packaging status of a broadcast, shown in `BroadcastView.live.packager`.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
 pub struct PackagerStatus {
     /// False when the codecs cannot be packaged (only H.264 + AAC are supported).
     pub supported: bool,

@@ -5,7 +5,8 @@
 //!   key, stream start/end, metadata);
 //! - `broadcast_deleted`: `{name}` when a broadcast is deleted (extension of §8.1);
 //! - `viewers`: `{name, counts}` when viewer counts change;
-//! - `stream`: `{name, status}` when a stream starts or ends;
+//! - `stream`: `{name, status}` when a stream starts or ends (in cluster mode also when
+//!   a stream of another node starts, ends or changes owner; `status` is effective);
 //! - `settings`: `{ui_language, ui_theme, default_waiting_text}` after `PATCH /settings`
 //!   (the dashboard switches language and default theme without a reload);
 //! - `vod`: `VodView` when a video on demand item is created or changes (status,
@@ -68,6 +69,8 @@ async fn translate(state: &AppState, headers: &HeaderMap, ev: HubEvent) -> Vec<E
     let mut out = Vec::new();
     match &ev {
         HubEvent::ViewerCountChanged { name, counts } => {
+            // Cluster mode: plus the other nodes' viewers (docs/CLUSTER.md §3.6).
+            let counts = state.cluster.with_remote_viewers(name, *counts);
             out.extend(json_event(
                 "viewers",
                 &json!({ "name": name, "counts": counts }),
@@ -101,6 +104,7 @@ async fn translate(state: &AppState, headers: &HeaderMap, ev: HubEvent) -> Vec<E
         }
         HubEvent::StreamStarted { .. }
         | HubEvent::StreamEnded { .. }
+        | HubEvent::RemoteStreamChanged { .. }
         | HubEvent::Metadata { .. }
         | HubEvent::BroadcastUpdated { .. } => {}
     }
@@ -120,16 +124,18 @@ async fn translate(state: &AppState, headers: &HeaderMap, ev: HubEvent) -> Vec<E
     };
     if matches!(
         ev,
-        HubEvent::StreamStarted { .. } | HubEvent::StreamEnded { .. }
+        HubEvent::StreamStarted { .. }
+            | HubEvent::StreamEnded { .. }
+            | HubEvent::RemoteStreamChanged { .. }
     ) {
-        let status = BroadcastStatus::of(&b, &state.hub);
+        let status = BroadcastStatus::of(&b, state);
         out.extend(json_event(
             "stream",
             &json!({ "name": name, "status": status }),
         ));
     }
     match ViewContext::load(state, headers).await {
-        Ok(ctx) => out.extend(json_event("broadcast", &ctx.view(state, b))),
+        Ok(ctx) => out.extend(json_event("broadcast", &ctx.view(state, b).await)),
         Err(e) => tracing::warn!(error = %e, "SSE: failed to build view"),
     }
     out

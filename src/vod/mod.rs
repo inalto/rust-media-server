@@ -7,7 +7,8 @@
 //! data/vod/<id>/poster.jpg     frame at 10 % of the duration, at most 1280 px wide
 //! data/vod/<id>/abr/           CMAF output of one ffmpeg pass: manifest.mpd, master.m3u8,
 //!                              media_<n>.m3u8, init-<n>.m4s, chunk-<n>-<00001>.m4s
-//! data/vod/<id>/abr.tmp/       output being written (swapped in when complete)
+//! data/vod/<id>/abr.tmp/       output being written (swapped in when complete);
+//!                              `abr.<node>.tmp/` in cluster mode (one per claiming node)
 //! ```
 //!
 //! - [`VodManager`] (`AppState.vod`): paths, import of a received/inbox file, job
@@ -38,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use serve::router;
 
+use crate::cluster::bus::{Notice, Outbox};
 use crate::config::Config;
 use crate::db::vod::{self as repo, VodItem};
 use crate::db::{Db, DbError};
@@ -142,6 +144,8 @@ pub struct VodManager {
     pub config: Arc<Config>,
     db: Db,
     events: broadcast::Sender<HubEvent>,
+    /// Cluster NOTIFY queue (`rms_vod`; a no-op on a single node).
+    outbox: Outbox,
     ffmpeg: Option<PathBuf>,
     ffprobe: Option<PathBuf>,
     /// Wakes the job runner (new item queued, job finished).
@@ -155,6 +159,7 @@ impl VodManager {
         config: Arc<Config>,
         db: Db,
         events: broadcast::Sender<HubEvent>,
+        outbox: Outbox,
         ffmpeg: Option<PathBuf>,
     ) -> Arc<Self> {
         let ffprobe = ffmpeg
@@ -164,6 +169,7 @@ impl VodManager {
             config,
             db,
             events,
+            outbox,
             ffmpeg,
             ffprobe,
             wake: Notify::new(),
@@ -217,11 +223,26 @@ impl VodManager {
         safe.then(|| self.dir().join(rel))
     }
 
-    /// Emit `HubEvent::VodChanged` (admin SSE `vod` / `vod_deleted`).
+    /// Emit `HubEvent::VodChanged` (admin SSE `vod` / `vod_deleted`); in cluster mode
+    /// the other nodes get it through `rms_vod` (and wake their job runner).
     pub fn changed(&self, id: &str) {
-        let _ = self
-            .events
-            .send(HubEvent::VodChanged { id: id.to_string() });
+        let event = HubEvent::VodChanged { id: id.to_string() };
+        if let Some(notice) = Notice::for_event(&event) {
+            self.outbox.send(notice);
+        }
+        let _ = self.events.send(event);
+    }
+
+    /// Directory of the output being written by this node's job (`abr.tmp` on a single
+    /// node, `abr.<node>.tmp` in cluster mode: two nodes never share a temp dir even if
+    /// a lease was lost while ffmpeg was still writing).
+    pub fn tmp_dir(&self, id: &str) -> PathBuf {
+        let node = self.db.node_id();
+        if node.is_empty() {
+            self.item_dir(id).join("abr.tmp")
+        } else {
+            self.item_dir(id).join(format!("abr.{node}.tmp"))
+        }
     }
 
     /// Wake the job runner (an item was queued).
@@ -338,11 +359,20 @@ impl VodManager {
         Ok(item)
     }
 
-    /// Remove the transcoded output (abr, abr.tmp, poster), e.g. before a re-transcode.
+    /// Remove the transcoded output (abr, every abr*.tmp, poster), e.g. before a
+    /// re-transcode.
     pub async fn clear_output(&self, id: &str) {
         let dir = self.item_dir(id);
-        for sub in ["abr", "abr.tmp"] {
-            let p = dir.join(sub);
+        let mut subs = vec![dir.join("abr")];
+        if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+            while let Ok(Some(e)) = rd.next_entry().await {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with("abr.") && name.ends_with(".tmp") {
+                    subs.push(e.path());
+                }
+            }
+        }
+        for p in subs {
             if p.exists()
                 && let Err(e) = tokio::fs::remove_dir_all(&p).await
             {

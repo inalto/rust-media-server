@@ -25,7 +25,6 @@ use crate::config::Config;
 use crate::db::settings::{UiLanguage, UiTheme};
 use crate::db::{self, Broadcast, Recording};
 use crate::error::ApiError;
-use crate::hub::Hub;
 use crate::metrics::ViewerCounts;
 use crate::state::AppState;
 
@@ -156,11 +155,16 @@ pub enum BroadcastStatus {
 }
 
 impl BroadcastStatus {
-    /// §4.2: paused wins over live.
-    pub fn of(broadcast: &Broadcast, hub: &Hub) -> Self {
-        if broadcast.paused {
+    /// §4.2: paused wins over live. Live = the local hub has the stream or, in cluster
+    /// mode, another node owns it (docs/CLUSTER.md §3.3).
+    pub fn of(broadcast: &Broadcast, state: &AppState) -> Self {
+        Self::from_flags(broadcast.paused, state.is_live(&broadcast.name))
+    }
+
+    pub fn from_flags(paused: bool, live: bool) -> Self {
+        if paused {
             BroadcastStatus::Paused
-        } else if hub.is_live(&broadcast.name) {
+        } else if live {
             BroadcastStatus::Live
         } else {
             BroadcastStatus::Offline
@@ -238,6 +242,9 @@ pub struct LiveInfo {
     pub recording: Option<Recording>,
     /// LL-HLS/LL-DASH packaging status (codec support, readiness, measured GOP).
     pub packager: Option<crate::packager::PackagerStatus>,
+    /// Cluster mode: the node the publisher is connected to (absent on a single node).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -312,26 +319,38 @@ impl ViewContext {
         self.effective_default_waiting_text()
     }
 
-    pub fn view(&self, state: &AppState, broadcast: Broadcast) -> BroadcastView {
-        let status = BroadcastStatus::of(&broadcast, &state.hub);
-        let live = state.hub.get(&broadcast.name).map(|s| {
-            let info = s.info();
-            LiveInfo {
-                started_at: s.started_at,
-                publisher_ip: s.publisher_addr.map(|a| a.ip().to_string()),
-                video_codec: info.video_codec,
-                audio_codec: info.audio_codec,
-                width: info.width,
-                height: info.height,
-                fps: info.fps,
-                bytes_in: s.bytes_in(),
-                recording: state.recorder.current(&broadcast.name),
-                packager: state.packager.status(&broadcast.name),
+    /// The view of `broadcast`. In cluster mode a stream published on another node is
+    /// described by its owner (`/internal/status`, cached a few seconds), or minimally
+    /// from the `live_streams` row when the owner does not answer.
+    pub async fn view(&self, state: &AppState, broadcast: Broadcast) -> BroadcastView {
+        let status = BroadcastStatus::of(&broadcast, state);
+        let cluster = state.cluster.enabled().then(|| state.cluster.node_id());
+        let local = state
+            .hub
+            .get(&broadcast.name)
+            .filter(|s| s.origin.is_local());
+        let live = match local {
+            Some(s) => {
+                let info = s.info();
+                Some(LiveInfo {
+                    started_at: s.started_at,
+                    publisher_ip: s.publisher_addr.map(|a| a.ip().to_string()),
+                    video_codec: info.video_codec,
+                    audio_codec: info.audio_codec,
+                    width: info.width,
+                    height: info.height,
+                    fps: info.fps,
+                    bytes_in: s.bytes_in(),
+                    recording: state.recorder.current(&broadcast.name),
+                    packager: state.packager.status(&broadcast.name),
+                    node_id: cluster.map(str::to_string),
+                })
             }
-        });
+            None => remote_live_info(state, &broadcast.name).await,
+        };
         BroadcastView {
             status,
-            viewers: state.tracker.counts(&broadcast.name),
+            viewers: state.viewer_counts(&broadcast.name),
             live,
             urls: PlaybackUrls::new(&self.base, &broadcast.name),
             obs: ObsSettings::new(&self.base, &state.config, &broadcast.stream_key),
@@ -339,6 +358,40 @@ impl ViewContext {
             broadcast,
         }
     }
+}
+
+/// [`LiveInfo`] of a stream published on another node (cluster mode).
+async fn remote_live_info(state: &AppState, name: &str) -> Option<LiveInfo> {
+    let owner = state.cluster.directory.remote_owner(name)?;
+    let local_packager = state.packager.status(name);
+    Some(match state.cluster.remote_status(name).await {
+        Some(r) => LiveInfo {
+            started_at: r.started_at,
+            publisher_ip: r.publisher_ip,
+            video_codec: r.video_codec,
+            audio_codec: r.audio_codec,
+            width: r.width,
+            height: r.height,
+            fps: r.fps,
+            bytes_in: r.bytes_in,
+            recording: r.recording,
+            packager: r.packager.or(local_packager),
+            node_id: Some(r.node_id),
+        },
+        None => LiveInfo {
+            started_at: owner.row.started_at,
+            publisher_ip: None,
+            video_codec: None,
+            audio_codec: None,
+            width: None,
+            height: None,
+            fps: None,
+            bytes_in: 0,
+            recording: None,
+            packager: local_packager,
+            node_id: Some(owner.node_id),
+        },
+    })
 }
 
 /// `/waiting/<relative path>` URL (each path segment percent-encoded).
@@ -491,7 +544,7 @@ impl EmbedInfo {
       method: 'POST', headers: {{ 'Content-Type': 'application/sdp' }}, body: pc.localDescription.sdp
     }});
     if (res.status !== 201) {{ console.error('WHEP error', res.status, await res.text()); pc.close(); return; }}
-    var session = new URL(res.headers.get('Location'), endpoint).href;
+    var session = new URL(res.headers.get('Location'), res.url || endpoint).href;
     await pc.setRemoteDescription({{ type: 'answer', sdp: await res.text() }});
     window.addEventListener('pagehide', function () {{
       fetch(session, {{ method: 'DELETE', keepalive: true }}); pc.close();

@@ -27,6 +27,7 @@
 pub mod broadcasts;
 pub mod cache;
 pub mod cluster;
+pub mod live_streams;
 pub mod metrics;
 pub mod nodes;
 pub mod pg;

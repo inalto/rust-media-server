@@ -78,13 +78,23 @@ pub struct PublicBroadcast {
 }
 
 /// WebRTC usable for `b` right now (see [`PublicSources::whep`]).
+/// Cluster mode: a node without usable WebRTC still offers WHEP when another node can
+/// take the offer (`307` redirect, docs/CLUSTER.md §3.8).
 fn whep_available(state: &AppState, b: &Broadcast) -> bool {
-    if !(b.enable_webrtc && state.webrtc.available()) {
+    if !b.enable_webrtc {
+        return false;
+    }
+    if !state.webrtc.available() && state.cluster.whep_redirect_target(&b.name).is_none() {
         return false;
     }
     match state.hub.get(&b.name) {
         Some(s) => s.info().video_codec.is_none_or(|c| c == "h264"),
-        None => true,
+        None => state
+            .cluster
+            .directory
+            .last_status(&b.name)
+            .and_then(|r| r.video_codec)
+            .is_none_or(|c| c == "h264"),
     }
 }
 
@@ -105,7 +115,7 @@ pub fn public_view(state: &AppState, ctx: &ViewContext, b: &Broadcast) -> Public
     PublicBroadcast {
         name: b.name.clone(),
         title: b.title.clone(),
-        status: BroadcastStatus::of(b, &state.hub),
+        status: BroadcastStatus::of(b, state),
         waiting_video_url: waiting_rel
             .as_deref()
             .map(|rel| waiting_url(&ctx.base, rel)),
@@ -147,7 +157,7 @@ async fn events(State(state): State<AppState>, Path(name): Path<String>) -> ApiR
     let b = load(&state, &name).await?;
     // Subscribe before computing the initial status so no change is missed.
     let mut rx = state.hub.subscribe_events();
-    let mut current = BroadcastStatus::of(&b, &state.hub);
+    let mut current = BroadcastStatus::of(&b, &state);
     let shutdown = state.shutdown.clone();
     let stream = async_stream::stream! {
         yield Ok::<Event, Infallible>(status_event(current));
@@ -167,7 +177,7 @@ async fn events(State(state): State<AppState>, Path(name): Path<String>) -> ApiR
                         continue;
                     }
                     let next = match db::broadcasts::find_by_name(&state.db, &name).await {
-                        Ok(Some(b)) => BroadcastStatus::of(&b, &state.hub),
+                        Ok(Some(b)) => BroadcastStatus::of(&b, &state),
                         Ok(None) => BroadcastStatus::Offline,
                         Err(e) => {
                             tracing::warn!(error = %e, "public SSE: failed to load broadcast");

@@ -3,7 +3,11 @@
 //! - `POST /whep/{name}` (`Content-Type: application/sdp`, body = offer) → `201 Created`,
 //!   `Location: /whep/{name}/{session}`, body = SDP answer (ICE gathering is complete:
 //!   host candidates on the shared UDP port, ICE-lite, no trickle needed).
-//! - `DELETE /whep/{name}/{session}` → `200` (peer connection closed).
+//! - `DELETE /whep/{name}/{session}` → `200` (peer connection closed). Cluster mode:
+//!   session ids are `<node_id>-<uuid>`; a session of another node is closed through
+//!   its internal listener.
+//! - Cluster mode, WebRTC unusable on this node: `POST` → `307` to another node's
+//!   `whep_url` (`cluster.whep_redirect`).
 //! - `PATCH /whep/{name}/{session}` → `405` (trickle ICE / ICE restart not supported).
 //! - `OPTIONS` on both → `204` (CORS preflight; `Link` ICE servers when configured).
 //!
@@ -235,11 +239,18 @@ async fn create(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, WhepError> {
-    if !state.config.webrtc.enabled {
-        return Err(ApiError::forbidden("WebRTC is disabled on this server").into());
-    }
     if !is_valid_name(&name) {
         return Err(ApiError::broadcast_not_found().into());
+    }
+    // Cluster mode, no usable WebRTC here: send the offer to a node that has it
+    // (`307` keeps the method and the body, draft-ietf-wish-whep §4.7).
+    if !state.webrtc.available()
+        && let Some(target) = state.cluster.whep_redirect_target(&name)
+    {
+        return Ok(redirect(&target));
+    }
+    if !state.config.webrtc.enabled {
+        return Err(ApiError::forbidden("WebRTC is disabled on this server").into());
     }
     let broadcast = db::broadcasts::find_by_name(&state.db, &name)
         .await?
@@ -254,9 +265,10 @@ async fn create(
         ));
     }
     let (offer, _) = validate_offer(&body)?;
+    // Cluster mode: relayed from the owner node when it is published elsewhere.
     let stream = state
-        .hub
-        .get(&broadcast.name)
+        .live_stream(&broadcast.name)
+        .await
         .ok_or_else(|| ApiError::not_found("stream offline"))?;
     if !state.webrtc.available() {
         return Err(WhepError::status(
@@ -287,15 +299,49 @@ async fn create(
     Ok(r)
 }
 
-/// `DELETE /whep/{name}/{session}`.
+/// `307 Temporary Redirect` to another node's WHEP endpoint.
+fn redirect(target: &str) -> Response {
+    let mut r = StatusCode::TEMPORARY_REDIRECT.into_response();
+    let h = r.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(target) {
+        h.insert(header::LOCATION, v);
+    }
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
+}
+
+/// `DELETE /whep/{name}/{session}`. In cluster mode a session of another node (id
+/// prefix) is closed through that node's internal listener.
 async fn delete_session(
     State(state): State<AppState>,
     Path((name, session)): Path<(String, String)>,
 ) -> Result<StatusCode, WhepError> {
     if state.webrtc.delete_session(&name, &session) {
-        Ok(StatusCode::OK)
-    } else {
-        Err(ApiError::not_found("session not found").into())
+        return Ok(StatusCode::OK);
+    }
+    let not_found = || WhepError::from(ApiError::not_found("session not found"));
+    let Some(node) = crate::webrtc::session_node(&session)
+        .filter(|n| state.cluster.enabled() && *n != state.cluster.node_id())
+    else {
+        return Err(not_found());
+    };
+    let base = state.cluster.node_url(node).await.ok_or_else(not_found)?;
+    match state
+        .cluster
+        .client()
+        .whep_delete(&base, &name, &session)
+        .await
+    {
+        Ok(s) if s.is_success() => Ok(StatusCode::OK),
+        Ok(s) if s == reqwest::StatusCode::NOT_FOUND => Err(not_found()),
+        Ok(s) => Err(WhepError::status(
+            StatusCode::BAD_GATEWAY,
+            format!("node {node} answered {s}"),
+        )),
+        Err(e) => Err(WhepError::status(
+            StatusCode::BAD_GATEWAY,
+            format!("cannot reach node {node}: {e}"),
+        )),
     }
 }
 

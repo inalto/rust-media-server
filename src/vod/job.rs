@@ -6,7 +6,7 @@
 //! (`UPDATE … SET status='processing', claimed_by=<node>, lease_until=now+60 s,
 //! attempts=attempts+1 WHERE id=? AND status='queued'`, one row or nothing). A job:
 //! probe → renditions → poster → one ffmpeg pass with progress (≥ 1 % steps, at most
-//! every 0.5 s) → playlist/MPD post-processing → swap `abr.tmp/` into `abr/` → `ready`
+//! every 0.5 s) → playlist/MPD post-processing → swap `abr.tmp/` (`abr.<node>.tmp/` in cluster mode) into `abr/` → `ready`
 //! (only while this node still holds the claim). The lease is renewed every 15 s while
 //! the job runs; when it is lost (another node re-queued the item after the lease
 //! expired) the job is cancelled and its result discarded. Every 15 s the runner also
@@ -187,7 +187,7 @@ pub async fn run(mgr: &VodManager, id: &str, cancel: &CancellationToken) {
             mgr.changed(id);
         }
         Err(JobError::Cancelled) => {
-            let _ = tokio::fs::remove_dir_all(mgr.item_dir(id).join("abr.tmp")).await;
+            let _ = tokio::fs::remove_dir_all(mgr.tmp_dir(id)).await;
             // Shutdown: back to the queue. Forced delete: the row is gone (no-op).
             if matches!(repo::unclaim(mgr.db(), id).await, Ok(true)) {
                 tracing::info!(id = %id, "VOD transcode interrupted; re-queued");
@@ -198,7 +198,7 @@ pub async fn run(mgr: &VodManager, id: &str, cancel: &CancellationToken) {
         }
         Err(JobError::Failed(msg)) => {
             tracing::warn!(id = %id, error = %msg, "VOD transcode failed");
-            let _ = tokio::fs::remove_dir_all(mgr.item_dir(id).join("abr.tmp")).await;
+            let _ = tokio::fs::remove_dir_all(mgr.tmp_dir(id)).await;
             if let Err(e) = repo::mark_failed(mgr.db(), id, &msg).await {
                 tracing::warn!(id = %id, error = %e, "cannot mark the video as failed");
             }
@@ -255,7 +255,7 @@ async fn process(mgr: &VodManager, id: &str, cancel: &CancellationToken) -> Resu
     }
 
     let item_dir = mgr.item_dir(id);
-    let tmp = item_dir.join("abr.tmp");
+    let tmp = mgr.tmp_dir(id);
     if tmp.exists() {
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
