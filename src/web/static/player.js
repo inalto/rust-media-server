@@ -4,13 +4,17 @@
 //   with polling every 5 s while the SSE is down.
 // - offline/paused → waiting screen: looped muted waiting video (poster) or a styled
 //   placeholder with the title, the waiting text and a pulsing badge.
-// - live → source selection (query `src=auto|flv|hls|dash`, default auto):
-//   auto = HTTP-FLV with mpegts.js when supported and not iOS, else native HLS
-//   (Safari/iOS), else hls.js, else dash.js. On fatal errors (or no progress) the next
-//   source in the order flv → hls → dash is tried, then the waiting screen with a retry
-//   after 5 s. Player libraries are loaded from the CDN only when needed.
+// - live → source selection (query `src=auto|webrtc|flv|hls|dash`, default auto):
+//   auto = WebRTC (WHEP, sub-second) when the server offers it, then HTTP-FLV with
+//   mpegts.js when supported and not iOS, else native HLS (Safari/iOS), else hls.js,
+//   else dash.js. On fatal errors (or no progress) the next source in the order
+//   webrtc → flv → hls → dash is tried, then the waiting screen with a retry after 5 s.
+//   WebRTC fails over when ICE does not connect within 6 s, the connection fails or
+//   closes, the WHEP POST is refused, or no video frame arrives within 8 s; its
+//   teardown closes the peer connection and DELETEs the WHEP session.
+//   Player libraries are loaded from the CDN only when needed.
 // - Query: autoplay=1|0 (1), muted=1|0 (1), controls=1|0 (1), src, latency=1|0.
-// - Debug handle: window.rmsPlayer = { status, source, engine, latency, setSource(), reload() }.
+// - Debug handle: window.rmsPlayer = { status, source, engine, latency, peerConnection, setSource(), reload() }.
 (function () {
   'use strict';
 
@@ -19,7 +23,9 @@
     hls: { url: 'https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js', global: 'Hls' },
     dash: { url: 'https://cdn.jsdelivr.net/npm/dashjs@5.2.1/dist/modern/umd/dash.all.min.js', global: 'dashjs' },
   };
-  var ORDER = ['flv', 'hls', 'dash'];
+  var ORDER = ['webrtc', 'flv', 'hls', 'dash'];
+  var ICE_TIMEOUT_MS = 6000;
+  var FIRST_FRAME_TIMEOUT_MS = 8000;
   var RETRY_MS = 5000;
   var POLL_MS = 5000;
   var START_TIMEOUT_MS = 15000;
@@ -38,6 +44,7 @@
   }
   function normalizeSrc(s) {
     s = (s || 'auto').toLowerCase();
+    if (s === 'whep') s = 'webrtc';
     return ORDER.indexOf(s) >= 0 ? s : 'auto';
   }
   var opts = {
@@ -364,7 +371,100 @@
     });
   }
 
+  /**
+   * WebRTC via WHEP: recvonly video + audio transceivers, POST the offer (no need to
+   * wait for local ICE candidates: the server is ICE-lite with public host candidates,
+   * the browser's checks reach it), apply the answer, play the MediaStream.
+   */
+  function createWebRtc(gen) {
+    if (!window.RTCPeerConnection || !window.MediaStream) return Promise.reject(new Error('WebRTC not supported'));
+    var endpoint = info.sources.whep;
+    var pc = new RTCPeerConnection();
+    var stream = new MediaStream();
+    var sessionUrl = null;
+    var closed = false;
+    var latency = NaN;
+    var lastStats = null;
+    var statsTimer = null;
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+    pc.ontrack = function (e) {
+      if (stream.getTracks().indexOf(e.track) < 0) stream.addTrack(e.track);
+      if (video.srcObject !== stream) {
+        video.srcObject = stream;
+        tryPlay();
+      }
+    };
+    var iceTimer = setTimeout(function () {
+      if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') fatal(gen, 'webrtc: ICE not connected within ' + ICE_TIMEOUT_MS / 1000 + ' s');
+    }, ICE_TIMEOUT_MS);
+    var frameTimer = setTimeout(function () {
+      if (video.readyState < 2) fatal(gen, 'webrtc: no video frames within ' + FIRST_FRAME_TIMEOUT_MS / 1000 + ' s');
+    }, FIRST_FRAME_TIMEOUT_MS);
+    pc.oniceconnectionstatechange = function () {
+      var st = pc.iceConnectionState;
+      if (st === 'connected' || st === 'completed') clearTimeout(iceTimer);
+      if (st === 'failed' || st === 'closed') fatal(gen, 'webrtc: ICE ' + st);
+    };
+    pc.onconnectionstatechange = function () {
+      var st = pc.connectionState;
+      if (st === 'failed' || st === 'closed') fatal(gen, 'webrtc: connection ' + st);
+    };
+    // Estimated delay: jitter buffer (last second) + half the round-trip time.
+    function pollStats() {
+      pc.getStats().then(function (report) {
+        var jb = null, rtt = 0;
+        report.forEach(function (r) {
+          if (r.type === 'inbound-rtp' && r.kind === 'video') jb = { delay: r.jitterBufferDelay || 0, count: r.jitterBufferEmittedCount || 0 };
+          if (r.type === 'candidate-pair' && r.nominated && typeof r.currentRoundTripTime === 'number') rtt = r.currentRoundTripTime;
+        });
+        if (jb && lastStats && jb.count > lastStats.count) latency = (jb.delay - lastStats.delay) / (jb.count - lastStats.count) + rtt / 2;
+        if (jb) lastStats = jb;
+      }, function () {});
+    }
+    function teardown() {
+      if (closed) return;
+      closed = true;
+      clearTimeout(iceTimer);
+      clearTimeout(frameTimer);
+      clearInterval(statsTimer);
+      try { pc.close(); } catch (_) { /* ignore */ }
+      if (sessionUrl) {
+        try { fetch(sessionUrl, { method: 'DELETE', keepalive: true }).catch(function () {}); } catch (_) { /* ignore */ }
+      }
+      if (video.srcObject === stream) video.srcObject = null;
+    }
+    var eng = {
+      source: 'webrtc', kind: 'webrtc', pc: pc,
+      destroy: teardown,
+      latency: function () { return latency; },
+      goLive: function () { /* always at the live edge */ },
+    };
+    return pc.createOffer().then(function (offer) {
+      return pc.setLocalDescription(offer);
+    }).then(function () {
+      return fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
+    }).then(function (res) {
+      var loc = res.headers.get('Location');
+      if (loc) sessionUrl = new URL(loc, endpoint).href;
+      if (res.status !== 201) {
+        return res.text().then(function (t) { throw new Error('WHEP ' + res.status + ' ' + t.slice(0, 200)); });
+      }
+      return res.text();
+    }).then(function (answer) {
+      if (closed) throw new Error('cancelled');
+      return pc.setRemoteDescription({ type: 'answer', sdp: answer });
+    }).then(function () {
+      statsTimer = setInterval(pollStats, 1000);
+      return eng;
+    }, function (err) {
+      teardown();
+      throw err;
+    });
+  }
+
   function createEngine(source, gen) {
+    if (source === 'webrtc') return createWebRtc(gen);
     if (source === 'flv') return createFlv(gen);
     if (source === 'hls') {
       // Native HLS on iOS / Safari; hls.js elsewhere (Chrome's native HLS is not LL-HLS aware).
@@ -381,13 +481,14 @@
   function sourceOrder() {
     var s = (info && info.sources) || {};
     var available = {
+      webrtc: !!s.whep && !!window.RTCPeerConnection,
       flv: !!s.flv && mseAvailable(),
       hls: !!s.hls && (mseAvailable() || nativeHls()),
       dash: !!s.dash && mseAvailable(),
     };
     var order;
     if (opts.src !== 'auto') order = ORDER.slice(ORDER.indexOf(opts.src));
-    else order = isIOS() ? ['hls', 'dash'] : ORDER.slice();
+    else order = isIOS() ? ['webrtc', 'hls', 'dash'] : ORDER.slice();
     return order.filter(function (k) { return available[k]; });
   }
 
@@ -566,10 +667,20 @@
     }
   }, 10000);
 
+  // Leaving the page: close a WebRTC session right away (DELETE with keepalive) instead
+  // of letting the server notice the missing ICE consent; resume if restored (bfcache).
+  window.addEventListener('pagehide', function () {
+    if (engine && engine.source === 'webrtc') stopLive();
+  });
+  window.addEventListener('pageshow', function (ev) {
+    if (ev.persisted && status === 'live' && !engine) startLive();
+  });
+
   window.rmsPlayer = {
     get status() { return status; },
     get source() { return engine ? engine.source : null; },
     get engine() { return engine ? engine.kind : null; },
+    get peerConnection() { return engine && engine.pc ? engine.pc : null; },
     get playing() { return playing; },
     get latency() { var l = engine && playing ? engine.latency() : NaN; return typeof l === 'number' && isFinite(l) ? l : null; },
     get info() { return info; },
