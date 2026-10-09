@@ -1113,6 +1113,12 @@ export const it = {
   'users.encodingsEmpty': 'Nessun video codificato.',
   'users.loadError': "Impossibile caricare l'utente",
 
+  // Accounts: owner chips in the video library (vod.js)
+  'vod.owner': 'Proprietario',
+  'vod.ownerTitle': "Apri l'utente",
+  'vod.bucketTitle': 'Bucket e percorso del file originale',
+  'vod.originStorage': 'Bucket di un utente (API di storage)',
+  'vod.privateChip': 'Privato',
 };
 
 export const en = {
@@ -2212,6 +2218,12 @@ export const en = {
   'users.encodingsEmpty': 'No encoded videos.',
   'users.loadError': 'Cannot load the user',
 
+  // Accounts: owner chips in the video library (vod.js)
+  'vod.owner': 'Owner',
+  'vod.ownerTitle': 'Open the user',
+  'vod.bucketTitle': 'Bucket and path of the original file',
+  'vod.originStorage': "A user's bucket (storage API)",
+  'vod.privateChip': 'Private',
 };
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,9 @@
 // progress from the admin SSE `vod` / `vod_deleted` events, renditions, plays, viewers),
 // actions (watch, links and embed, edit, re-transcode, download the original, delete)
 // and the read-only "VOD ladders" panel of the Settings page (vodSettingsPanel).
+// Encodings of users' bucket files (origin `storage`) show owner and bucket chips linking
+// to the user (#/users/<id>) and to the file's folder in the admin bucket browser; their
+// preview is signed when the video is private.
 
 import {
   api, ApiError, bus, describeError, h, icon, iconButton, setChildren, toast, uid, modal, confirmDialog,
@@ -12,6 +15,41 @@ import { t, tn, formatNumber } from './i18n.js';
 import { getThemeChoice, onThemeChange } from './theme.js';
 
 const enc = encodeURIComponent;
+
+/** Owners of bucket encodings: users by id and buckets by id (admin API), loaded lazily. */
+const owners = { users: new Map(), buckets: new Map(), usersLoaded: false, bucketsOf: new Set() };
+async function loadOwners(list) {
+  const ids = [...new Set(list.filter((v) => v.user_id).map((v) => v.user_id))];
+  if (!ids.length) return false;
+  let changed = false;
+  if (!owners.usersLoaded || ids.some((id) => !owners.users.has(id))) {
+    for (const u of await api('/users')) owners.users.set(u.id, u);
+    owners.usersLoaded = true;
+    changed = true;
+  }
+  await Promise.all(ids.filter((id) => !owners.bucketsOf.has(id) && owners.users.has(id)).map(async (id) => {
+    owners.bucketsOf.add(id);
+    for (const b of await api(`/users/${enc(id)}/buckets`)) owners.buckets.set(b.id, b);
+    changed = true;
+  }));
+  return changed;
+}
+
+/** Owner / bucket / visibility chips of a bucket encoding (null for the admin library). */
+function ownerChips(v) {
+  if (!v.user_id) return null;
+  const u = owners.users.get(v.user_id);
+  const b = owners.buckets.get(v.bucket_id);
+  const uname = u ? u.username : v.user_id.slice(0, 8);
+  const path = v.object_path || '';
+  const dir = path.slice(0, path.lastIndexOf('/') + 1) || '/';
+  return h('p', { class: 'chips vod-owner' },
+    h('a', { class: 'chip-tag', href: `#/users/${enc(u ? u.username : v.user_id)}`, title: t('vod.ownerTitle') }, icon('user', 12), uname),
+    h(b ? 'a' : 'span', { class: 'chip-tag mono', href: b ? `#/users/${enc(u ? u.username : v.user_id)}/buckets/${enc(b.name)}${dir.split('/').map(enc).join('/')}` : null, title: t('vod.bucketTitle') },
+      icon('bucket', 12), `${b ? b.name : '…'}:${path}`),
+    v.visibility === 'private' ? h('span', { class: 'chip-tag private', title: t('browser.privateTitle') }, icon('lock', 12), t('vod.privateChip')) : null);
+}
+
 const STATUS = {
   queued: ['status-offline', () => t('vod.status.queued')],
   processing: ['status-paused', () => t('vod.status.processing')],
@@ -119,8 +157,13 @@ export function mountVod(root) {
 
   function upsert(v) {
     if (!v || !v.id) return;
+    const isNew = !items.has(v.id);
     items.set(v.id, v);
     render();
+    if (isNew && v.user_id && (!owners.users.has(v.user_id) || !owners.buckets.has(v.bucket_id))) {
+      owners.bucketsOf.delete(v.user_id);
+      loadOwners([v]).then(() => { const el = rows.get(v.id); if (el && items.has(v.id)) el.update(items.get(v.id)); }).catch(() => {});
+    }
     if (openDetail && openDetail.id === v.id) openDetail.update(v);
   }
 
@@ -176,22 +219,26 @@ export function mountVod(root) {
     const titleBtn = h('button', { type: 'button', class: 'vod-title-btn', onclick: () => detailDialog(id) });
     const desc = h('p', { class: 'vod-desc' });
     const meta = h('p', { class: 'vod-meta' });
+    const owner = h('div', { class: 'vod-owner-box' });
     const statusBox = h('div', { class: 'vod-status' });
     const rend = h('p', { class: 'vod-renditions' });
     const plays = h('span', { class: 'vod-stat' });
     const viewers = h('span', { class: 'vod-stat' });
     const actions = h('div', { class: 'vod-actions' });
     el.append(thumb,
-      h('div', { class: 'vod-main' }, h('h3', { class: 'vod-title' }, titleBtn), desc, meta, statusBox, rend),
+      h('div', { class: 'vod-main' }, h('h3', { class: 'vod-title' }, titleBtn), desc, meta, owner, statusBox, rend),
       h('div', { class: 'vod-side' }, h('div', { class: 'vod-stats' }, plays, viewers), actions));
     let lastPoster;
     el.update = (v) => {
       el.dataset.status = v.status;
-      if (v.poster_url !== lastPoster) {
-        lastPoster = v.poster_url;
-        setChildren(thumb, v.poster_url
-          ? h('img', { src: `${v.poster_url}?t=${enc(v.updated_at || '')}`, alt: '', loading: 'lazy', decoding: 'async' })
-          : h('div', { class: 'vod-thumb-empty' }, icon('film', 24)));
+      // A private bucket encoding's poster needs a signed token: show a placeholder.
+      const poster = v.visibility === 'private' ? null : v.poster_url;
+      const posterKey = v.visibility === 'private' ? 'private' : v.poster_url;
+      if (posterKey !== lastPoster) {
+        lastPoster = posterKey;
+        setChildren(thumb, poster
+          ? h('img', { src: `${poster}?t=${enc(v.updated_at || '')}`, alt: '', loading: 'lazy', decoding: 'async' })
+          : h('div', { class: 'vod-thumb-empty', title: v.visibility === 'private' ? t('browser.privateTitle') : null }, icon(v.visibility === 'private' ? 'lock' : 'film', 24)));
         thumb.append(h('span', { class: 'vod-duration', hidden: v.source_duration_secs == null }, clock(v.source_duration_secs)));
       }
       const dur = thumb.querySelector('.vod-duration');
@@ -201,6 +248,8 @@ export function mountVod(root) {
       desc.textContent = v.description || '';
       desc.hidden = !v.description;
       meta.textContent = [sourceSummary(v), t('vod.addedAt', { when: fmtDateTime(v.created_at) }), v.origin === 'inbox' ? t('vod.fromInbox') : null].filter(Boolean).join(' · ');
+      setChildren(owner, ownerChips(v));
+      owner.hidden = !v.user_id;
       const parts = [statusBadge(v.status)];
       if (v.status === 'processing' || v.status === 'queued') {
         const pct = v.status === 'processing' ? v.progress || 0 : 0;
@@ -219,7 +268,7 @@ export function mountVod(root) {
       const ready = v.status === 'ready';
       const busy = v.status === 'processing';
       setChildren(actions,
-        ready ? h('a', { class: 'btn small', href: v.urls.watch, target: '_blank', rel: 'noopener', title: t('vod.watchTitle') }, icon('external', 16), h('span', null, t('vod.watch'))) : null,
+        ready && v.visibility !== 'private' ? h('a', { class: 'btn small', href: v.urls.watch, target: '_blank', rel: 'noopener', title: t('vod.watchTitle') }, icon('external', 16), h('span', null, t('vod.watch'))) : null,
         iconButton('code', t('vod.embed'), () => detailDialog(id), { cls: 'btn small', attrs: { title: t('vod.embedTitle') } }),
         iconButton('edit', t('action.edit'), () => editDialog(id), { cls: 'btn small', showLabel: false }),
         iconButton('refresh', t('vod.retranscode'), () => retranscodeDialog(id), { cls: 'btn small', showLabel: false, attrs: { disabled: busy || !v.source_available } }),
@@ -380,10 +429,20 @@ export function mountVod(root) {
     const rendBox = h('div');
     let previewFor = null;
     function renderPreview() {
-      const key = v.status === 'ready' ? `ready|${v.updated_at}` : v.status;
+      const key = v.status === 'ready' ? `ready|${v.updated_at}|${v.visibility}` : v.status;
       if (key === previewFor) return;
       previewFor = key;
-      if (v.status === 'ready') {
+      if (v.status === 'ready' && v.visibility === 'private' && v.user_id && v.bucket_id) {
+        // Private bucket encoding: sign a 1 h link as the owner (admin ?user=).
+        setChildren(preview, h('div', { class: 'preview-off' }, icon('lock', 28), h('p', null, t('common.loading'))));
+        api(`/account/buckets/${enc(v.bucket_id)}/sign?user=${enc(v.user_id)}`, { method: 'POST', body: { path: v.object_path, expires_secs: 3600 } })
+          .then((s) => {
+            const u = new URL(s.embed);
+            u.searchParams.set('theme', getThemeChoice());
+            setChildren(preview, h('iframe', { src: u.toString(), title: t('vod.previewTitle', { title: v.title }), allow: 'autoplay; fullscreen; picture-in-picture' }));
+          })
+          .catch((e) => setChildren(preview, h('div', { class: 'preview-off' }, icon('alert', 28), h('p', null, describeError(e)))));
+      } else if (v.status === 'ready') {
         setChildren(preview, h('iframe', { src: `/embed/vod/${enc(id)}?theme=${getThemeChoice()}`, title: t('vod.previewTitle', { title: v.title }), allow: 'autoplay; fullscreen; picture-in-picture' }));
       } else {
         setChildren(preview, h('div', { class: 'preview-off' }, icon('film', 28), h('p', null, (STATUS[v.status] || STATUS.queued)[1]())));
@@ -400,14 +459,15 @@ export function mountVod(root) {
         [t('vod.source'), sourceSummary(v) || '—'],
         [t('vod.duration'), v.source_duration_secs != null ? fmtDuration(v.source_duration_secs) : '—'],
         [t('vod.originalFile'), v.source_available ? (v.source_name || '—') : t('vod.sourceRemoved')],
-        [t('vod.origin'), v.origin === 'inbox' ? t('vod.originInbox') : t('vod.originUpload')],
+        [t('vod.origin'), v.origin === 'inbox' ? t('vod.originInbox') : v.origin === 'storage' ? t('vod.originStorage') : t('vod.originUpload')],
+        v.user_id ? [t('vod.owner'), ownerChips(v)] : null,
         [t('vod.added'), fmtDateTime(v.created_at)],
         [t('vod.readyAt'), v.ready_at ? fmtDateTime(v.ready_at) : '—'],
         [t('vod.playsLabel'), fmtInt(v.plays || 0)],
         [t('vod.viewersNow'), fmtInt(v.viewers_now || 0)],
       ];
       if (v.status === 'failed' && v.error) kv.push([t('vod.error'), h('pre', { class: 'vod-error-text' }, v.error)]);
-      setChildren(infoBox, ...kv.map(([k, val]) => [h('dt', null, k), h('dd', null, val)]));
+      setChildren(infoBox, ...kv.filter(Boolean).map(([k, val]) => [h('dt', null, k), h('dd', null, val)]));
       const rs = v.renditions || [];
       setChildren(rendBox, rs.length
         ? h('div', { class: 'table-wrap' }, h('table', null,
@@ -458,6 +518,7 @@ export function mountVod(root) {
       items.clear();
       for (const v of listRes) items.set(v.id, v);
       render();
+      loadOwners(listRes).then((changed) => { if (changed && !destroyed) { rows.forEach((el, rid) => { if (items.has(rid)) el.update(items.get(rid)); }); } }).catch(() => {});
     } catch (e) {
       if (destroyed || (e instanceof ApiError && e.status === 401)) return;
       setChildren(empty, icon('alert', 28), h('p', { class: 'state-title' }, t('vod.loadError')), h('p', { class: 'hint' }, describeError(e)));
