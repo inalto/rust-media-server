@@ -559,6 +559,7 @@ impl ClusterNode {
     /// for names whose remote owner changed and stops relays whose owner is gone.
     pub async fn refresh_directory(&self) {
         let ttl = self.node_ttl();
+        let queried_at = Instant::now();
         let (rows, nodes) = match tokio::join!(
             live_streams::list_alive(&self.db, ttl),
             nodes::list(&self.db, ttl)
@@ -575,7 +576,7 @@ impl ClusterNode {
             .into_iter()
             .map(|r| (r.name, r.node_id))
             .collect();
-        self.directory.replace(rows, nodes);
+        self.directory.replace_since(rows, nodes, queried_at);
         let after: Vec<(String, String)> = self
             .directory
             .rows()

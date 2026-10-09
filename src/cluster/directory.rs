@@ -40,7 +40,13 @@ pub struct Directory {
     remote_viewers: RwLock<HashMap<String, ViewerCounts>>,
     status: Mutex<HashMap<String, (Instant, Option<RemoteStreamStatus>)>>,
     loaded: Mutex<Option<Instant>>,
+    /// Changes applied from notices (`Some` = started, `None` = ended), so that a
+    /// reload whose query started before them does not undo them.
+    recent: Mutex<HashMap<String, (Instant, Option<LiveStreamRow>)>>,
 }
+
+/// How long notice changes are remembered (several reload periods).
+const RECENT_TTL: Duration = Duration::from_secs(30);
 
 impl Directory {
     pub fn new(me: &str) -> Self {
@@ -52,8 +58,37 @@ impl Directory {
 
     /// Replace the stream rows and the alive nodes (full reload).
     pub fn replace(&self, rows: Vec<LiveStreamRow>, nodes: Vec<NodeInfo>) {
-        *self.streams.write().unwrap_or_else(|e| e.into_inner()) =
+        self.replace_since(rows, nodes, Instant::now());
+    }
+
+    /// [`Self::replace`] with rows read by a query that started at `queried_at`: the
+    /// notice changes applied after that instant win over the (older) rows.
+    pub fn replace_since(
+        &self,
+        rows: Vec<LiveStreamRow>,
+        nodes: Vec<NodeInfo>,
+        queried_at: Instant,
+    ) {
+        let mut map: HashMap<String, LiveStreamRow> =
             rows.into_iter().map(|r| (r.name.clone(), r)).collect();
+        {
+            let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+            recent.retain(|_, (at, _)| at.elapsed() < RECENT_TTL);
+            for (name, (at, change)) in recent.iter() {
+                if *at < queried_at {
+                    continue;
+                }
+                match change {
+                    Some(row) => {
+                        map.insert(name.clone(), row.clone());
+                    }
+                    None => {
+                        map.remove(name);
+                    }
+                }
+            }
+        }
+        *self.streams.write().unwrap_or_else(|e| e.into_inner()) = map;
         *self.nodes.write().unwrap_or_else(|e| e.into_inner()) = nodes
             .into_iter()
             .filter(|n| n.alive)
@@ -86,10 +121,20 @@ impl Directory {
             entry.started_at = now;
         }
         entry.heartbeat = now;
+        let row = entry.clone();
+        drop(map);
+        self.remember(name, Some(row));
         self.status
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(name);
+    }
+
+    fn remember(&self, name: &str, change: Option<LiveStreamRow>) {
+        self.recent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string(), (Instant::now(), change));
     }
 
     /// `name` ended (released or reaped). With `node`, only if that node owns the row.
@@ -101,6 +146,7 @@ impl Directory {
         let removed = if matches { map.remove(name) } else { None };
         drop(map);
         if removed.is_some() {
+            self.remember(name, None);
             self.status
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -284,6 +330,28 @@ mod tests {
         fn remote_stream_kept_for_wrong_node(&self) -> bool {
             self.remove_stream("a", Some("n1")).is_none() && self.owner_row("a").is_some()
         }
+    }
+
+    #[test]
+    fn notices_win_over_an_older_reload() {
+        let d = Directory::new("n2");
+        let before = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        d.upsert_stream("new", "n1");
+        d.replace(vec![row("gone", "n1")], vec![node("n1", true)]);
+        d.remove_stream("gone", Some("n1"));
+        // A reload whose query started before both notices: "new" stays, "gone" stays gone.
+        d.replace_since(vec![row("gone", "n1")], vec![node("n1", true)], before);
+        assert!(d.owner_row("new").is_some());
+        assert!(d.owner_row("gone").is_none());
+        // A later reload is authoritative.
+        d.replace_since(
+            vec![row("gone", "n1")],
+            vec![node("n1", true)],
+            Instant::now(),
+        );
+        assert!(d.owner_row("new").is_none());
+        assert!(d.owner_row("gone").is_some());
     }
 
     #[test]

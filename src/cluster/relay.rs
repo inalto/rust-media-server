@@ -298,6 +298,8 @@ impl ClusterNode {
             };
             let outcome = match base {
                 Some(base) => {
+                    // Requests arriving during this attempt wait for its outcome.
+                    h.set_state(RelayState::Connecting);
                     h.attempts.fetch_add(1, Ordering::Relaxed);
                     self.relay_once(&h, &base, &mut wanted).await
                 }
