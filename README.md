@@ -2,17 +2,17 @@
 
 Media server per dirette a bassa latenza scritto in Rust, in un unico binario. Ispirato ad
 Ant Media Server e a `xiu`: OBS pubblica in RTMP, il server ridistribuisce ai browser in
-HTTP-FLV / WebSocket-FLV, LL-HLS e LL-DASH (CMAF), registra su richiesta, raccoglie le
+WebRTC (WHEP), HTTP-FLV / WebSocket-FLV, LL-HLS e LL-DASH (CMAF), registra su richiesta, raccoglie le
 metriche degli spettatori simultanei e offre una dashboard di gestione (axum) con embed
 pronti da incollare e un video d'attesa quando la diretta non c'è.
 
 - Ingest: **RTMP** (stream key segreta per ogni diretta; Enhanced RTMP accettato per HEVC/AV1 ma impacchettato in HLS/DASH solo H.264/AAC)
-- Distribuzione: **HTTP-FLV**, **WS-FLV** (≈1–2 s), **LL-HLS** (≈2–3 s), **LL-DASH** (≈2–3 s)
+- Distribuzione: **WebRTC/WHEP** (sotto il secondo), **HTTP-FLV**, **WS-FLV** (≈1–2 s), **LL-HLS** (≈2–3 s), **LL-DASH** (≈2–3 s)
 - Dashboard in italiano: dirette, impostazioni OBS, link/embed, metriche con grafici, registrazioni, video d'attesa
 - Registrazione: automatica (flag) o manuale; FLV nativo → MP4 via ffmpeg
 - Metriche: spettatori simultanei per protocollo campionati su SQLite, grafici Chart.js, picco/sessioni/durata media
 - Video d'attesa per diretta o globale, mostrato dal player quando la diretta è offline o **in pausa**
-- Zero dipendenze esterne a runtime sul server: SQLite incorporato; `ffmpeg` opzionale (remux MP4, normalizzazione video d'attesa). I browser caricano hls.js, mpegts.js, dash.js (jsDelivr) e Chart.js (cdnjs) da CDN
+- Zero dipendenze esterne a runtime sul server: SQLite incorporato; `ffmpeg` opzionale (remux MP4, normalizzazione video d'attesa, audio Opus per WebRTC). I browser caricano hls.js, mpegts.js, dash.js (jsDelivr) e Chart.js (cdnjs) da CDN; il client WebRTC non usa librerie
 
 Architettura e contratto API: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (inglese).
 Standard di streaming a bassa latenza e raccomandazioni: [docs/PROTOCOLS.md](docs/PROTOCOLS.md).
@@ -22,7 +22,7 @@ Riferimento API: [docs/API.md](docs/API.md).
 
 - Linux x86_64 (testato su AlmaLinux 9), Rust stable recente per compilare (edition 2024; sviluppato con 1.99, la dipendenza `uuid` richiede almeno 1.89)
 - `ffmpeg`/`ffprobe` nel PATH (opzionali ma consigliati): build statiche vanno benissimo
-- Porte: `8080/tcp` (HTTP: dashboard, API, player) e `1935/tcp` (RTMP) — modificabili
+- Porte: `8080/tcp` (HTTP: dashboard, API, player), `1935/tcp` (RTMP) e `8443/udp` (WebRTC: **una sola porta UDP** per tutti gli spettatori, va aperta nel firewall) — modificabili
 
 ## Installazione
 
@@ -65,16 +65,29 @@ Chiavi principali:
 | `metrics.sample_interval_secs` | `5` | campionamento spettatori |
 | `metrics.retention_days` | `90` | ritenzione delle serie storiche |
 | `ffmpeg.path` | vuoto | percorso di ffmpeg; vuoto = cerca nel PATH |
+| `webrtc.enabled` | `true` | uscita WebRTC via WHEP (`/whep/<nome>`) |
+| `webrtc.udp_port` | `8443` | **unica porta UDP** per tutte le sessioni WebRTC (ICE, DTLS, SRTP): va aperta in ingresso (`8443/udp`); non passa dal reverse proxy |
+| `webrtc.public_ip` | `[]` | IP pubblici IPv4 annunciati ai browser (candidati ICE). Vuoto = indirizzi delle interfacce locali: va bene in LAN o su un server con IP pubblico diretto. **Dietro NAT 1:1** (VM cloud con IP elastico, router con port forwarding di `8443/udp`) indicare l'IP pubblico, es. `["203.0.113.7"]` (variabile: `RMS_WEBRTC_PUBLIC_IP=203.0.113.7`) |
+| `webrtc.ice_lite` | `true` | ICE-lite: il server risponde solo ai controlli di connettività (ha un indirizzo raggiungibile) |
+| `webrtc.max_sessions` | `100` | sessioni WebRTC simultanee (oltre: `503`, il player passa a HTTP-FLV) |
+| `webrtc.audio_bitrate_kbps` | `96` | bitrate Opus: l'AAC di OBS viene transcodificato in Opus con ffmpeg (senza ffmpeg le sessioni WebRTC sono solo video) |
+| `webrtc.idle_stop_secs` | `30` | ferma il publisher WebRTC di una diretta dopo questi secondi senza spettatori WebRTC |
+| `webrtc.stun_server` | vuoto | server STUN opzionale annunciato ai client nell'header `Link` (es. `stun.l.google.com:19302`) |
 
 ## Flusso di lavoro
 
 1. Nella dashboard crea una **diretta** (titolo → nome URL automatico). Ogni diretta ha una stream key segreta.
 2. In OBS: *Impostazioni → Stream → Servizio: Personalizzato*, Server `rtmp://<host>:1935/live`, Chiave `<stream key>`.
    Impostazioni consigliate (vedi `docs/PROTOCOLS.md` §5): **intervallo keyframe 2 s** (1 s per latenza minima),
-   x264 `tune=zerolatency` o NVENC *Low latency*, CBR, nessun B-frame, audio AAC 48 kHz.
+   x264 `tune=zerolatency` o NVENC *Low latency*, CBR, audio AAC 48 kHz e **nessun B-frame**: per WebRTC è
+   obbligatorio (il video H.264 passa senza transcodifica e i browser non riordinano i B-frame; con x264
+   `zerolatency` sono già disattivati, con NVENC/QSV impostare *B-frames = 0*). Un nuovo spettatore WebRTC
+   parte dal keyframe successivo: con keyframe ogni 2 s attende al massimo 2 s.
 3. Avvia la diretta in OBS: la dashboard mostra lo stato *In diretta*, codec, risoluzione, spettatori.
 4. Copia il codice `<iframe>` dalla sezione *Link e embed* e incollalo nel sito. Il player sceglie da solo
-   la sorgente migliore (HTTP-FLV su desktop/Android, LL-HLS nativo su iOS) e mostra il
+   la sorgente migliore (WebRTC se disponibile, altrimenti HTTP-FLV su desktop/Android e LL-HLS nativo su
+   iOS; se WebRTC non si connette entro pochi secondi, ad esempio per un firewall UDP, passa da solo alla
+   sorgente successiva) e mostra il
    **video d'attesa** finché la diretta non arriva, se cade o se la metti **in pausa**.
 5. Attiva la registrazione (flag *Registra automaticamente* sulla diretta, oppure *Registra ora* durante la diretta).
    I file finiscono in `data/recordings/<nome>/` e sono scaricabili dalla dashboard.
@@ -83,6 +96,7 @@ Chiavi principali:
 
 | Protocollo | URL | Player |
 |---|---|---|
+| WebRTC (WHEP) | `http://<host>:8080/whep/<nome>` (POST dell'offerta SDP; media su `8443/udp`) | player embed, snippet WHEP della dashboard, client WHEP (es. GStreamer `whepsrc`) |
 | HTTP-FLV | `http://<host>:8080/live/<nome>.flv` | mpegts.js, VLC, ffplay |
 | WebSocket-FLV | `ws://<host>:8080/ws/live/<nome>.flv` | mpegts.js |
 | LL-HLS | `http://<host>:8080/hls/<nome>/master.m3u8` | hls.js, Safari/iOS, VLC |
@@ -90,7 +104,14 @@ Chiavi principali:
 | Player embed | `http://<host>:8080/embed/<nome>` | iframe |
 | Player pagina intera | `http://<host>:8080/player/<nome>` | browser |
 
-Parametri del player embed (tutti opzionali): `?autoplay=1|0&muted=1|0&controls=1|0&src=auto|flv|hls|dash&latency=1|0` (default: `1`, `1`, `1`, `auto`; `latency` è `0` in `/embed` e `1` in `/player`). Dettagli in [docs/API.md](docs/API.md) §7.
+Parametri del player embed (tutti opzionali): `?autoplay=1|0&muted=1|0&controls=1|0&src=auto|webrtc|flv|hls|dash&latency=1|0` (default: `1`, `1`, `1`, `auto`; `latency` è `0` in `/embed` e `1` in `/player`). Con `auto` l'ordine è WebRTC → HTTP-FLV → LL-HLS → LL-DASH. Dettagli in [docs/API.md](docs/API.md) §6.5 e §7.
+
+**WebRTC: rete.** Il segnale WHEP passa in HTTP(S) dal reverse proxy come il resto, ma l'audio/video viaggia
+su UDP direttamente verso `webrtc.udp_port` (default `8443/udp`): la porta va aperta nel firewall e, dietro
+NAT, inoltrata al server con `webrtc.public_ip` impostato all'IP pubblico. Non serve un server TURN per
+spettatori con accesso UDP; reti che bloccano l'UDP in uscita (alcune aziendali) non riescono a
+connettersi e il player ripiega su HTTP-FLV/LL-HLS. Per la riproduzione WebRTC del player embed l'audio AAC
+viene convertito in Opus con ffmpeg (senza ffmpeg la sessione è solo video).
 
 Esempio di embed:
 
@@ -113,6 +134,7 @@ scripts/test-publish.sh <stream_key> 127.0.0.1:1935
 # terminale 3: verifica
 DATA_DIR=/tmp/rms-data scripts/smoke.sh http://127.0.0.1:8080   # oppure: scripts/smoke.sh http://127.0.0.1:8080 "$TOKEN"
 ffprobe http://127.0.0.1:8080/live/prova.flv
+# WebRTC: apri http://127.0.0.1:8080/player/prova?src=webrtc (porta UDP 8443 libera)
 ```
 
 ## API
@@ -137,7 +159,8 @@ curl -N -H "$H" $B/events                                        # SSE: stato, s
 - `deploy/rms.service`: unit systemd (modificare utente e percorsi).
 - `deploy/nginx.conf.example` / `deploy/Caddyfile.example`: reverse proxy con TLS, WebSocket e
   senza buffering (indispensabile per FLV, LL-HLS e LL-DASH). Impostare `server.public_url`
-  all'URL pubblico e `server.trust_proxy = true`.
+  all'URL pubblico e `server.trust_proxy = true`. Il proxy inoltra anche `/whep/` (HTTP), ma **non** la
+  porta UDP WebRTC: aprire `8443/udp` direttamente sul server (es. `firewall-cmd --add-port=8443/udp --permanent`).
 - RTMP resta sulla porta 1935 (opzionalmente RTMPS tramite il modulo `stream` di nginx).
 
 ## Struttura del progetto
@@ -145,6 +168,7 @@ curl -N -H "$H" $B/events                                        # SSE: stato, s
 ```
 src/main.rs        avvio e wiring          src/hub/        registro stream, GOP cache, pacchetti FLV
 src/ingest/rtmp.rs ingest RTMP (rtmp-rs)   src/egress/     HTTP-FLV, WS-FLV, LL-HLS, LL-DASH
+src/webrtc/        WHEP: porta UDP condivisa, sessioni WebRTC (rtc), H.264 → RTP, AAC → Opus (ffmpeg)
 src/packager/      muxer CMAF, store, playlist HLS, MPD DASH
 src/recorder/      registrazione FLV → MP4 src/metrics/    tracker spettatori, campionatore
 src/api/           REST + SSE (axum)       src/web/        dashboard e player (statici incorporati)
@@ -154,9 +178,10 @@ src/db/            SQLite (rusqlite)       docs/           architettura, protoco
 ## Limiti noti e roadmap
 
 - Il packager LL-HLS/LL-DASH impacchetta solo **H.264 + AAC**; HEVC/AV1 (Enhanced RTMP) passano solo via HTTP-FLV/WS-FLV.
+- WebRTC: solo video H.264 senza B-frame (HEVC/AV1 → `415`, il player usa un'altra sorgente); solo IPv4; nessun TURN né trickle ICE; un nuovo spettatore parte dal keyframe successivo; senza ffmpeg niente audio.
 - Nessun transcoding/ABR: la qualità è quella inviata da OBS (consigliati 2–6 Mbit/s CBR, keyframe 2 s).
 - Safari nativo e HTTP/2 non sono stati verificati in questo ambiente (vedi `docs/ARCHITECTURE.md` §15).
-- Prossimi passi previsti: uscita WebRTC (WHEP) sotto il secondo, ingest SRT/WHIP, token per gli spettatori.
+- Prossimi passi previsti: ingest SRT/WHIP, token per gli spettatori, TURN/IPv6 per WebRTC.
 
 ## Licenza
 

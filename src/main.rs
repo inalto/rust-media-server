@@ -24,6 +24,7 @@ use rust_media_server::metrics::{self, ViewerTracker};
 use rust_media_server::packager::{self, PackagerManager};
 use rust_media_server::recorder::RecorderManager;
 use rust_media_server::state::{AppState, AppStateParts};
+use rust_media_server::webrtc::WebRtcManager;
 use rust_media_server::{api, egress, web};
 
 /// rust-media-server: RTMP ingest, HTTP-FLV / WS-FLV / LL-HLS / LL-DASH egress.
@@ -91,12 +92,12 @@ fn init_tracing(level: &str) {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .and_then(|v| {
-            let d = with_rtmp_rs_cap(&v);
+            let d = with_rtc_cap(&with_rtmp_rs_cap(&v));
             EnvFilter::try_new(&d).ok()
         });
     let filter = env
-        .or_else(|| EnvFilter::try_new(with_rtmp_rs_cap(level)).ok())
-        .unwrap_or_else(|| EnvFilter::new(with_rtmp_rs_cap("info")));
+        .or_else(|| EnvFilter::try_new(with_rtc_cap(&with_rtmp_rs_cap(level))).ok())
+        .unwrap_or_else(|| EnvFilter::new(with_rtc_cap(&with_rtmp_rs_cap("info"))));
     let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -110,6 +111,29 @@ fn with_rtmp_rs_cap(directives: &str) -> String {
     const CAP: &str = "rtmp_rs=warn,rtmp_rs::registry=error";
     let d = directives.trim().trim_end_matches(',');
     if d.contains("rtmp_rs") {
+        d.to_string()
+    } else if d.is_empty() {
+        format!("info,{CAP}")
+    } else {
+        format!("{d},{CAP}")
+    }
+}
+
+/// The WebRTC stack (`rtc*` crates) logs every state change at INFO and a harmless DTLS
+/// `server_name` WARN per session; cap it unless a directive targets an `rtc*` crate.
+fn with_rtc_cap(directives: &str) -> String {
+    const CAP: &str =
+        "rtc=error,rtc_dtls=error,rtc_ice=warn,rtc_srtp=warn,rtc_sctp=warn,rtc_interceptor=warn";
+    let d = directives.trim().trim_end_matches(',');
+    let targets_rtc = d
+        .split(',')
+        .filter_map(|directive| directive.split('=').next())
+        .any(|target| {
+            target.trim() == "rtc"
+                || target.trim().starts_with("rtc_")
+                || target.trim().starts_with("rtc::")
+        });
+    if targets_rtc {
         d.to_string()
     } else if d.is_empty() {
         format!("info,{CAP}")
@@ -177,6 +201,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
     packager.spawn();
     let recorder = RecorderManager::new(config.clone(), db.clone(), hub.clone());
     recorder.spawn();
+    let webrtc = WebRtcManager::new(config.clone(), hub.clone(), tracker.clone());
+    webrtc.spawn(shutdown.clone());
 
     let state = AppState::new(AppStateParts {
         config: config.clone(),
@@ -185,6 +211,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         tracker: tracker.clone(),
         packager,
         recorder,
+        webrtc,
         admin_token,
         shutdown: shutdown.clone(),
     });
@@ -198,6 +225,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .merge(api::router(&state))
         .merge(egress::router())
         .merge(packager::router())
+        .merge(WebRtcManager::router())
         .merge(web::router(&state))
         .fallback(|| async { ApiError::not_found("not found").into_response() })
         .layer(TraceLayer::new_for_http())
@@ -271,7 +299,19 @@ async fn wait_for_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::with_rtmp_rs_cap;
+    use super::{with_rtc_cap, with_rtmp_rs_cap};
+
+    #[test]
+    fn rtc_is_capped_unless_configured() {
+        assert!(with_rtc_cap("info").starts_with("info,rtc=error,"));
+        // rust_media_server::webrtc contains "rtc" but is not an rtc crate.
+        assert!(with_rtc_cap("info,rust_media_server::webrtc=debug").contains(",rtc=error"));
+        assert_eq!(with_rtc_cap("info,rtc_ice=debug"), "info,rtc_ice=debug");
+        assert_eq!(with_rtc_cap("rtc=info"), "rtc=info");
+        for d in ["info", "debug,rtmp_rs=warn", ""] {
+            assert!(tracing_subscriber::EnvFilter::try_new(with_rtc_cap(d)).is_ok());
+        }
+    }
 
     #[test]
     fn rtmp_rs_is_capped_unless_configured() {

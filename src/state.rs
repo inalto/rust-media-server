@@ -15,6 +15,7 @@ use crate::hub::{Hub, HubEvent};
 use crate::metrics::ViewerTracker;
 use crate::packager::PackagerManager;
 use crate::recorder::RecorderManager;
+use crate::webrtc::WebRtcManager;
 
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
@@ -26,6 +27,8 @@ pub struct Inner {
     pub tracker: Arc<ViewerTracker>,
     pub packager: Arc<PackagerManager>,
     pub recorder: Arc<RecorderManager>,
+    /// WebRTC (WHEP) egress.
+    pub webrtc: Arc<WebRtcManager>,
     /// Monotonic process start (uptime).
     pub started_at: Instant,
     pub started_at_utc: DateTime<Utc>,
@@ -48,6 +51,7 @@ pub struct AppStateParts {
     pub tracker: Arc<ViewerTracker>,
     pub packager: Arc<PackagerManager>,
     pub recorder: Arc<RecorderManager>,
+    pub webrtc: Arc<WebRtcManager>,
     pub admin_token: String,
     pub shutdown: CancellationToken,
 }
@@ -63,6 +67,7 @@ impl AppState {
             tracker: p.tracker,
             packager: p.packager,
             recorder: p.recorder,
+            webrtc: p.webrtc,
             started_at: Instant::now(),
             started_at_utc: Utc::now(),
             events,

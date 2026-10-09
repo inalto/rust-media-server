@@ -53,6 +53,7 @@ rm -f "$TMP.cookies"
 expect "admin API without token -> 401" 401 "$BASE/api/v1/broadcasts"
 expect "GET /system" 200 "${AUTH[@]}" "$BASE/api/v1/system"
 contains "system has version" '"version"'
+contains "system has webrtc status" '"webrtc":{'
 expect "GET /broadcasts" 200 "${AUTH[@]}" "$BASE/api/v1/broadcasts"
 expect "POST /broadcasts invalid name -> 400" 400 "${AUTH[@]}" -H 'Content-Type: application/json' -d '{"title":"x","name":"Bad Name"}' "$BASE/api/v1/broadcasts"
 expect "POST /broadcasts missing title -> 400" 400 "${AUTH[@]}" -H 'Content-Type: application/json' -d '{"name":"x"}' "$BASE/api/v1/broadcasts"
@@ -61,6 +62,8 @@ contains "view has status offline" '"status":"offline"'
 contains "view has stream_key" '"stream_key"'
 contains "view has OBS server" '"server":"rtmp://'
 contains "view has flv url" "/live/$NAME.flv"
+contains "view has whep url" "/whep/$NAME"
+contains "view has enable_webrtc" '"enable_webrtc":true'
 expect "POST duplicate -> 409" 409 "${AUTH[@]}" -H 'Content-Type: application/json' -d "{\"title\":\"Smoke test\",\"name\":\"$NAME\"}" "$BASE/api/v1/broadcasts"
 expect "GET /broadcasts/{name}" 200 "${AUTH[@]}" "$BASE/api/v1/broadcasts/$NAME"
 expect "GET unknown broadcast -> 404" 404 "${AUTH[@]}" "$BASE/api/v1/broadcasts/does-not-exist-$RANDOM"
@@ -80,6 +83,7 @@ expect "disconnect when offline -> 409" 409 "${AUTH[@]}" -X POST "$BASE/api/v1/b
 expect "embed info" 200 "${AUTH[@]}" "$BASE/api/v1/broadcasts/$NAME/embed"
 contains "embed has iframe" '<iframe'
 contains "embed has mpegts snippet" 'mpegts'
+contains "embed has WHEP snippet" 'application/sdp'
 expect "sessions (empty)" 200 "${AUTH[@]}" "$BASE/api/v1/broadcasts/$NAME/sessions"
 expect "metrics overview" 200 "${AUTH[@]}" "$BASE/api/v1/metrics/overview"
 expect "metrics time series" 200 "${AUTH[@]}" "$BASE/api/v1/broadcasts/$NAME/metrics"
@@ -94,6 +98,21 @@ expect "DELETE waiting video (none set)" 200 "${AUTH[@]}" -X DELETE "$BASE/api/v
 expect "HTTP-FLV offline -> 404" 404 "$BASE/live/$NAME.flv"
 contains "offline error message" 'stream offline'
 expect "HTTP-FLV unknown -> 404" 404 "$BASE/live/does-not-exist-$RANDOM.flv"
+# WHEP (WebRTC). A structurally valid offer (rejected later because the stream is offline).
+OFFER="$(printf 'v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=recvonly\r\na=ice-ufrag:abcd\r\na=ice-pwd:aaaaaaaaaaaaaaaaaaaaaaaa\r\na=fingerprint:sha-256 AA:BB\r\na=setup:actpass\r\na=rtcp-mux\r\na=rtpmap:102 H264/90000\r\na=fmtp:102 packetization-mode=1;profile-level-id=42e01f\r\n')"
+expect "WHEP OPTIONS -> 204" 204 -X OPTIONS "$BASE/whep/$NAME"
+expect "WHEP POST wrong content type -> 415" 415 -H 'Content-Type: text/plain' --data-binary 'v=0' "$BASE/whep/$NAME"
+expect "WHEP POST garbage SDP -> 400" 400 -H 'Content-Type: application/sdp' --data-binary 'garbage' "$BASE/whep/$NAME"
+expect "WHEP POST offer while offline -> 404" 404 -H 'Content-Type: application/sdp' --data-binary "$OFFER" "$BASE/whep/$NAME"
+contains "WHEP offline error message" 'stream offline'
+expect "WHEP POST unknown broadcast -> 404" 404 -H 'Content-Type: application/sdp' --data-binary "$OFFER" "$BASE/whep/does-not-exist-$RANDOM"
+expect "WHEP PATCH session -> 405" 405 -X PATCH -H 'Content-Type: application/trickle-ice-sdpfrag' --data-binary 'a=x' "$BASE/whep/$NAME/0123"
+expect "WHEP DELETE unknown session -> 404" 404 -X DELETE "$BASE/whep/$NAME/0123"
+expect "PATCH enable_webrtc=false" 200 "${AUTH[@]}" -X PATCH -H 'Content-Type: application/json' -d '{"enable_webrtc":false}' "$BASE/api/v1/broadcasts/$NAME"
+contains "PATCH enable_webrtc applied" '"enable_webrtc":false'
+expect "WHEP POST with enable_webrtc=false -> 403" 403 -H 'Content-Type: application/sdp' --data-binary "$OFFER" "$BASE/whep/$NAME"
+expect "public info with WebRTC disabled" 200 "$BASE/api/v1/public/broadcasts/$NAME"
+contains "public whep source null when disabled" '"whep":null'
 expect "dashboard page" 200 "$BASE/"
 expect "embed page" 200 "$BASE/embed/$NAME"
 contains "embed page has name" "data-name=\"$NAME\""

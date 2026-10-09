@@ -21,6 +21,7 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub ffmpeg: FfmpegConfig,
     pub log: LogConfig,
+    pub webrtc: WebRtcConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -144,6 +145,43 @@ impl Default for MetricsConfig {
     }
 }
 
+/// WebRTC egress via WHEP (`/whep/{name}`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WebRtcConfig {
+    pub enabled: bool,
+    /// Single UDP port shared by every WebRTC session (ICE, DTLS, SRTP).
+    pub udp_port: u16,
+    /// Public IPv4 addresses advertised as ICE host candidates (1:1 NAT, e.g. a cloud
+    /// VM's elastic IP). Empty = the addresses of the local network interfaces.
+    pub public_ip: Vec<String>,
+    /// ICE-lite: the server only answers connectivity checks (it has a reachable address).
+    pub ice_lite: bool,
+    /// Maximum concurrent WebRTC sessions (all broadcasts); further offers get 503.
+    pub max_sessions: usize,
+    /// Opus bitrate of the AAC → Opus transcode (ffmpeg).
+    pub audio_bitrate_kbps: u32,
+    /// Stop the per-broadcast WebRTC publisher after this many seconds without sessions.
+    pub idle_stop_secs: u64,
+    /// Optional `stun:host:port` advertised to WHEP clients in a `Link` header.
+    pub stun_server: String,
+}
+
+impl Default for WebRtcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            udp_port: 8443,
+            public_ip: Vec::new(),
+            ice_lite: true,
+            max_sessions: 100,
+            audio_bitrate_kbps: 96,
+            idle_stop_secs: 30,
+            stun_server: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct FfmpegConfig {
@@ -235,6 +273,14 @@ impl Config {
         if self.rtmp.app.is_empty() {
             self.rtmp.app = "live".into();
         }
+        self.webrtc.public_ip = self
+            .webrtc
+            .public_ip
+            .iter()
+            .map(|ip| ip.trim().to_string())
+            .filter(|ip| !ip.is_empty())
+            .collect();
+        self.webrtc.stun_server = self.webrtc.stun_server.trim().to_string();
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -254,6 +300,17 @@ impl Config {
         }
         if self.metrics.sample_interval_secs == 0 || self.metrics.session_timeout_secs == 0 {
             bail!("metrics intervals must be positive");
+        }
+        if self.webrtc.enabled && self.webrtc.udp_port == 0 {
+            bail!("webrtc.udp_port must be a fixed port (not 0)");
+        }
+        for ip in &self.webrtc.public_ip {
+            if ip.parse::<std::net::Ipv4Addr>().is_err() {
+                bail!("webrtc.public_ip: {ip:?} is not an IPv4 address");
+            }
+        }
+        if !(6..=510).contains(&self.webrtc.audio_bitrate_kbps) {
+            bail!("webrtc.audio_bitrate_kbps must be between 6 and 510");
         }
         Ok(())
     }
@@ -389,6 +446,15 @@ pub fn apply_env_overrides(
                 parse_bool(&value)
                     .with_context(|| format!("{name}: expected a boolean, got {value:?}"))?,
             ),
+            // Lists of strings (e.g. `RMS_WEBRTC_PUBLIC_IP=203.0.113.7,198.51.100.2`).
+            toml::Value::Array(_) => toml::Value::Array(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| toml::Value::String(v.to_string()))
+                    .collect(),
+            ),
             other => bail!(
                 "{name}: cannot override non-scalar key of type {}",
                 other.type_str()
@@ -446,6 +512,40 @@ mod tests {
         assert_eq!(c.metrics.retention_days, 90);
         assert_eq!(c.ffmpeg.path, "");
         assert_eq!(c.log.level, "info");
+        assert!(c.webrtc.enabled);
+        assert_eq!(c.webrtc.udp_port, 8443);
+        assert!(c.webrtc.public_ip.is_empty());
+        assert!(c.webrtc.ice_lite);
+        assert_eq!(c.webrtc.max_sessions, 100);
+        assert_eq!(c.webrtc.audio_bitrate_kbps, 96);
+        assert_eq!(c.webrtc.idle_stop_secs, 30);
+        assert_eq!(c.webrtc.stun_server, "");
+    }
+
+    #[test]
+    fn webrtc_env_overrides_and_validation() {
+        let mut warnings = Vec::new();
+        let mut c = apply_env_overrides(
+            Config::default(),
+            vars(&[
+                ("RMS_WEBRTC_UDP_PORT", "18443"),
+                ("RMS_WEBRTC_PUBLIC_IP", " 203.0.113.7, 198.51.100.2 ,"),
+                ("RMS_WEBRTC_ICE_LITE", "false"),
+            ]),
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(c.webrtc.udp_port, 18443);
+        assert_eq!(c.webrtc.public_ip, vec!["203.0.113.7", "198.51.100.2"]);
+        assert!(!c.webrtc.ice_lite);
+        c.normalize();
+        assert!(c.validate().is_ok());
+        c.webrtc.public_ip = vec!["not-an-ip".into()];
+        assert!(c.validate().is_err());
+        c.webrtc.public_ip.clear();
+        c.webrtc.udp_port = 0;
+        assert!(c.validate().is_err());
     }
 
     #[test]

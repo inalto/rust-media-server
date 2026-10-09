@@ -456,3 +456,82 @@ Open (low/medium-low severity, documented for future work):
 Roadmap (phase 4+): WebRTC egress via WHEP (`webrtc` crate; H.264 pass-through + AAC→Opus via ffmpeg RTP),
 native SRT ingest (`srt-tokio`) or the ffmpeg bridge, WHIP ingest, ABR/transcoding ladder, viewer tokens,
 delta playlists (`CAN-SKIP-UNTIL`), MoQ when the IETF spec settles.
+
+## 16. Phase 4 as-built: WebRTC egress via WHEP (binding; field-level detail in docs/API.md §6.5)
+
+**Stack.** `src/webrtc/` uses `rtc` 0.21, the sans-I/O core of webrtc-rs 0.21, directly instead of the
+async `webrtc` 0.21 crate: the async crate's driver binds its own sockets per peer connection (no UDP mux:
+`SettingEngine::with_udp_network` is a TODO and `nat_1to1_ips` is stored but never applied in 0.21) and its
+`TrackLocal*` objects bind to a single peer connection. With `rtc` the server owns the socket, chooses the
+ICE candidates and drives each peer connection from its own task (`handle_read` / `poll_write` /
+`poll_event` / `handle_timeout`).
+
+**Modules.**
+- `webrtc/mod.rs` — `WebRtcManager` (`AppState.webrtc`): `new(config, hub, tracker)`, `spawn(shutdown)`
+  (binds `0.0.0.0:webrtc.udp_port`; a bind failure disables WHEP and is reported by `status()` /
+  `GET /system`), `router()` (merged in `main.rs`), `create_session`, `delete_session`,
+  `close_broadcast` (called by the broadcast PATCH/DELETE handlers), publishers map, sessions map plus
+  2-minute tombstones (a late `DELETE` after a server-side close answers 200).
+- `webrtc/mux.rs` — `UdpMux`: one socket for every session. A STUN Binding Request is routed by the local
+  ufrag of its `USERNAME` (each session registers its random ufrag) and teaches the mux the peer address
+  (≤ 8 per session); every other datagram (DTLS, SRTP/SRTCP, STUN responses) is routed by peer address;
+  bounded per-session queues (512, drop when full); unknown traffic dropped.
+- `webrtc/session.rs` — `negotiate()` builds the `RTCPeerConnection` (media engine: H.264
+  packetization-mode=1 profiles 42001f/42e01f/4d001f/64001f with nack/pli/fir feedback, Opus 48 kHz
+  stereo; default interceptors: NACK responder, RTCP sender/receiver reports, TWCC receiver;
+  `SettingEngine`: ICE-lite per config, the session's ICE credentials, mDNS disabled), adds one video and
+  (when the publisher has audio) one audio track with random SSRCs, applies the offer, adds one host
+  candidate per advertised address plus the end-of-candidates sentinel, and returns the answer. It runs in
+  `spawn_blocking` (certificate generation). `run()` is the session task: inbound datagrams are tagged with
+  the first advertised address as local address; media is written only once the peer connection is
+  `Connected`, video starting at an IDR (and again after a `Lagged`); each packet gets the session's SSRC,
+  negotiated payload type and its own contiguous sequence numbers. RTCP from the browser is handled by the
+  interceptors and otherwise drained (no keyframe can be forced upstream: PLI is ignored).
+- `webrtc/publisher.rs` — `WhepPublisher` per live stream (created by the first session; identity checked
+  with `Weak<LiveStream>` like the packager): `VideoPacketizer` (FLV tag → `cmaf::parse_video_tag` →
+  `h264::avcc_to_annexb` with SPS/PPS before IDRs → `H264Payloader`, MTU 1200 → RTP packets with
+  timestamp = random base + 90 × continuous DTS in ms (`MediaClock` absorbs negative steps and jumps
+  > 10 s)), fan-out of `Arc<MediaChunk>` (one per access unit / Opus packet) on a `broadcast` channel
+  (1024). State `Starting → Ready(profile) | Unsupported(reason) → Ended` in a `watch` channel; `Ready` is
+  published only after the whole GOP-cache catch-up so the audio decision is known.
+- `webrtc/audio.rs` — Opus via ffmpeg: audio-only FLV (header, AAC sequence header, frames rebased to 0)
+  written to stdin, `-probesize 32 -analyzeduration 0` (each probed byte would be permanent delay:
+  32 KB ≈ 2 s), `libopus -application lowdelay -frame_duration 20`, `-f rtp -payload_type 111` to a
+  socket on `127.0.0.1:0` (RTCP to the same port, ignored). Restart with backoff 1 → 30 s while the stream
+  is live. Started on the first audio packet only when ffmpeg exists; otherwise sessions are video-only
+  (the answer rejects the audio m-line) and a warning is logged once.
+- `webrtc/h264.rs` — `parse_avcc` (SPS/PPS lists, `lengthSizeMinusOne`), `split_avcc`, `avcc_to_annexb`,
+  `choose_h264_payload_type` (stream profile match > same profile_idc > Constrained Baseline > first);
+  `webrtc/whep.rs` — HTTP handlers, `WhepError`, `validate_offer`.
+
+**Lifecycle.** Publisher: stops on stream end (`ended_token`), after `webrtc.idle_stop_secs` without
+sessions (checked every second; removal under the map lock re-checks the session count), when replaced by
+a newer publishing session, or on shutdown; its `stop` token ends the encoder and every session. Session:
+`ViewerTracker::open(name, WebRtc, ip, ua)` when the peer connection first reaches `Connected` (failed
+attempts are not counted); closed on DELETE, ICE/peer connection `Failed`/`Closed`, `Disconnected` > 10 s,
+not connected within 30 s, publisher stop, `enable_webrtc` set false / broadcast deleted, shutdown.
+
+**Player.** `webrtc` engine first in `auto` (`webrtc → flv → hls → dash`, iOS `webrtc → hls → dash`),
+`src=webrtc|whep`; failover on POST error, ICE not connected in 6 s, `failed`/`closed`, no frame in 8 s,
+no video packet for 4 s (`getStats`); teardown = `pc.close()` + `DELETE` (keepalive, also on `pagehide`).
+`rmsPlayer.latency` = jitter-buffer delay + RTT/2.
+
+**Deviations from the phase 4 brief.** `rtc` instead of the async `webrtc` crate (above); one packetizer per
+stream with per-session SSRC/PT/sequence stamping instead of shared `TrackLocalStatic*` objects; RTP video
+timestamps from the FLV DTS instead of `Sample.duration` accumulation; `PATCH` answers 405 (no trickle).
+
+**Known limits.** IPv4 only; host candidates only (no STUN gathering, no TURN: viewers need UDP reachability
+of `webrtc.udp_port`); with several advertised addresses all inbound traffic is attributed to the first one
+(fine for one public IP or a single-homed host); B-frames are sent in decode order (not supported by
+browsers' WebRTC decoders: encoders must disable them); new viewers wait for the next IDR (≤ keyframe
+interval); audio/video sync relies on RTCP sender reports of the send time (Opus leaves ffmpeg ≈ 30 ms
+after the AAC frame arrives); the unauthenticated POST can hold a session slot for up to 30 s without
+connecting (`webrtc.max_sessions` bounds it; per-IP limits are future work).
+
+**Measured (2026-10-09, localhost, Chrome 150 headless, x264 veryfast zerolatency 720p30 2.5 Mbit/s + AAC
+128 kbit/s).** Glass-to-glass (wall-clock code burned into the frame before encoding, decoded from the
+rendered frame): p50 35-40 ms, p90 ≤ 54 ms. Chrome `getStats`: video jitter buffer 7-8 ms, audio 50-60 ms,
+0 packets lost, 0 freezes over 20 s. WHEP POST → ICE connected ≈ 240 ms. ffmpeg Opus path adds ≈ 30 ms
+(it was 2.1 s with the default probe size). Server CPU ≈ 1.5 % of one core idle, 13.6 % with 10 viewers,
+25.8 % with 30 viewers (all at 30 fps, no loss), RSS ≈ 49 MiB; the Opus encoder process ≈ 4 % CPU per
+broadcast. A browser killed without `DELETE` is reaped after ≈ 15 s (5 s ICE disconnected + 10 s grace).

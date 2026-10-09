@@ -28,6 +28,8 @@ pub struct Broadcast {
     pub enable_flv: bool,
     pub enable_hls: bool,
     pub enable_dash: bool,
+    /// WebRTC egress via WHEP (`/whep/{name}`).
+    pub enable_webrtc: bool,
     /// Admin forced "waiting" state.
     pub paused: bool,
     /// Relative path under `data/waiting/`.
@@ -47,6 +49,7 @@ pub struct NewBroadcast {
     pub enable_flv: bool,
     pub enable_hls: bool,
     pub enable_dash: bool,
+    pub enable_webrtc: bool,
     pub waiting_text: String,
 }
 
@@ -60,6 +63,7 @@ impl NewBroadcast {
             enable_flv: true,
             enable_hls: true,
             enable_dash: true,
+            enable_webrtc: true,
             waiting_text: DEFAULT_WAITING_TEXT.into(),
         }
     }
@@ -74,6 +78,7 @@ pub struct BroadcastPatch {
     pub enable_flv: Option<bool>,
     pub enable_hls: Option<bool>,
     pub enable_dash: Option<bool>,
+    pub enable_webrtc: Option<bool>,
     pub waiting_text: Option<String>,
 }
 
@@ -136,7 +141,7 @@ pub fn generate_stream_key() -> String {
 }
 
 const COLUMNS: &str = "id, name, title, description, stream_key, record, enable_flv, enable_hls, \
-     enable_dash, paused, waiting_video, waiting_text, created_at, updated_at";
+     enable_dash, paused, waiting_video, waiting_text, created_at, updated_at, enable_webrtc";
 
 fn from_row(r: &Row<'_>) -> rusqlite::Result<Broadcast> {
     Ok(Broadcast {
@@ -154,6 +159,7 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Broadcast> {
         waiting_text: r.get(11)?,
         created_at: parse_ts(&r.get::<_, String>(12)?),
         updated_at: parse_ts(&r.get::<_, String>(13)?),
+        enable_webrtc: r.get(14)?,
     })
 }
 
@@ -187,6 +193,7 @@ pub fn insert_sync(c: &Connection, new: &NewBroadcast) -> DbResult<Broadcast> {
         enable_flv: new.enable_flv,
         enable_hls: new.enable_hls,
         enable_dash: new.enable_dash,
+        enable_webrtc: new.enable_webrtc,
         paused: false,
         waiting_video: None,
         waiting_text: new.waiting_text.clone(),
@@ -196,8 +203,9 @@ pub fn insert_sync(c: &Connection, new: &NewBroadcast) -> DbResult<Broadcast> {
     let ts = fmt_ts(&now);
     c.execute(
         "INSERT INTO broadcasts (id, name, title, description, stream_key, record, enable_flv, \
-         enable_hls, enable_dash, paused, waiting_video, waiting_text, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, NULL, ?10, ?11, ?11)",
+         enable_hls, enable_dash, paused, waiting_video, waiting_text, created_at, updated_at, \
+         enable_webrtc) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, NULL, ?10, ?11, ?11, ?12)",
         params![
             b.id,
             b.name,
@@ -209,7 +217,8 @@ pub fn insert_sync(c: &Connection, new: &NewBroadcast) -> DbResult<Broadcast> {
             b.enable_hls,
             b.enable_dash,
             b.waiting_text,
-            ts
+            ts,
+            b.enable_webrtc
         ],
     )?;
     // Re-read so the returned value matches what is stored (millisecond timestamps).
@@ -250,12 +259,13 @@ pub fn update_sync(c: &Connection, name: &str, p: &BroadcastPatch) -> DbResult<O
     let enable_flv = p.enable_flv.unwrap_or(cur.enable_flv);
     let enable_hls = p.enable_hls.unwrap_or(cur.enable_hls);
     let enable_dash = p.enable_dash.unwrap_or(cur.enable_dash);
+    let enable_webrtc = p.enable_webrtc.unwrap_or(cur.enable_webrtc);
     let waiting_text = p.waiting_text.clone().unwrap_or(cur.waiting_text);
     update_and_get(
         c,
         name,
         "title = ?1, description = ?2, record = ?3, enable_flv = ?4, enable_hls = ?5, \
-         enable_dash = ?6, waiting_text = ?7",
+         enable_dash = ?6, waiting_text = ?7, enable_webrtc = ?8",
         &[
             &title,
             &description,
@@ -264,6 +274,7 @@ pub fn update_sync(c: &Connection, name: &str, p: &BroadcastPatch) -> DbResult<O
             &enable_hls,
             &enable_dash,
             &waiting_text,
+            &enable_webrtc,
         ],
     )
 }
@@ -389,7 +400,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(b.name, "show");
-        assert!(b.enable_flv && b.enable_hls && b.enable_dash);
+        assert!(b.enable_flv && b.enable_hls && b.enable_dash && b.enable_webrtc);
         assert_eq!(b.waiting_text, DEFAULT_WAITING_TEXT);
         assert!(!b.paused);
 
@@ -409,6 +420,7 @@ mod tests {
             BroadcastPatch {
                 title: Some("New".into()),
                 enable_dash: Some(false),
+                enable_webrtc: Some(false),
                 ..Default::default()
             },
         )
@@ -417,6 +429,7 @@ mod tests {
         .unwrap();
         assert_eq!(patched.title, "New");
         assert!(!patched.enable_dash);
+        assert!(!patched.enable_webrtc);
         assert!(patched.enable_hls);
 
         let rk = regenerate_key(&db, "show").await.unwrap().unwrap();

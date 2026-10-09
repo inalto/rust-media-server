@@ -1,6 +1,10 @@
 # nginx reverse proxy for rms: TLS termination, WebSocket, no buffering for media.
 # Set server.public_url = "https://stream.example.com" and server.trust_proxy = true in rms.
 # RTMP (1935/tcp) is NOT proxied here; expose it directly or via the nginx `stream` module.
+# WebRTC: the WHEP signalling (POST/DELETE /whep/...) goes through this proxy like any other
+# request, but the media does NOT: browsers send ICE/DTLS/SRTP straight to webrtc.udp_port
+# (default 8443/udp) on the addresses rms advertises. Open that UDP port on the server and set
+# webrtc.public_ip to the public address when the server is behind NAT (do not proxy it).
 map $http_upgrade $connection_upgrade { default upgrade; '' close; }
 
 server {

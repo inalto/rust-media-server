@@ -691,6 +691,8 @@ pub(crate) mod tests {
         let tracker = ViewerTracker::new(&config, None, hub.events());
         let packager = PackagerManager::new(config.clone(), hub.clone(), tracker.clone());
         let recorder = RecorderManager::new(config.clone(), db.clone(), hub.clone());
+        let webrtc =
+            crate::webrtc::WebRtcManager::new(config.clone(), hub.clone(), tracker.clone());
         let state = AppState::new(AppStateParts {
             config,
             db,
@@ -698,6 +700,7 @@ pub(crate) mod tests {
             tracker,
             packager,
             recorder,
+            webrtc,
             admin_token: TOKEN.into(),
             shutdown: CancellationToken::new(),
         });

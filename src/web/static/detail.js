@@ -419,11 +419,12 @@ export function mountDetail(root, name, { navigate }) {
       ws_flv: copyField({ label: 'WebSocket-FLV', value: '' }),
       hls: copyField({ label: 'LL-HLS', value: '' }),
       dash: copyField({ label: 'LL-DASH', value: '' }),
+      whep: copyField({ label: 'WebRTC (WHEP)', value: '' }),
       embed: copyField({ label: 'Pagina embed', value: '' }),
       player: copyField({ label: 'Pagina player', value: '' }),
     };
     const disabledTag = {};
-    for (const k of ['flv', 'ws_flv', 'hls', 'dash']) {
+    for (const k of ['flv', 'ws_flv', 'hls', 'dash', 'whep']) {
       disabledTag[k] = h('span', { class: 'tag', hidden: true }, 'disattivato');
       fields[k].querySelector('label').append(' ', disabledTag[k]);
     }
@@ -438,6 +439,7 @@ export function mountDetail(root, name, { navigate }) {
     const srcId = uid('src');
     const srcSelect = h('select', { id: srcId, onchange: (e) => { opts.src = e.target.value; renderIframe(); } },
       h('option', { value: 'auto' }, 'Automatica (consigliata)'),
+      h('option', { value: 'webrtc' }, 'WebRTC (WHEP)'),
       h('option', { value: 'flv' }, 'HTTP-FLV'),
       h('option', { value: 'hls' }, 'LL-HLS'),
       h('option', { value: 'dash' }, 'LL-DASH'));
@@ -469,6 +471,7 @@ export function mountDetail(root, name, { navigate }) {
         ['hlsjs', 'Esempio con hls.js (LL-HLS)'],
         ['mpegtsjs', 'Esempio con mpegts.js (HTTP-FLV)'],
         ['dashjs', 'Esempio con dash.js (LL-DASH)'],
+        ['whep', 'Esempio WebRTC (WHEP, senza librerie)'],
       ];
       setChildren(snippetBox, ...items.map(([k, label]) => h('details', { class: 'snippet' },
         h('summary', null, icon('code', 16), label),
@@ -505,7 +508,7 @@ export function mountDetail(root, name, { navigate }) {
       el,
       update(b) {
         for (const k of Object.keys(fields)) fields[k].setValue(b.urls[k]);
-        const enabled = { flv: b.enable_flv, ws_flv: b.enable_flv, hls: b.enable_hls, dash: b.enable_dash };
+        const enabled = { flv: b.enable_flv, ws_flv: b.enable_flv, hls: b.enable_hls, dash: b.enable_dash, whep: b.enable_webrtc };
         for (const k of Object.keys(disabledTag)) disabledTag[k].hidden = !!enabled[k];
       },
     };

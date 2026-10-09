@@ -98,7 +98,7 @@ impl Db {
 }
 
 /// Current schema version (stored in `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Schema v1 = ARCHITECTURE.md §7, verbatim.
 const SCHEMA_V1: &str = r#"
@@ -127,6 +127,10 @@ CREATE INDEX IF NOT EXISTS idx_samples_ts ON viewer_samples(broadcast_id, ts);
 CREATE INDEX IF NOT EXISTS idx_vsessions ON viewer_sessions(broadcast_id, started_at);
 "#;
 
+/// Schema v2: per-broadcast WebRTC (WHEP) flag.
+const SCHEMA_V2: &str =
+    "ALTER TABLE broadcasts ADD COLUMN enable_webrtc INTEGER NOT NULL DEFAULT 1;";
+
 /// Apply pending migrations. Later schema changes append a new `if version < N` block
 /// and bump [`SCHEMA_VERSION`].
 pub fn migrate(conn: &mut Connection) -> DbResult<()> {
@@ -137,6 +141,13 @@ pub fn migrate(conn: &mut Connection) -> DbResult<()> {
         tx.execute_batch("PRAGMA user_version = 1")?;
         tx.commit()?;
         tracing::info!("database schema migrated to version 1");
+    }
+    if version < 2 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V2)?;
+        tx.execute_batch("PRAGMA user_version = 2")?;
+        tx.commit()?;
+        tracing::info!("database schema migrated to version 2");
     }
     Ok(())
 }
@@ -188,6 +199,39 @@ mod tests {
         }
         // Idempotent.
         db.call(migrate).await.unwrap();
+    }
+
+    #[test]
+    fn migration_v1_to_v2_adds_enable_webrtc() {
+        // A database created by the phase 1-3 binary (schema v1, one broadcast).
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch("PRAGMA user_version = 1").unwrap();
+        conn.execute(
+            "INSERT INTO broadcasts (id, name, title, stream_key, created_at, updated_at) \
+             VALUES ('id1', 'old', 'Old', 'k1', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let flag: bool = conn
+            .query_row(
+                "SELECT enable_webrtc FROM broadcasts WHERE name = 'old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(flag, "existing broadcasts default to WebRTC enabled");
+        // Re-running is a no-op (the ALTER must not run twice).
+        migrate(&mut conn).unwrap();
+        let b = broadcasts::find_by_name_sync(&conn, "old")
+            .unwrap()
+            .unwrap();
+        assert!(b.enable_webrtc);
     }
 
     #[test]

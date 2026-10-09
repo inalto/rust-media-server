@@ -451,6 +451,10 @@ function mountSettings(root) {
       const s = await api('/system');
       if (destroyed) return;
       const ff = s.ffmpeg || {};
+      const rtc = s.webrtc || {};
+      const rtcLine = !rtc.enabled ? 'disattivato'
+        : !rtc.available ? `non disponibile${rtc.error ? ': ' + rtc.error : ''}`
+          : `porta UDP ${rtc.udp_port} · ${fmtInt(rtc.sessions)} sessioni${rtc.audio ? '' : ' · solo video (manca ffmpeg)'}`;
       setChildren(systemBox,
         ff.available ? null : h('div', { class: 'banner warn', role: 'alert' }, icon('alert'),
           h('div', null, h('strong', null, 'ffmpeg non è disponibile sul server. '),
@@ -464,6 +468,8 @@ function mountSettings(root) {
           ['HTTP in ascolto su', s.http_bind],
           ['URL pubblico', s.public_url || 'dedotto dalla richiesta (Host)'],
           ['Dirette in onda', fmtInt(s.hub && s.hub.live_streams)],
+          ['WebRTC (WHEP)', rtcLine],
+          ['Indirizzi ICE annunciati', (rtc.candidates && rtc.candidates.length) ? rtc.candidates.join(', ') : '—'],
         ]));
     } catch (e) {
       if (!(e instanceof ApiError && e.status === 401)) setChildren(systemBox, h('p', { class: 'error' }, describeError(e)));

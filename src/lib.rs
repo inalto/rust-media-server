@@ -16,5 +16,6 @@ pub mod packager;
 pub mod recorder;
 pub mod state;
 pub mod web;
+pub mod webrtc;
 
 pub use state::AppState;
