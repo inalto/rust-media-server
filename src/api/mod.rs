@@ -21,7 +21,7 @@ use serde::Serialize;
 use tower_http::cors::CorsLayer;
 
 use crate::config::Config;
-use crate::db::settings::UiLanguage;
+use crate::db::settings::{UiLanguage, UiTheme};
 use crate::db::{self, Broadcast, Recording};
 use crate::error::ApiError;
 use crate::hub::Hub;
@@ -256,6 +256,8 @@ pub struct ViewContext {
     pub default_waiting_text: Option<String>,
     /// UI language setting; selects the built-in waiting text.
     pub language: UiLanguage,
+    /// Default colour theme of the dashboard and of the player.
+    pub theme: UiTheme,
 }
 
 impl ViewContext {
@@ -269,6 +271,7 @@ impl ViewContext {
             default_waiting_text: non_empty(db::settings::DEFAULT_WAITING_TEXT)
                 .filter(|t| !UiLanguage::is_builtin_waiting_text(t)),
             language: UiLanguage::from_settings(&settings),
+            theme: UiTheme::from_settings(&settings),
         })
     }
 

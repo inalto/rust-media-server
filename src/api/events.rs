@@ -6,8 +6,8 @@
 //! - `broadcast_deleted`: `{name}` when a broadcast is deleted (extension of §8.1);
 //! - `viewers`: `{name, counts}` when viewer counts change;
 //! - `stream`: `{name, status}` when a stream starts or ends;
-//! - `settings`: `{ui_language, default_waiting_text}` after `PATCH /settings` (the
-//!   dashboard switches language without a reload);
+//! - `settings`: `{ui_language, ui_theme, default_waiting_text}` after `PATCH /settings`
+//!   (the dashboard switches language and default theme without a reload);
 //! - `heartbeat`: `{ts}` every 15 s.
 
 use std::convert::Infallible;
@@ -78,6 +78,7 @@ async fn translate(state: &AppState, headers: &HeaderMap, ev: HubEvent) -> Vec<E
                     "settings",
                     &json!({
                         "ui_language": ctx.language,
+                        "ui_theme": ctx.theme,
                         "default_waiting_text": ctx.effective_default_waiting_text(),
                     }),
                 )),
@@ -160,11 +161,15 @@ mod tests {
         db::settings::set(&state.db, db::settings::UI_LANGUAGE, "en")
             .await
             .unwrap();
+        db::settings::set(&state.db, db::settings::UI_THEME, "light")
+            .await
+            .unwrap();
         let out = translate(&state, &HeaderMap::new(), HubEvent::SettingsChanged).await;
         assert_eq!(out.len(), 1);
         let text = format!("{:?}", out[0]);
         assert!(text.contains("settings"), "{text}");
         assert!(text.contains(r#"\"ui_language\":\"en\""#), "{text}");
+        assert!(text.contains(r#"\"ui_theme\":\"light\""#), "{text}");
         assert!(
             text.contains("The live stream will start shortly"),
             "{text}"

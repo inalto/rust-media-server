@@ -13,6 +13,9 @@ pub const DEFAULT_WAITING_VIDEO: &str = "default_waiting_video";
 pub const DEFAULT_WAITING_TEXT: &str = "default_waiting_text";
 /// Language of the dashboard and of the player texts (`it` | `en`, default `it`).
 pub const UI_LANGUAGE: &str = "ui_language";
+/// Default colour theme of the dashboard and of the player (`system` | `light` | `dark`,
+/// default `system`).
+pub const UI_THEME: &str = "ui_theme";
 
 /// UI language (dashboard and embedded player). Serialized as `"it"` / `"en"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
@@ -67,12 +70,59 @@ impl UiLanguage {
     }
 }
 
+/// Default colour theme (dashboard and embedded player). Serialized as `"system"` /
+/// `"light"` / `"dark"`; `system` follows the browser's `prefers-color-scheme`. Each
+/// dashboard browser can override it (toggle, `localStorage`), each player page with
+/// `?theme=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiTheme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl UiTheme {
+    pub const ALL: [UiTheme; 3] = [UiTheme::System, UiTheme::Light, UiTheme::Dark];
+
+    /// Exact `"system"` / `"light"` / `"dark"`; anything else is `None`.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.as_str() == s)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UiTheme::System => "system",
+            UiTheme::Light => "light",
+            UiTheme::Dark => "dark",
+        }
+    }
+
+    /// Theme stored in a settings map (`system` when missing or invalid).
+    pub fn from_settings(settings: &HashMap<String, String>) -> Self {
+        settings
+            .get(UI_THEME)
+            .and_then(|v| Self::parse(v.trim()))
+            .unwrap_or_default()
+    }
+}
+
 /// Current UI language (`it` when not set).
 pub async fn ui_language(db: &Db) -> DbResult<UiLanguage> {
     Ok(get(db, UI_LANGUAGE)
         .await?
         .and_then(|v| UiLanguage::parse(v.trim()))
         .unwrap_or_default())
+}
+
+/// UI language and default theme with a single read (HTML pages).
+pub async fn ui_prefs(db: &Db) -> DbResult<(UiLanguage, UiTheme)> {
+    let settings = all(db).await?;
+    Ok((
+        UiLanguage::from_settings(&settings),
+        UiTheme::from_settings(&settings),
+    ))
 }
 
 pub async fn get(db: &Db, key: &str) -> DbResult<Option<String>> {
@@ -162,5 +212,33 @@ mod tests {
             " The live stream will start shortly "
         ));
         assert!(!UiLanguage::is_builtin_waiting_text("Torniamo presto"));
+    }
+
+    #[tokio::test]
+    async fn ui_theme_default_and_parse() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(
+            ui_prefs(&db).await.unwrap(),
+            (UiLanguage::It, UiTheme::System)
+        );
+        set(&db, UI_THEME, "light").await.unwrap();
+        set(&db, UI_LANGUAGE, "en").await.unwrap();
+        assert_eq!(
+            ui_prefs(&db).await.unwrap(),
+            (UiLanguage::En, UiTheme::Light)
+        );
+        set(&db, UI_THEME, " dark ").await.unwrap();
+        assert_eq!(ui_prefs(&db).await.unwrap().1, UiTheme::Dark);
+        set(&db, UI_THEME, "blue").await.unwrap();
+        assert_eq!(ui_prefs(&db).await.unwrap().1, UiTheme::System);
+        for t in UiTheme::ALL {
+            assert_eq!(UiTheme::parse(t.as_str()), Some(t));
+            assert_eq!(
+                serde_json::to_value(t).unwrap(),
+                serde_json::json!(t.as_str())
+            );
+        }
+        assert_eq!(UiTheme::parse("Light"), None);
+        assert_eq!(UiTheme::parse(""), None);
     }
 }
