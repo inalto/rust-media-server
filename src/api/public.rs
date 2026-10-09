@@ -3,6 +3,8 @@
 //! - `GET /api/v1/public/broadcasts/{name}` → [`PublicBroadcast`]
 //! - `GET /api/v1/public/broadcasts/{name}/events` → SSE `status` events `{status}`
 //!   (sent immediately, then on every change) + `heartbeat` every 15 s.
+//! - `GET /api/v1/public/ui` → `{"language": "it" | "en"}` (UI language setting, for
+//!   pages rendered before login).
 
 use std::convert::Infallible;
 
@@ -19,6 +21,7 @@ use tokio::sync::broadcast::error::RecvError;
 use super::broadcasts::load;
 use super::events::{HEARTBEAT, heartbeat_event, sse_response};
 use super::{BroadcastStatus, PlaybackUrls, ViewContext, poster_path_for, waiting_url};
+use crate::db::settings::UiLanguage;
 use crate::db::{self, Broadcast};
 use crate::error::ApiResult;
 use crate::state::AppState;
@@ -27,6 +30,19 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/public/broadcasts/{name}", get(info))
         .route("/public/broadcasts/{name}/events", get(events))
+        .route("/public/ui", get(ui))
+}
+
+/// `GET /api/v1/public/ui`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicUi {
+    pub language: UiLanguage,
+}
+
+async fn ui(State(state): State<AppState>) -> ApiResult<Json<PublicUi>> {
+    Ok(Json(PublicUi {
+        language: db::settings::ui_language(&state.db).await?,
+    }))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +71,8 @@ pub struct PublicBroadcast {
     pub enable_hls: bool,
     pub enable_dash: bool,
     pub enable_webrtc: bool,
+    /// UI language setting: the player's texts follow it (`?lang=` overrides it).
+    pub ui_language: UiLanguage,
 }
 
 /// WebRTC usable for `b` right now (see [`PublicSources::whep`]).
@@ -102,6 +120,7 @@ pub fn public_view(state: &AppState, ctx: &ViewContext, b: &Broadcast) -> Public
         enable_hls,
         enable_dash,
         enable_webrtc,
+        ui_language: ctx.language,
     }
 }
 

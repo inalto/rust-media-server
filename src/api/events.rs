@@ -6,6 +6,8 @@
 //! - `broadcast_deleted`: `{name}` when a broadcast is deleted (extension of §8.1);
 //! - `viewers`: `{name, counts}` when viewer counts change;
 //! - `stream`: `{name, status}` when a stream starts or ends;
+//! - `settings`: `{ui_language, default_waiting_text}` after `PATCH /settings` (the
+//!   dashboard switches language without a reload);
 //! - `heartbeat`: `{ts}` every 15 s.
 
 use std::convert::Infallible;
@@ -70,6 +72,19 @@ async fn translate(state: &AppState, headers: &HeaderMap, ev: HubEvent) -> Vec<E
             ));
             return out;
         }
+        HubEvent::SettingsChanged => {
+            match ViewContext::load(state, headers).await {
+                Ok(ctx) => out.extend(json_event(
+                    "settings",
+                    &json!({
+                        "ui_language": ctx.language,
+                        "default_waiting_text": ctx.effective_default_waiting_text(),
+                    }),
+                )),
+                Err(e) => tracing::warn!(error = %e, "SSE: failed to load settings"),
+            }
+            return out;
+        }
         HubEvent::StreamStarted { .. }
         | HubEvent::StreamEnded { .. }
         | HubEvent::Metadata { .. }
@@ -132,4 +147,28 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
         }
     };
     sse_response(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::waiting::tests::test_state;
+
+    #[tokio::test]
+    async fn settings_event() {
+        let (state, dir) = test_state(false).await;
+        db::settings::set(&state.db, db::settings::UI_LANGUAGE, "en")
+            .await
+            .unwrap();
+        let out = translate(&state, &HeaderMap::new(), HubEvent::SettingsChanged).await;
+        assert_eq!(out.len(), 1);
+        let text = format!("{:?}", out[0]);
+        assert!(text.contains("settings"), "{text}");
+        assert!(text.contains(r#"\"ui_language\":\"en\""#), "{text}");
+        assert!(
+            text.contains("The live stream will start shortly"),
+            "{text}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

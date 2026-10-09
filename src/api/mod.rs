@@ -21,6 +21,7 @@ use serde::Serialize;
 use tower_http::cors::CorsLayer;
 
 use crate::config::Config;
+use crate::db::settings::UiLanguage;
 use crate::db::{self, Broadcast, Recording};
 use crate::error::ApiError;
 use crate::hub::Hub;
@@ -251,7 +252,10 @@ pub struct BroadcastView {
 pub struct ViewContext {
     pub base: BaseUrl,
     pub default_waiting_video: Option<String>,
+    /// Custom global default waiting text (`None` = built-in text of `language`).
     pub default_waiting_text: Option<String>,
+    /// UI language setting; selects the built-in waiting text.
+    pub language: UiLanguage,
 }
 
 impl ViewContext {
@@ -261,8 +265,19 @@ impl ViewContext {
         Ok(Self {
             base: BaseUrl::from_request(&state.config, headers),
             default_waiting_video: non_empty(db::settings::DEFAULT_WAITING_VIDEO),
-            default_waiting_text: non_empty(db::settings::DEFAULT_WAITING_TEXT),
+            // A stored copy of a built-in text is not a customization.
+            default_waiting_text: non_empty(db::settings::DEFAULT_WAITING_TEXT)
+                .filter(|t| !UiLanguage::is_builtin_waiting_text(t)),
+            language: UiLanguage::from_settings(&settings),
         })
+    }
+
+    /// Global default waiting text in effect: the custom one, else the built-in text
+    /// in the UI language.
+    pub fn effective_default_waiting_text(&self) -> String {
+        self.default_waiting_text
+            .clone()
+            .unwrap_or_else(|| self.language.builtin_waiting_text().to_string())
     }
 
     /// Relative waiting video path in effect (broadcast's own, else global default).
@@ -278,14 +293,16 @@ impl ViewContext {
             .map(|p| waiting_url(&self.base, &p))
     }
 
-    /// Waiting text in effect: broadcast's own, else global default, else built-in.
+    /// Waiting text in effect: broadcast's own, else global default, else built-in (in
+    /// the UI language). A broadcast text equal to a built-in text (`POST /broadcasts`
+    /// stores the Italian one when `waiting_text` is omitted) counts as "no own text",
+    /// like `""`; stored texts are never rewritten, only rendered.
     pub fn waiting_text(&self, b: &Broadcast) -> String {
-        if !b.waiting_text.trim().is_empty() {
+        let own = b.waiting_text.trim();
+        if !own.is_empty() && !UiLanguage::is_builtin_waiting_text(own) {
             return b.waiting_text.clone();
         }
-        self.default_waiting_text
-            .clone()
-            .unwrap_or_else(|| db::broadcasts::DEFAULT_WAITING_TEXT.to_string())
+        self.effective_default_waiting_text()
     }
 
     pub fn view(&self, state: &AppState, broadcast: Broadcast) -> BroadcastView {
