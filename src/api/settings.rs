@@ -1,10 +1,11 @@
-//! Global settings: default waiting text, default waiting video and UI language
-//! (ARCHITECTURE.md §8.1, §17).
+//! Global settings: default waiting text, default waiting video, UI language and default
+//! theme (ARCHITECTURE.md §8.1, §17, §18).
 //!
 //! - `GET /settings` → [`Settings`]
-//! - `PATCH /settings` `{default_waiting_text?, ui_language?}` → [`Settings`] (empty text,
-//!   or a built-in text, = built-in default; `ui_language` must be `"it"` or `"en"`).
-//!   Emits `HubEvent::SettingsChanged` (admin SSE `settings` event) after a change.
+//! - `PATCH /settings` `{default_waiting_text?, ui_language?, ui_theme?}` → [`Settings`]
+//!   (empty text, or a built-in text, = built-in default; `ui_language` must be `"it"` or
+//!   `"en"`, `ui_theme` `"system"`, `"light"` or `"dark"`). Emits
+//!   `HubEvent::SettingsChanged` (admin SSE `settings` event) after a change.
 //! - `POST /settings/waiting-video` multipart `file` → [`Settings`] (same pipeline as the
 //!   per-broadcast upload, stored under `data/waiting/_default/`)
 //! - `DELETE /settings/waiting-video` → [`Settings`]
@@ -24,7 +25,9 @@ use super::waiting::{
     remove_video_files, upload_body_limit,
 };
 use super::{ApiJson, ViewContext, waiting_url};
-use crate::db::settings::{DEFAULT_WAITING_TEXT, DEFAULT_WAITING_VIDEO, UI_LANGUAGE, UiLanguage};
+use crate::db::settings::{
+    DEFAULT_WAITING_TEXT, DEFAULT_WAITING_VIDEO, UI_LANGUAGE, UI_THEME, UiLanguage, UiTheme,
+};
 use crate::db::{self};
 use crate::error::{ApiError, ApiResult};
 use crate::hub::HubEvent;
@@ -58,12 +61,16 @@ pub struct Settings {
     pub ffmpeg_available: bool,
     /// Language of the dashboard and of the player texts.
     pub ui_language: UiLanguage,
+    /// Default colour theme of the dashboard and of the player (a dashboard browser can
+    /// override it with its toggle, a player page with `?theme=`).
+    pub ui_theme: UiTheme,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SettingsPatch {
     pub default_waiting_text: Option<String>,
     pub ui_language: Option<String>,
+    pub ui_theme: Option<String>,
 }
 
 async fn current(state: &AppState, headers: &HeaderMap) -> ApiResult<Settings> {
@@ -79,6 +86,7 @@ async fn current(state: &AppState, headers: &HeaderMap) -> ApiResult<Settings> {
         max_upload_mb: state.config.server.max_upload_mb,
         ffmpeg_available: state.ffmpeg.is_some(),
         ui_language: ctx.language,
+        ui_theme: ctx.theme,
     })
 }
 
@@ -110,6 +118,12 @@ async fn patch_settings(
         ),
         None => None,
     };
+    let theme = match body.ui_theme.as_deref() {
+        Some(t) => Some(UiTheme::parse(t).ok_or_else(|| {
+            ApiError::bad_request("ui_theme must be \"system\", \"light\" or \"dark\"")
+        })?),
+        None => None,
+    };
 
     if let Some(text) = text {
         // A built-in text is stored as "no custom text" so it follows the UI language.
@@ -124,7 +138,11 @@ async fn patch_settings(
         db::settings::set(&state.db, UI_LANGUAGE, language.as_str()).await?;
         tracing::info!(language = language.as_str(), "UI language updated");
     }
-    if text.is_some() || language.is_some() {
+    if let Some(theme) = theme {
+        db::settings::set(&state.db, UI_THEME, theme.as_str()).await?;
+        tracing::info!(theme = theme.as_str(), "UI theme updated");
+    }
+    if text.is_some() || language.is_some() || theme.is_some() {
         state.hub.emit(HubEvent::SettingsChanged);
     }
     Ok(Json(current(&state, &headers).await?))
@@ -293,7 +311,10 @@ mod tests {
         assert_eq!(s["ui_language"], "it");
         let (st, ui) = send(&state, public_get("/api/v1/public/ui")).await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(ui, serde_json::json!({ "language": "it" }));
+        assert_eq!(
+            ui,
+            serde_json::json!({ "language": "it", "theme": "system" })
+        );
 
         // Validation: nothing is written on a 400, even with a valid text alongside.
         for bad in [r#""fr""#, r#""EN""#, r#""""#, "1"] {
@@ -373,6 +394,106 @@ mod tests {
         // An empty patch changes nothing and announces nothing.
         let (st, _) = send(&state, json_request("PATCH", "/api/v1/settings", "{}")).await;
         assert_eq!(st, StatusCode::OK);
+        assert!(events.try_recv().is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ui_theme_setting() {
+        let (state, dir) = test_state(false).await;
+        // Default: system, also on the public endpoints (no auth).
+        let (st, s) = send(&state, json_request("GET", "/api/v1/settings", "")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(s["ui_theme"], "system");
+        let (st, ui) = send(&state, public_get("/api/v1/public/ui")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(ui["theme"], "system");
+        db::broadcasts::create(&state.db, NewBroadcast::new("show", "Show"))
+            .await
+            .unwrap();
+        let (_, p) = send(&state, public_get("/api/v1/public/broadcasts/show")).await;
+        assert_eq!(p["ui_theme"], "system");
+
+        // Validation: nothing is written on a 400, even with valid fields alongside.
+        for bad in [
+            r#""blue""#,
+            r#""Light""#,
+            r#""DARK""#,
+            r#""""#,
+            r#"" dark""#,
+            "1",
+        ] {
+            let body =
+                format!(r#"{{"ui_theme":{bad},"ui_language":"en","default_waiting_text":"Ciao"}}"#);
+            let (st, _) = send(&state, json_request("PATCH", "/api/v1/settings", &body)).await;
+            assert!(st.is_client_error(), "{bad}: {st}");
+        }
+        let (st, e) = send(
+            &state,
+            json_request("PATCH", "/api/v1/settings", r#"{"ui_theme":"blue"}"#),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(e["error"].as_str().unwrap().contains("ui_theme"));
+        for key in [
+            db::settings::UI_THEME,
+            db::settings::UI_LANGUAGE,
+            db::settings::DEFAULT_WAITING_TEXT,
+        ] {
+            assert_eq!(db::settings::get(&state.db, key).await.unwrap(), None);
+        }
+
+        // Each value: persisted, announced on the hub, public endpoints follow; the
+        // language is untouched.
+        let mut events = state.hub.subscribe_events();
+        for theme in ["light", "dark", "system"] {
+            let body = format!(r#"{{"ui_theme":"{theme}"}}"#);
+            let (st, s) = send(&state, json_request("PATCH", "/api/v1/settings", &body)).await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(s["ui_theme"], theme);
+            assert_eq!(s["ui_language"], "it");
+            assert_eq!(
+                events.try_recv().unwrap(),
+                crate::hub::HubEvent::SettingsChanged
+            );
+            assert_eq!(
+                db::settings::get(&state.db, db::settings::UI_THEME)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(theme)
+            );
+            let (_, ui) = send(&state, public_get("/api/v1/public/ui")).await;
+            assert_eq!(ui, serde_json::json!({ "language": "it", "theme": theme }));
+            let (_, p) = send(&state, public_get("/api/v1/public/broadcasts/show")).await;
+            assert_eq!(p["ui_theme"], theme);
+            let (_, s) = send(&state, json_request("GET", "/api/v1/settings", "")).await;
+            assert_eq!(s["ui_theme"], theme);
+        }
+        // Theme and language together: one event.
+        let (st, s) = send(
+            &state,
+            json_request(
+                "PATCH",
+                "/api/v1/settings",
+                r#"{"ui_theme":"dark","ui_language":"en"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            (&s["ui_theme"], &s["ui_language"]),
+            (&"dark".into(), &"en".into())
+        );
+        assert_eq!(
+            events.try_recv().unwrap(),
+            crate::hub::HubEvent::SettingsChanged
+        );
+        assert!(events.try_recv().is_err());
+        // An empty patch changes nothing and announces nothing.
+        let (st, s) = send(&state, json_request("PATCH", "/api/v1/settings", "{}")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(s["ui_theme"], "dark");
         assert!(events.try_recv().is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }

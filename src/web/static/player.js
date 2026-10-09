@@ -15,10 +15,14 @@
 //   Player libraries are loaded from the CDN only when needed.
 // - Query: autoplay=1|0 (1), muted=1|0 (1), controls=1|0 (1), src, latency=1|0,
 //   lang=it|en (texts; default: `ui_language` from the public broadcast info, before
-//   that the <html lang> set by the server).
-// - Debug handle: window.rmsPlayer = { status, source, engine, latency, peerConnection, language, setSource(), reload() }.
-// ES module (loaded with type="module") only to import the shared translations.
+//   that the <html lang> set by the server), theme=system|light|dark (colours; default:
+//   `ui_theme` from the public broadcast info, before that the <html data-theme> set by
+//   the server; `system` follows prefers-color-scheme). The dashboard's preview iframe
+//   also sends {type: 'rms-theme', theme} messages (same origin only).
+// - Debug handle: window.rmsPlayer = { status, source, engine, latency, peerConnection, language, theme, setSource(), reload() }.
+// ES module (loaded with type="module") only to import the shared translations and theme.
 import { t, setLanguage, getLanguage, normalizeLanguage, translateDom, formatNumber, isBuiltinWaitingText } from './i18n.js';
+import { initTheme, normalizeTheme, setServerTheme, setThemeOverride, resolvedTheme } from './theme.js';
 
 (function () {
   'use strict';
@@ -66,6 +70,15 @@ import { t, setLanguage, getLanguage, normalizeLanguage, translateDom, formatNum
   var langOverride = normalizeLanguage(params.get('lang'));
   setLanguage(langOverride || document.documentElement.lang);
   translateDom(document);
+
+  // Theme: ?theme= wins; otherwise the server setting (<html data-theme> now, then
+  // `ui_theme` from every info refresh); `system` follows the OS (CSS media query).
+  initTheme({ override: normalizeTheme(params.get('theme')) });
+  window.addEventListener('message', function (ev) {
+    var d = ev.data;
+    if (ev.origin !== location.origin || !d || d.type !== 'rms-theme') return;
+    if (normalizeTheme(d.theme)) setThemeOverride(d.theme);
+  });
 
   var $ = function (id) { return document.getElementById(id); };
   var stage = $('stage');
@@ -639,6 +652,7 @@ import { t, setLanguage, getLanguage, normalizeLanguage, translateDom, formatNum
       return res.json().then(function (data) {
         info = data;
         if (!langOverride && data.ui_language && setLanguage(data.ui_language)) translateDom(document);
+        if (data.ui_theme) setServerTheme(data.ui_theme); // ignored while ?theme= is set
         renderTitle();
         lastWaitingRefresh = Date.now();
         return data;
@@ -720,6 +734,7 @@ import { t, setLanguage, getLanguage, normalizeLanguage, translateDom, formatNum
     get latency() { var l = engine && playing ? engine.latency() : NaN; return typeof l === 'number' && isFinite(l) ? l : null; },
     get info() { return info; },
     get language() { return getLanguage(); },
+    get theme() { return resolvedTheme(); },
     get options() { return Object.assign({}, opts); },
     setSource: function (src) {
       opts.src = normalizeSrc(src);

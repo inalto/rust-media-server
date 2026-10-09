@@ -87,6 +87,9 @@ const ICONS = {
   film: '<rect x="2" y="2" width="20" height="20" rx="2.5"/><path d="M7 2v20M17 2v20M2 12h20M2 7h5M2 17h5M17 17h5M17 7h5"/>',
   text: '<path d="M4 7V4h16v3M9 20h6M12 4v16"/>',
   folder: '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>',
+  moon: '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>',
+  themeSystem: '<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/>',
 };
 
 /** Inline SVG icon (decorative: aria-hidden). */
@@ -210,6 +213,7 @@ const ERROR_TRANSLATIONS = [
   [/file is empty/i, () => t('error.emptyFile')],
   [/could not find a free name/i, () => t('error.noFreeName')],
   [/ui_language must be/i, () => t('error.invalidLanguage')],
+  [/ui_theme must be/i, () => t('error.invalidTheme')],
 ];
 
 /** User-facing description of an error, in the UI language. */

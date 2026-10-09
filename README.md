@@ -75,10 +75,12 @@ Chiavi principali:
 | `webrtc.stun_server` | vuoto | server STUN opzionale annunciato ai client nell'header `Link` (es. `stun.l.google.com:19302`) |
 
 **Lingua dell'interfaccia.** Dashboard e player sono in italiano (predefinito) o in inglese: si sceglie
-nella dashboard in *Impostazioni → Lingua* (oppure `PATCH /api/v1/settings {"ui_language":"en"}`), vale
+nella dashboard in *Impostazioni → Lingua e tema* (oppure `PATCH /api/v1/settings {"ui_language":"en"}`), vale
 subito per le dashboard aperte e per i testi del player incorporato (badge di attesa/pausa, pulsanti, testo
 di attesa predefinito: «La diretta inizierà a breve» / «The live stream will start shortly»). I testi di
 attesa personalizzati restano come sono. Un singolo embed può forzare la lingua con `?lang=it|en`.
+
+**Tema chiaro/scuro.** Il tema predefinito di dashboard e player (*Sistema*, che segue il dispositivo, *Chiaro* o *Scuro*) si sceglie in *Impostazioni → Lingua e tema* (oppure `PATCH /api/v1/settings {"ui_theme":"light"}`); ogni browser può cambiarlo per sé con il pulsante sole/luna in alto nella dashboard e un singolo embed può forzarlo con `?theme=light|dark|system`.
 
 ## Flusso di lavoro
 
@@ -110,7 +112,7 @@ attesa personalizzati restano come sono. Un singolo embed può forzare la lingua
 | Player embed | `http://<host>:8080/embed/<nome>` | iframe |
 | Player pagina intera | `http://<host>:8080/player/<nome>` | browser |
 
-Parametri del player embed (tutti opzionali): `?autoplay=1|0&muted=1|0&controls=1|0&src=auto|webrtc|flv|hls|dash&latency=1|0&lang=it|en` (default: `1`, `1`, `1`, `auto`; `latency` è `0` in `/embed` e `1` in `/player`; `lang` predefinito = lingua impostata in *Impostazioni*). Con `auto` l'ordine è WebRTC → HTTP-FLV → LL-HLS → LL-DASH. Dettagli in [docs/API.md](docs/API.md) §6.5 e §7.
+Parametri del player embed (tutti opzionali): `?autoplay=1|0&muted=1|0&controls=1|0&src=auto|webrtc|flv|hls|dash&latency=1|0&lang=it|en&theme=system|light|dark` (default: `1`, `1`, `1`, `auto`; `latency` è `0` in `/embed` e `1` in `/player`; `lang` e `theme` predefiniti = lingua e tema impostati in *Impostazioni*). Con `auto` l'ordine è WebRTC → HTTP-FLV → LL-HLS → LL-DASH. Dettagli in [docs/API.md](docs/API.md) §6.5 e §7.
 
 **WebRTC: rete.** Il segnale WHEP passa in HTTP(S) dal reverse proxy come il resto, ma l'audio/video viaggia
 su UDP direttamente verso `webrtc.udp_port` (default `8443/udp`): la porta va aperta nel firewall e, dietro

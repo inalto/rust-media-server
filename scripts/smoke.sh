@@ -107,13 +107,35 @@ contains "public ui is en" '"language":"en"'
 expect "public info has ui_language" 200 "$BASE/api/v1/public/broadcasts/$NAME"
 contains "public info ui_language en" '"ui_language":"en"'
 expect "embed page in English" 200 "$BASE/embed/$NAME"
-contains "embed html lang en" '<html lang="en">'
+contains "embed html lang en" '<html lang="en"'
 expect "embed page ?lang=it override" 200 "$BASE/embed/$NAME?lang=it"
-contains "embed html lang it" '<html lang="it">'
+contains "embed html lang it" '<html lang="it"'
 expect "PATCH ui_language=it" 200 "${AUTH[@]}" -X PATCH -H 'Content-Type: application/json' -d '{"ui_language":"it"}' "$BASE/api/v1/settings"
 contains "ui_language is it" '"ui_language":"it"'
 if [[ "$ORIG_LANG" != "it" ]]; then
   expect "restore ui_language=$ORIG_LANG" 200 "${AUTH[@]}" -X PATCH -H 'Content-Type: application/json' -d "{\"ui_language\":\"$ORIG_LANG\"}" "$BASE/api/v1/settings"
+fi
+# Default theme (system|light|dark): validation, public endpoints, pages, restore.
+expect "GET /public/ui has theme" 200 "$BASE/api/v1/public/ui"
+contains "public ui has theme" '"theme":"'
+ORIG_THEME="$(grep -o '"theme":"[a-z]*"' "$TMP" | cut -d'"' -f4)"
+ORIG_THEME="${ORIG_THEME:-system}"
+expect "PATCH ui_theme=blue -> 400" 400 "${AUTH[@]}" -X PATCH -H 'Content-Type: application/json' -d '{"ui_theme":"blue"}' "$BASE/api/v1/settings"
+contains "ui_theme error message" 'ui_theme'
+expect "PATCH ui_theme=light" 200 "${AUTH[@]}" -X PATCH -H 'Content-Type: application/json' -d '{"ui_theme":"light"}' "$BASE/api/v1/settings"
+contains "ui_theme is light" '"ui_theme":"light"'
+expect "public ui theme follows" 200 "$BASE/api/v1/public/ui"
+contains "public ui theme is light" '"theme":"light"'
+expect "public info has ui_theme" 200 "$BASE/api/v1/public/broadcasts/$NAME"
+contains "public info ui_theme light" '"ui_theme":"light"'
+expect "dashboard page in the light theme" 200 "$BASE/"
+contains "dashboard html data-theme light" 'data-theme="light">'
+expect "embed page ?theme=dark override" 200 "$BASE/embed/$NAME?theme=dark"
+contains "embed html data-theme dark" 'data-theme="dark">'
+expect "PATCH ui_theme=system" 200 "${AUTH[@]}" -X PATCH -H 'Content-Type: application/json' -d '{"ui_theme":"system"}' "$BASE/api/v1/settings"
+contains "ui_theme is system" '"ui_theme":"system"'
+if [[ "$ORIG_THEME" != "system" ]]; then
+  expect "restore ui_theme=$ORIG_THEME" 200 "${AUTH[@]}" -X PATCH -H 'Content-Type: application/json' -d "{\"ui_theme\":\"$ORIG_THEME\"}" "$BASE/api/v1/settings"
 fi
 expect "waiting video upload without file -> 400" 400 "${AUTH[@]}" -F "note=x" "$BASE/api/v1/broadcasts/$NAME/waiting-video"
 expect "waiting video upload of a non-video -> 415" 415 "${AUTH[@]}" -F "file=@$0;type=text/x-shellscript" "$BASE/api/v1/broadcasts/$NAME/waiting-video"
@@ -143,6 +165,8 @@ expect "player page" 200 "$BASE/player/$NAME"
 expect "static asset" 200 "$BASE/static/player.js"
 expect "static i18n.js" 200 "$BASE/static/i18n.js"
 contains "i18n.js exports t()" 'export function t('
+expect "static theme.js" 200 "$BASE/static/theme.js"
+contains "theme.js exports initTheme()" 'export function initTheme('
 expect "public SSE first event" 200 --max-time 2 "$BASE/api/v1/public/broadcasts/$NAME/events" || true
 expect "DELETE broadcast -> 204" 204 "${AUTH[@]}" -X DELETE "$BASE/api/v1/broadcasts/$NAME"
 expect "GET deleted -> 404" 404 "${AUTH[@]}" "$BASE/api/v1/broadcasts/$NAME"

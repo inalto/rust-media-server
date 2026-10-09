@@ -6,6 +6,11 @@
 // before the login view, then GET /settings after login; the admin SSE `settings`
 // event and the Settings page switch it at runtime: the static shell is re-translated
 // (data-i18n) and the current view is re-rendered without a reload.
+//
+// Theme (theme.js): this browser's override (top-bar toggle, localStorage `rms.theme`)
+// wins over the server default `ui_theme` (<html data-theme>, then /public/ui,
+// /settings, the SSE `settings` event and the Settings page), which defaults to
+// `system` (prefers-color-scheme, followed live).
 
 import {
   api, ApiError, bus, store, describeError, onUnauthorized, h, icon, iconButton, setChildren, toast, uid,
@@ -14,6 +19,13 @@ import {
 } from './core.js';
 import { mountDetail } from './detail.js';
 import { t, tn, setLanguage, getLanguage, onLanguageChange, translateDom } from './i18n.js';
+import {
+  initTheme, getThemeChoice, getThemeOverride, getServerTheme, setServerTheme, setThemeOverride,
+  nextTheme, onThemeChange,
+} from './theme.js';
+
+// Before anything renders (the inline script in index.html already set the attribute).
+initTheme({ storageKey: 'rms.theme' });
 
 const POLL_MS = 10000;
 const SSE_MAX_BACKOFF = 30000;
@@ -21,8 +33,31 @@ const SSE_MAX_BACKOFF = 30000;
 const app = document.getElementById('app');
 const topbar = document.getElementById('topbar');
 const connEl = document.getElementById('conn');
+const themeBtn = document.getElementById('theme-toggle');
 let unmount = null;
 let authed = false;
+
+// ---------------------------------------------------------------------------
+// Theme toggle (top bar): system → light → dark, stored in this browser only
+// ---------------------------------------------------------------------------
+
+const THEME_NAMES = { system: () => t('theme.system'), light: () => t('theme.light'), dark: () => t('theme.dark') };
+const THEME_ICONS = { system: 'themeSystem', light: 'sun', dark: 'moon' };
+const themeName = (theme) => (THEME_NAMES[theme] || THEME_NAMES.system)();
+
+function renderThemeToggle() {
+  const current = getThemeChoice();
+  const next = nextTheme(current);
+  const names = { current: themeName(current), next: themeName(next) };
+  setChildren(themeBtn, icon(THEME_ICONS[current], 16));
+  themeBtn.setAttribute('aria-label', t('theme.toggleLabel', names));
+  themeBtn.title = t('theme.toggleTitle', names);
+  themeBtn.dataset.theme = current;
+}
+
+themeBtn.addEventListener('click', () => setThemeOverride(nextTheme(getThemeChoice())));
+onThemeChange(renderThemeToggle);
+renderThemeToggle();
 
 // ---------------------------------------------------------------------------
 // Auth
@@ -78,6 +113,7 @@ document.getElementById('logout').addEventListener('click', async () => {
 
 async function start() {
   const [list, settings] = await Promise.all([api('/broadcasts'), api('/settings').catch(() => null)]);
+  if (settings && settings.ui_theme) setServerTheme(settings.ui_theme);
   if (settings && settings.ui_language) setLanguage(settings.ui_language);
   authed = true;
   store.replaceAll(list);
@@ -138,8 +174,13 @@ function connectSSE() {
     if (d.status === 'live') toast(t('toast.streamLive', { title }), 'success');
     else if (d.status === 'offline') toast(t('toast.streamOffline', { title }), 'info');
   });
-  // UI language changed (here or in another dashboard): re-render in the new language.
-  es.addEventListener('settings', (ev) => { const d = parse(ev); if (d && d.ui_language) setLanguage(d.ui_language); });
+  // UI language / default theme changed (here or in another dashboard): apply them
+  // (a language change re-renders the view; the theme only needs the attribute).
+  es.addEventListener('settings', (ev) => {
+    const d = parse(ev);
+    if (d && d.ui_theme) setServerTheme(d.ui_theme);
+    if (d && d.ui_language) setLanguage(d.ui_language);
+  });
   es.addEventListener('heartbeat', () => setConn('live'));
   es.addEventListener('error', async () => {
     if (!es) return;
@@ -415,6 +456,43 @@ function mountSettings(root) {
     h('div', { class: 'field' }, h('label', { for: langId }, t('settings.language')), langSelect,
       h('p', { id: langNoteId, class: 'hint' }, t('settings.languageNote'))),
     h('div', null, langSave));
+
+  // Default theme (server setting); each browser can still override it with the toggle.
+  const themeId = uid('theme');
+  const themeSelect = h('select', { id: themeId, name: 'ui_theme' },
+    ...['system', 'light', 'dark'].map((v) => h('option', { value: v }, themeName(v))));
+  let shownServerTheme = getServerTheme();
+  themeSelect.value = shownServerTheme;
+  const themeNoteId = uid('hint');
+  themeSelect.setAttribute('aria-describedby', themeNoteId);
+  const themeSave = h('button', { type: 'submit', class: 'btn primary' }, t('settings.themeSave'));
+  const overrideBox = h('div', { class: 'theme-override', role: 'status' });
+  const themeForm = h('form', { class: 'stack' },
+    h('div', { class: 'field' }, h('label', { for: themeId }, t('settings.theme')), themeSelect,
+      h('p', { id: themeNoteId, class: 'hint' }, t('settings.themeNote'))),
+    h('div', null, themeSave),
+    overrideBox);
+  themeForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    themeSave.disabled = true;
+    try {
+      const res = await api('/settings', { method: 'PATCH', body: { ui_theme: themeSelect.value } });
+      shownServerTheme = res.ui_theme;
+      setServerTheme(res.ui_theme);
+      toast(t('settings.themeSaved'), 'success');
+    } catch (ex) {
+      toast(describeError(ex), 'error');
+    } finally { themeSave.disabled = false; }
+  });
+  function renderOverride() {
+    const own = getThemeOverride();
+    if (!own) { setChildren(overrideBox); overrideBox.hidden = true; return; }
+    overrideBox.hidden = false;
+    setChildren(overrideBox,
+      h('p', { class: 'hint' }, t('settings.themeOverride', { theme: themeName(own) })),
+      h('button', { type: 'button', class: 'btn small', onclick: () => setThemeOverride(null) }, t('settings.themeOverrideReset')));
+  }
+  renderOverride();
   langForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     langSave.disabled = true;
@@ -538,7 +616,7 @@ function mountSettings(root) {
 
   setChildren(root, h('div', { class: 'page' },
     h('div', { class: 'page-head' }, h('div', null, h('h1', null, t('settings.title')), h('p', { class: 'muted' }, t('settings.lead')))),
-    section('set-language', 'text', t('settings.languageSection'), langForm),
+    section('set-language', 'sliders', t('settings.appearanceSection'), h('div', { class: 'grid-2' }, langForm, themeForm)),
     section('set-waiting', 'film', t('settings.waitingSection'),
       h('p', { class: 'hint lead' }, t('settings.waitingLead')),
       h('div', { class: 'grid-2' }, videoBox, h('div', { class: 'stack' }, upload, textForm))),
@@ -550,6 +628,7 @@ function mountSettings(root) {
       settings = await api('/settings');
       if (destroyed) return;
       if (settings.ui_language) langSelect.value = settings.ui_language;
+      if (settings.ui_theme) themeSelect.value = shownServerTheme = settings.ui_theme;
       text.control.value = settings.default_waiting_text || '';
       upload.refreshLimits();
       renderVideo();
@@ -560,7 +639,14 @@ function mountSettings(root) {
   loadSystem();
   loadOverview();
   timers.push(setInterval(() => { if (!document.hidden) loadOverview(); }, POLL_MS));
-  const offs = [bus.on('broadcast', () => loadOverview())];
+  const offs = [
+    bus.on('broadcast', () => loadOverview()),
+    // Toggle pressed, override reset, or default changed elsewhere (SSE).
+    onThemeChange(() => {
+      renderOverride();
+      if (getServerTheme() !== shownServerTheme) themeSelect.value = shownServerTheme = getServerTheme();
+    }),
+  ];
   return () => { destroyed = true; timers.forEach(clearInterval); offs.forEach((off) => off()); };
 }
 
@@ -574,6 +660,7 @@ async function loadPublicLanguage() {
     const res = await fetch('/api/v1/public/ui', { cache: 'no-store' });
     if (res.ok) {
       const ui = await res.json();
+      if (ui && ui.theme) setServerTheme(ui.theme);
       if (ui && ui.language) setLanguage(ui.language);
     }
   } catch (_) { /* keep <html lang> */ }
@@ -582,6 +669,7 @@ async function loadPublicLanguage() {
 // A language change re-translates the static shell and re-renders the current view.
 onLanguageChange(() => {
   translateDom(document);
+  renderThemeToggle();
   if (!authed) return;
   setConn(connEl.dataset.state);
   const y = window.scrollY;

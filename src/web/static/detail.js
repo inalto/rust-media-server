@@ -11,6 +11,7 @@ import {
 } from './core.js';
 import { metricsSection } from './metrics.js';
 import { t, tn, formatNumber, isBuiltinWaitingText } from './i18n.js';
+import { getThemeChoice, onThemeChange } from './theme.js';
 
 const LIVE_POLL_MS = 5000;
 const SESSIONS_POLL_MS = 10000;
@@ -298,7 +299,9 @@ export function mountDetail(root, name, { navigate }) {
     const key = 'rmsPreview';
     let enabled = true;
     try { enabled = localStorage.getItem(key) !== '0'; } catch (_) { /* ignore */ }
-    const src = `/embed/${enc(name)}?muted=1&autoplay=1&latency=1`;
+    // The preview follows the dashboard's theme: `?theme=` at load, then a same-origin
+    // message on every change (no reload of the stream; see player.js).
+    const src = () => `/embed/${enc(name)}?muted=1&autoplay=1&latency=1&theme=${getThemeChoice()}`;
     const frameBox = h('div', { class: 'preview-box' });
     const toggle = h('button', { type: 'button', class: 'btn', 'aria-pressed': String(enabled) });
     const reloadBtn = iconButton('refresh', t('preview.reload'), () => { if (enabled) render(true); }, { showLabel: false });
@@ -311,7 +314,7 @@ export function mountDetail(root, name, { navigate }) {
         return;
       }
       if (force || !frameBox.querySelector('iframe')) {
-        setChildren(frameBox, h('iframe', { src, title: t('preview.frameTitle'), allow: 'autoplay; fullscreen; picture-in-picture', loading: 'lazy' }));
+        setChildren(frameBox, h('iframe', { src: src(), title: t('preview.frameTitle'), allow: 'autoplay; fullscreen; picture-in-picture', loading: 'lazy' }));
       }
     }
     toggle.addEventListener('click', () => {
@@ -323,6 +326,10 @@ export function mountDetail(root, name, { navigate }) {
       h('p', { class: 'hint' }, t('preview.hint')));
     el.tools.append(toggle, reloadBtn);
     render(false);
+    offs.push(onThemeChange(({ choice }) => {
+      const frame = frameBox.querySelector('iframe');
+      if (frame && frame.contentWindow) frame.contentWindow.postMessage({ type: 'rms-theme', theme: choice }, location.origin);
+    }));
     return { el, update() {} };
   }
 
@@ -433,8 +440,8 @@ export function mountDetail(root, name, { navigate }) {
       fields[k].querySelector('label').append(' ', disabledTag[k]);
     }
     let embed = null;
-    // lang: '' = the server setting (no ?lang= in the URL), else 'it' | 'en'.
-    const opts = { autoplay: true, muted: true, controls: true, src: 'auto', lang: '' };
+    // lang / theme: '' = the server setting (no ?lang= / ?theme= in the URL).
+    const opts = { autoplay: true, muted: true, controls: true, src: 'auto', lang: '', theme: '' };
     const iframeCode = h('textarea', { class: 'code', rows: '4', readonly: true, spellcheck: 'false', id: uid('iframe') });
     const check = (key, label) => {
       const id = uid('opt');
@@ -453,6 +460,12 @@ export function mountDetail(root, name, { navigate }) {
       h('option', { value: '' }, t('links.langDefault')),
       h('option', { value: 'it' }, t('links.langIt')),
       h('option', { value: 'en' }, t('links.langEn')));
+    const themeId = uid('ptheme');
+    const themeSelect = h('select', { id: themeId, onchange: (e) => { opts.theme = e.target.value; renderIframe(); } },
+      h('option', { value: '' }, t('links.themeDefault')),
+      h('option', { value: 'system' }, t('theme.system')),
+      h('option', { value: 'light' }, t('theme.light')),
+      h('option', { value: 'dark' }, t('theme.dark')));
     const optsForm = h('fieldset', { class: 'embed-opts' },
       h('legend', null, t('links.optsLegend')),
       check('autoplay', t('links.autoplay')),
@@ -460,6 +473,7 @@ export function mountDetail(root, name, { navigate }) {
       check('controls', t('links.controls')),
       h('div', { class: 'field inline' }, h('label', { for: srcId }, t('links.source')), srcSelect),
       h('div', { class: 'field inline' }, h('label', { for: langId }, t('links.lang')), langSelect),
+      h('div', { class: 'field inline' }, h('label', { for: themeId }, t('links.theme')), themeSelect),
       h('p', { class: 'hint' }, t('links.autoplayHint')));
     const snippetBox = h('div', { class: 'snippets' });
 
@@ -470,6 +484,7 @@ export function mountDetail(root, name, { navigate }) {
       if (!opts.controls) u.searchParams.set('controls', '0');
       if (opts.src !== 'auto') u.searchParams.set('src', opts.src);
       if (opts.lang) u.searchParams.set('lang', opts.lang);
+      if (opts.theme) u.searchParams.set('theme', opts.theme);
       return u.toString();
     }
     function renderIframe() {

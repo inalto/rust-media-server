@@ -3,8 +3,8 @@
 //! - `GET /api/v1/public/broadcasts/{name}` → [`PublicBroadcast`]
 //! - `GET /api/v1/public/broadcasts/{name}/events` → SSE `status` events `{status}`
 //!   (sent immediately, then on every change) + `heartbeat` every 15 s.
-//! - `GET /api/v1/public/ui` → `{"language": "it" | "en"}` (UI language setting, for
-//!   pages rendered before login).
+//! - `GET /api/v1/public/ui` → `{"language": "it" | "en", "theme": "system" | "light" |
+//!   "dark"}` (UI language and default theme settings, for pages rendered before login).
 
 use std::convert::Infallible;
 
@@ -21,7 +21,7 @@ use tokio::sync::broadcast::error::RecvError;
 use super::broadcasts::load;
 use super::events::{HEARTBEAT, heartbeat_event, sse_response};
 use super::{BroadcastStatus, PlaybackUrls, ViewContext, poster_path_for, waiting_url};
-use crate::db::settings::UiLanguage;
+use crate::db::settings::{UiLanguage, UiTheme};
 use crate::db::{self, Broadcast};
 use crate::error::ApiResult;
 use crate::state::AppState;
@@ -37,12 +37,12 @@ pub fn routes() -> Router<AppState> {
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicUi {
     pub language: UiLanguage,
+    pub theme: UiTheme,
 }
 
 async fn ui(State(state): State<AppState>) -> ApiResult<Json<PublicUi>> {
-    Ok(Json(PublicUi {
-        language: db::settings::ui_language(&state.db).await?,
-    }))
+    let (language, theme) = db::settings::ui_prefs(&state.db).await?;
+    Ok(Json(PublicUi { language, theme }))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +73,8 @@ pub struct PublicBroadcast {
     pub enable_webrtc: bool,
     /// UI language setting: the player's texts follow it (`?lang=` overrides it).
     pub ui_language: UiLanguage,
+    /// Default theme setting: the player follows it unless the page has `?theme=`.
+    pub ui_theme: UiTheme,
 }
 
 /// WebRTC usable for `b` right now (see [`PublicSources::whep`]).
@@ -121,6 +123,7 @@ pub fn public_view(state: &AppState, ctx: &ViewContext, b: &Broadcast) -> Public
         enable_dash,
         enable_webrtc,
         ui_language: ctx.language,
+        ui_theme: ctx.theme,
     }
 }
 

@@ -1,12 +1,15 @@
 <!doctype html>
 <!-- Texts are Italian fallbacks: data-i18n* attributes are resolved by app.js (i18n.js);
-     the server sets <html lang> from the ui_language setting. -->
-<html lang="it">
+     the server sets <html lang> from the ui_language setting and <html data-theme> from
+     ui_theme (system|light|dark); the inline script below applies this browser's theme
+     override (localStorage rms.theme, set by the top-bar toggle) before the first paint. -->
+<html lang="it" data-theme="system">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#0b0e14">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="">
+  <script>(function () { try { var v = localStorage.getItem('rms.theme'); if (v === 'system' || v === 'light' || v === 'dark') document.documentElement.setAttribute('data-theme', v); } catch (e) { /* storage blocked: server default */ } })();</script>
   <title data-i18n="app.docTitle">rms · Pannello dirette</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/style.css">
@@ -24,6 +27,7 @@
     </nav>
     <div class="topbar-end">
       <span id="conn" class="conn" data-state="connecting" role="status"><span class="conn-dot" aria-hidden="true"></span><span class="conn-label" data-i18n="conn.connecting">Connessione…</span></span>
+      <button id="theme-toggle" type="button" class="btn ghost small icon-only" aria-label="Tema" title="Tema"></button>
       <button id="logout" type="button" class="btn ghost small" title="Esci dal pannello" aria-label="Esci" data-i18n-title="logout.title" data-i18n-aria-label="logout.label">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
         <span class="logout-label" data-i18n="logout.label">Esci</span>

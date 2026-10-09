@@ -315,6 +315,7 @@ One row of the `recordings` table.
 | `max_upload_mb` | integer | `server.max_upload_mb` |
 | `ffmpeg_available` | boolean | whether ffmpeg was found at startup |
 | `ui_language` | `"it"` \| `"en"` | language of the dashboard and of the player texts (setting key `ui_language`, default `"it"`) |
+| `ui_theme` | `"system"` \| `"light"` \| `"dark"` | default colour theme of the dashboard and of the player (setting key `ui_theme`, default `"system"` = follow the browser's `prefers-color-scheme`). Each dashboard browser can override it with the top-bar toggle (stored in that browser's `localStorage`, key `rms.theme`); a player page with `?theme=` ([7](#7-pages)) |
 
 ```json
 {
@@ -324,7 +325,8 @@ One row of the `recordings` table.
   "default_waiting_text": "La diretta inizierà a breve",
   "max_upload_mb": 1024,
   "ffmpeg_available": true,
-  "ui_language": "it"
+  "ui_language": "it",
+  "ui_theme": "system"
 }
 ```
 
@@ -650,11 +652,14 @@ Removes the broadcast's own video (idempotent); the global default applies again
 |---|---|---|
 | `default_waiting_text` | string | trimmed; up to 500 characters; `""` (or a built-in text) restores the built-in text, which follows `ui_language`; omitted = unchanged |
 | `ui_language` | string | `"it"` or `"en"` (exact, lowercase); omitted = unchanged |
+| `ui_theme` | string | `"system"`, `"light"` or `"dark"` (exact, lowercase); omitted = unchanged |
 
-- Response `200`: [Settings](#settings). `400` if the text is too long or `ui_language` is anything else
-  (`ui_language must be "it" or "en"`); nothing is written on a `400`.
-- A request that sets either field sends a `settings` event on the admin SSE stream
-  ([4.6](#46-events-sse)), so open dashboards switch language without a reload.
+- Response `200`: [Settings](#settings). `400` if the text is too long, `ui_language` is anything else
+  (`ui_language must be "it" or "en"`) or `ui_theme` is anything else
+  (`ui_theme must be "system", "light" or "dark"`); nothing is written on a `400`.
+- A request that sets any field sends a `settings` event on the admin SSE stream
+  ([4.6](#46-events-sse)), so open dashboards switch language and default theme without a reload
+  (a browser whose toggle overrides the theme keeps its own choice).
 
 #### `POST /api/v1/settings/waiting-video`
 
@@ -720,7 +725,7 @@ Admin Server-Sent Events stream (`Content-Type: text/event-stream`, `Cache-Contr
 | `stream` | `{"name": "evento-2026", "status": "live"}` | stream start/end; `status` is the new `offline`/`live`/`paused`; sent right before the matching `broadcast` event |
 | `viewers` | `{"name": "evento-2026", "counts": ViewerCounts}` | the viewer counts of a broadcast changed |
 | `broadcast_deleted` | `{"name": "evento-2026"}` | a broadcast was deleted |
-| `settings` | `{"ui_language": "en", "default_waiting_text": "The live stream will start shortly"}` | after a `PATCH /api/v1/settings` that set `ui_language` and/or `default_waiting_text` (effective values) |
+| `settings` | `{"ui_language": "en", "ui_theme": "system", "default_waiting_text": "The live stream will start shortly"}` | after a `PATCH /api/v1/settings` that set `ui_language`, `ui_theme` and/or `default_waiting_text` (effective values) |
 
 ```
 event: viewers
@@ -741,9 +746,11 @@ embed player and the dashboard login page use.
 
 #### `GET /api/v1/public/ui`
 
-UI settings needed before login (the dashboard reads the language here before showing the login view).
+UI settings needed before login (the dashboard reads the language and the default theme here before
+showing the login view).
 
-- Response `200`: `{"language": "it"}` (`"it"` or `"en"`, the `ui_language` setting).
+- Response `200`: `{"language": "it", "theme": "system"}` (`language`: `"it"` or `"en"`, the
+  `ui_language` setting; `theme`: `"system"`, `"light"` or `"dark"`, the `ui_theme` setting).
 
 #### `GET /api/v1/public/broadcasts/{name}`
 
@@ -768,7 +775,8 @@ UI settings needed before login (the dashboard reads the language here before sh
   "enable_hls": true,
   "enable_dash": false,
   "enable_webrtc": true,
-  "ui_language": "it"
+  "ui_language": "it",
+  "ui_theme": "system"
 }
 ```
 
@@ -782,6 +790,7 @@ UI settings needed before login (the dashboard reads the language here before sh
 | `sources` | object | `flv`, `ws_flv`, `hls`, `dash`, `whep`: URL, or `null` when the protocol is disabled. `flv` and `ws_flv` follow `enable_flv`; `hls` / `dash` are `null` when disabled for the broadcast *or* on the server (`hls.enabled` / `dash.enabled`); `whep` is `null` when `enable_webrtc` is false, WebRTC is disabled or unavailable on the server (`webrtc.enabled`, UDP port not bound), or the live video codec is known and is not H.264 |
 | `enable_flv`, `enable_hls`, `enable_dash`, `enable_webrtc` | boolean | `enable_hls` / `enable_dash` / `enable_webrtc` already include the server-wide conditions (`enable_webrtc` = `sources.whep` is non-null) |
 | `ui_language` | `"it"` \| `"en"` | the UI language setting: the player's texts follow it unless the page has `?lang=` |
+| `ui_theme` | `"system"` \| `"light"` \| `"dark"` | the default theme setting: the player's colours follow it unless the page has `?theme=` |
 
 `404 broadcast not found` for an unknown name.
 
@@ -1076,7 +1085,7 @@ await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
 
 | Route | Description |
 |---|---|
-| `GET /` | the dashboard SPA (`text/html`, `Cache-Control: no-cache`, Italian or English UI per `ui_language`, which also sets `<html lang>`; hash routes `#/`, `#/b/{name}`, `#/settings`). Shows the login view when the API answers 401 |
+| `GET /` | the dashboard SPA (`text/html`, `Cache-Control: no-cache`, Italian or English UI per `ui_language`, which also sets `<html lang>`; `<html data-theme>` from `ui_theme`, overridden before the first paint by this browser's toggle choice (`localStorage` `rms.theme`); hash routes `#/`, `#/b/{name}`, `#/settings`). Shows the login view when the API answers 401 |
 | `GET /embed/{name}` | player page for iframes |
 | `GET /player/{name}` | the same player as a full page, with the title above it |
 | `GET /static/{file}` | assets embedded in the binary |
@@ -1102,12 +1111,16 @@ Query parameters (all optional):
 | `src` | `auto`, `webrtc` (alias `whep`), `flv`, `hls`, `dash` | `auto` | source to try first (any other value is `auto`); see below |
 | `latency` | `1` / `0` | `0` on `/embed`, `1` on `/player` | show the estimated latency in the corner |
 | `lang` | `it` / `en` (case-insensitive) | the `ui_language` setting | language of the player texts (waiting/paused badge, built-in waiting text, buttons, "not found"); also sets `<html lang>`. Other values are ignored |
+| `theme` | `system` / `light` / `dark` (case-insensitive) | the `ui_theme` setting | colours of the player page (waiting screen, title, badges and buttons over the video; the video area stays black). `system` follows the viewer's `prefers-color-scheme`, live. Sets `<html data-theme>` (server-side, and by an inline script before the first paint). Other values are ignored |
 
 A flag is false when present with the value `0`, `false`, `no` or `off` (case-insensitive) and true for
 any other value, including an empty one. The dashboard preview uses `?muted=1&autoplay=1&latency=1`.
 Without `lang` the player starts with the server's `<html lang>` and then follows `ui_language` from the
 public info (re-read every 60 s while waiting). A custom waiting text is shown as-is in either language;
-the built-in one is shown in the player's language.
+the built-in one is shown in the player's language. Likewise, without `theme` the player starts with the
+server's `<html data-theme>` and then follows `ui_theme` from the public info: the theme resolves as
+`?theme=` -> `ui_theme` -> `system`. The dashboard preview adds `&theme=` with the dashboard's own theme
+and keeps it in sync (same-origin `postMessage` `{type: "rms-theme", theme}`, no reload).
 
 Source selection: `auto` tries `webrtc` -> `flv` -> `hls` -> `dash` (on iOS: `webrtc` -> `hls` ->
 `dash`). `webrtc` is a built-in WHEP client (no library; see [6.5](#65-webrtc-whep)); `flv` plays
@@ -1123,7 +1136,8 @@ waiting screen and retries after 5 s. The libraries are loaded on demand from js
 hls.js 1.7.3 (`lowLatencyMode`, `liveSyncDuration: 1.5`, `liveMaxLatencyDuration: 4`), dash.js 5.2.1.
 `window.rmsPlayer` exposes `status`, `source`, `engine` (`webrtc`, `mpegts.js`, `hls.js`, `native`,
 `dash.js`), `latency` (for WebRTC: jitter-buffer delay + half the RTT from `getStats()`),
-`peerConnection` (WebRTC only), `setSource(src)` and `reload()` for debugging.
+`peerConnection` (WebRTC only), `theme` (resolved: `light` / `dark`), `setSource(src)` and `reload()`
+for debugging.
 
 ### `/waiting/{path}`
 
@@ -1139,7 +1153,8 @@ carry `Cache-Control: no-cache` and a content-hash `ETag`; `If-None-Match` is ho
 
 `index.html`, `app.js`, `core.js`, `detail.js`, `metrics.js`, `mock.js`, `style.css` (dashboard);
 `embed.html`, `player.js` (ES module), `player.css` (player); `i18n.js` (Italian/English texts and
-formatting, shared by the dashboard and the player); `favicon.svg`.
+formatting, shared by the dashboard and the player); `theme.js` (dark/light theme resolution, shared);
+`favicon.svg`.
 
 ---
 
@@ -1193,7 +1208,9 @@ curl -s -H "$H" -X DELETE $B/api/v1/broadcasts/evento-2026/waiting-video | jq .w
 curl -s -H "$H" -F file=@attesa.mp4 $B/api/v1/settings/waiting-video | jq .default_waiting_video
 curl -s -H "$H" -H "$J" -X PATCH -d '{"default_waiting_text":"Siamo quasi pronti"}' $B/api/v1/settings
 curl -s -H "$H" -H "$J" -X PATCH -d '{"ui_language":"en"}' $B/api/v1/settings | jq .ui_language   # "en"
-curl -s $B/api/v1/public/ui                                     # {"language":"en"}, no token
+curl -s $B/api/v1/public/ui                                     # {"language":"en","theme":"system"}, no token
+curl -s -H "$H" -H "$J" -X PATCH -d '{"ui_theme":"light"}' $B/api/v1/settings | jq .ui_theme   # "light"
+curl -s -o /dev/null -w '%{http_code}\n' -H "$H" -H "$J" -X PATCH -d '{"ui_theme":"blue"}' $B/api/v1/settings   # 400
 curl -s -H "$H" $B/api/v1/system | jq
 
 # --- events (SSE); -N disables curl's output buffering
@@ -1221,5 +1238,6 @@ ffplay "$B/dash/evento-2026/manifest.mpd"
 
 # --- pages
 curl -s -o /dev/null -w '%{http_code}\n' "$B/embed/evento-2026?autoplay=0&muted=1&controls=1&src=hls&latency=1"
-curl -s "$B/embed/evento-2026?lang=en" | grep -o '<html lang="[a-z]*">'   # <html lang="en">
+curl -s "$B/embed/evento-2026?lang=en" | grep -o '<html lang="[a-z]*"'   # <html lang="en"
+curl -s "$B/embed/evento-2026?theme=light" | grep -o 'data-theme="[a-z]*"'   # data-theme="light"
 ```
